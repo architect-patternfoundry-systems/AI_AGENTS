@@ -139,6 +139,49 @@ Example: `my_song--Artist Name--Electronic.mp3` → title="my_song", artist="Art
 - Additional custom fields are preserved in the `metadata_json` column in the database
 - The worker adds `processed_at` timestamp and `source_system: "drop-folder"` automatically
 
+#### Current Metadata Enrichment Capabilities
+
+**At Ingestion Time (Drop-Folder Worker):**
+- **Minimal enrichment**: Worker only adds `processed_at` timestamp and `source_system` fields
+- **No transcription**: Drop-folder worker does NOT automatically trigger Whisper transcription
+- **No audio analysis**: No BPM detection, key detection, or audio feature extraction
+- **Metadata preservation**: All user-provided metadata is passed through unchanged
+
+**Post-Ingestion Enrichment (Manual/Optional):**
+- **Whisper Transcription**: Available via ToneRoot IPC service (`lyrics.transcribe` call)
+  - Triggered manually through ToneRoot UI or IPC
+  - Requires audio to be accessible via S3
+  - Produces `lyrics_sync` with timestamped segments
+  - Stored in database `metadata_json.lyrics_sync` column
+  - NOT automatically triggered by drop-folder uploads
+
+**Future Automated Enrichment (Not Implemented):**
+- **Automatic transcription**: Could be added to drop-folder worker or separate enrichment service
+- **Audio feature extraction**: BPM, key, genre classification, mood detection
+- **Metadata lookup**: MusicBrainz, Discogs integration for artist/album/track metadata
+- **Lyrics fetching**: Genius, LyricWiki integration (if not transcribed)
+- **Audio quality analysis**: Dynamic range, clipping detection, noise assessment
+
+#### Metadata Update Strategy
+
+**Current State (Manual):**
+1. File dropped → worker processes → uploads to S3 → basic DB entry
+2. User opens ToneRoot → manually triggers transcription via UI
+3. TranscriptionWorker processes → updates DB with `lyrics_sync`
+4. User can manually edit metadata in ToneRoot UI
+
+**Recommended Future State (Automated):**
+Consider implementing a separate **metadata enrichment service** that:
+
+1. **Listens for new drop-folder uploads** (via S3 events or database triggers)
+2. **Automatically triggers transcription** for new audio files
+3. **Performs audio feature extraction** (BPM, key, genre)
+4. **Enriches metadata** from external sources (MusicBrainz, etc.)
+5. **Updates database** with enriched metadata
+6. **Emits events** for UI updates
+
+This would keep the drop-folder worker simple (ingestion-only) while providing automated enrichment as a separate concern.
+
 The worker (ADR-013) remains responsible for:
 - Claiming files from `incoming/`
 - Audio processing and format conversion
