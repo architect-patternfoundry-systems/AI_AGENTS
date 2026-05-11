@@ -139,6 +139,115 @@ Example: `my_song--Artist Name--Electronic.mp3` → title="my_song", artist="Art
 - Additional custom fields are preserved in the `metadata_json` column in the database
 - The worker adds `processed_at` timestamp and `source_system: "drop-folder"` automatically
 
+#### Operational Semantics
+
+**Order of Operations and File Matching**
+
+**Scenario 1: Audio file dropped before JSON sidecar**
+- **Current behavior**: Worker processes audio file immediately using filename fallback
+- **Issue**: JSON sidecar arrives later but is ignored (audio already processed)
+- **Recommended behavior**:
+  - Worker should wait up to 30 seconds for sidecar before processing without it
+  - If sidecar arrives during wait period, use it
+  - If sidecar arrives after processing, metadata update requires separate enrichment service
+  - Gateways SHOULD upload both file and sidecar in single atomic operation
+
+**Scenario 2: JSON sidecar dropped before audio file**
+- **Current behavior**: JSON sidecar sits in `incoming/` until audio file arrives
+- **Recommended behavior**:
+  - Worker ignores orphaned sidecars (no matching audio file)
+  - Orphaned sidecars older than 1 hour are moved to `failed/` with error log
+  - Gateways SHOULD upload audio file first, then sidecar
+
+**Scenario 3: Filename mismatch (audio.mp3 vs metadata.json)**
+- **Current behavior**: Sidecar not associated (only exact filename match)
+- **Recommended behavior**:
+  - **Strict mode** (recommended): Reject sidecars that don't match audio filename exactly
+  - **Lenient mode** (optional): Allow pattern matching (e.g., `audio.*.json` matches `audio.mp3`)
+  - Gateways MUST ensure sidecar filename matches audio filename exactly
+  - Mismatched sidecars moved to `failed/` with error log
+
+**Scenario 4: Multiple files with same name**
+- **Current behavior**: Advisory locking prevents concurrent processing, second file waits
+- **Recommended behavior**:
+  - If content is identical (same hash), second file is deduplication (ignored)
+  - If content differs, second file processed as new version (different UUID)
+  - Gateways SHOULD reject duplicate filenames to avoid confusion
+  - Or gateways SHOULD append timestamp to prevent collisions: `file_20240110_143022.mp3`
+
+**Scenario 5: Non-file gateway clients (HTTP, API)**
+- **Recommended behavior**:
+  - MUST send both file and metadata in single atomic request
+  - MUST NOT support separate file/metadata upload requests (prevents race conditions)
+  - MUST validate that both are present before accepting upload
+  - MUST return error if either is missing
+
+#### File Naming Conventions
+
+**Strict Filename Matching (Recommended for File-Based Gateways)**
+```
+audio_file.mp3        → audio_file.mp3.json
+my_song--Artist--Genre.mp3  → my_song--Artist--Genre.mp3.json
+```
+
+**UUID-Based Matching (Alternative for Advanced Gateways)**
+- Gateway generates UUID, uploads both with same UUID prefix
+- Worker matches by UUID instead of filename
+- More flexible but requires gateway coordination
+
+#### Acknowledgment and Notification Mechanisms
+
+**Immediate ACK (File Receipt)**
+- Gateway returns HTTP 200/OK immediately after successful write to `incoming/`
+- ACK confirms file reached drop zone, NOT that processing is complete
+- ACK includes: `upload_id`, `filename`, `timestamp`, `estimated_processing_time`
+
+**Asynchronous Processing Notification**
+Current implementation has NO notification mechanism. Recommended options:
+
+**Option 1: Webhook Callback (Recommended)**
+- Gateway accepts optional callback_url parameter
+- Worker POSTs to callback_url when processing completes
+- Simple, widely supported, works across firewalls
+
+**Option 2: Database Polling**
+- Client queries database for processing status
+- Check metadata fields for completion indicators
+- Simple but requires client polling logic
+
+**Option 3: Message Queue (Kafka/RabbitMQ)**
+- Worker publishes events to message queue on completion
+- Client subscribes to queue for notifications
+- More complex but scalable for high-volume scenarios
+
+**Option 4: WebSocket Subscription**
+- Client opens WebSocket connection to gateway
+- Gateway forwards worker events to connected clients
+- Real-time but requires persistent connection
+
+**Recommended Implementation**:
+- Phase 1: Implement webhook callback for HTTP gateway
+- Phase 2: Add database polling documentation for alternative approach
+- Phase 3: Consider message queue for high-volume scenarios
+
+#### Error Handling and Retry Policy
+
+**Gateway-Level Errors**
+- Invalid file format: Reject immediately with 400 Bad Request
+- Missing required metadata: Reject immediately with 400 Bad Request
+- Virus scan failure: Reject with 403 Forbidden, quarantine file
+- Rate limit exceeded: Reject with 429 Too Many Requests
+
+**Worker-Level Errors**
+- Processing failure: Move to `failed/` with error log
+- S3 upload failure: Retry 3 times with exponential backoff
+- DB upsert failure: Log warning, continue (sync job will handle)
+
+**Client Retry Policy**
+- Gateway ACK timeout: Retry upload with new filename (append timestamp)
+- Processing failure: Check `failed/` directory, fix issue, re-upload
+- Webhook delivery failure: Worker should retry webhook 3 times
+
 #### Current Metadata Enrichment Capabilities
 
 **At Ingestion Time (Drop-Folder Worker):**
@@ -265,6 +374,35 @@ All other integration options are explicitly deferred with revisit conditions:
   - File type validation using libmagic
   - TLS termination via Traefik
   - API key authentication
+
+# API Specification (Phase 1)
+POST /upload
+- Request: multipart/form-data
+  - file: audio_file (required)
+  - metadata: JSON string (optional, but recommended)
+  - callback_url: webhook URL (optional, for async notification)
+- Response: 200 OK
+  - upload_id: UUID
+  - filename: original filename
+  - timestamp: ISO8601
+  - estimated_processing_time: seconds
+- Validation:
+  - Both file and metadata in single request (atomic)
+  - Reject if file type validation fails
+  - Reject if virus scan fails (if enabled)
+  - Reject if rate limit exceeded
+
+# Webhook Callback (async notification)
+POST {callback_url}
+- Request body:
+  - upload_id: UUID
+  - status: success | failed
+  - audio_uuid: content-hash UUID
+  - s3_key: S3 key for primary audio
+  - derivatives: list of derivative S3 keys
+  - error: null or error message
+  - processed_at: ISO8601 timestamp
+- Retry policy: 3 attempts with exponential backoff
 ```
 
 ### CLI Tool
@@ -274,6 +412,13 @@ toneroot-upload file.mp3 --metadata artist="Artist" --title="Song"
 toneroot-upload --watch ./audio/
 toneroot-upload --nfs-path /mnt/data_lake/toneroot/drop-zone/incoming/
 toneroot-upload --http-url https://upload.toneroot.local
+
+# CLI should enforce:
+# - Upload both file and metadata in single operation
+# - Validate filename matching if uploading sidecar separately
+# - Append timestamp to prevent filename collisions
+# - Return upload_id for tracking
+# - Support --callback-url for async notification
 ```
 
 ## Success Criteria
