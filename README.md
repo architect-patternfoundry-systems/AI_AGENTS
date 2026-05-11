@@ -21,7 +21,8 @@ AI_AGENTS/
 │   ├── security.md              # Security policies and requirements
 │   └── adr/                     # Architectural Decision Records
 │       ├── ADR-013-drop-folder-worker.md
-│       └── ADR-014-ingestion-gateway.md
+│       ├── ADR-014-ingestion-gateway.md
+│       └── ADR-015-ollama-model-consolidation.md
 ├── domains/                     # Layer 2: Domain-specific patterns
 │   ├── nextjs/                  # Next.js/React patterns
 │   │   └── rules.md

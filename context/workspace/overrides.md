@@ -16,3 +16,8 @@ Workspace-specific overrides and additions to global governance.
 - All services must use Tailscale MagicDNS for internal communication
 - No localhost assumptions for shared infrastructure
 - GPU resources require special CUDA library path for faster-whisper
+
+## Optimization Opportunities
+- **Ollama Model Consolidation**: See ADR-015 for opportunity to consolidate llama3 (4.7GB) + gemma2:9b (5.4GB) → single Qwen2.5-3B-Instruct (~3GB), potential 7GB savings
+- **Model Cache Review**: Evaluate HuggingFace cache for unused models before major service updates
+- **Storage Optimization**: Regular cleanup of old model artifacts and temporary files
