@@ -39,3 +39,11 @@ Rules and patterns specific to Python development in this workspace.
 - Never commit .env files with secrets
 - Provide .env.example as template
 - Use environment-specific configurations
+
+## Resource Resolution [TRIGGER: sys._MEIPASS, os.path.join, config loading, plugin discovery, asset loading, resource locator, path resolution]
+
+Before implementing ANY of the above patterns:
+1. Read ADR-015: /home/cortex/workspace/AI_AGENTS/global/adr/ADR-015-resource-resolution-priority.md
+2. Use ResourceLocator base class — do NOT implement ad-hoc resolution
+3. Required resources: locate_or_raise(), optional: locate()
+4. Always include explicit tier conditions (never omit condition lambda)
