@@ -191,6 +191,8 @@ class RawIntakeBundle:
 
 **Idempotency:** the Ingestion Engine checks `SELECT id FROM media WHERE intake_bundle_sha256 = :sha AND owner_profile_uuid = :owner` before any writes. Match → return existing `media.id`, no-op. This makes all connectors inherently idempotent at the intake layer.
 
+**Engine SHA256 re-verification:** the Ingestion Engine re-computes SHA256 from `bundle.local_path` bytes and asserts it against `bundle.sha256` before doing anything else — before the idempotency check, before any DB write. Connectors can lie, fail mid-copy, or have bugs. The connector-provided hash is never trusted for deduplication without re-verification. This matches the posture of the transfer protocol (D7) which re-verifies received bytes against the sidecar's `intake_sha256`. Intake and transfer must have the same integrity posture.
+
 **Per-user deduplication scope:** `(sha256, owner_profile_uuid)`. The same file imported by two different users creates two independent media rows, two sidecars, and occupies storage twice. This is intentional — each user's sovereign archive is independent. Operators should not be surprised by this. It is documented here as a deliberate choice.
 
 ### D7: Transfer Protocol — Token Contract
@@ -218,6 +220,8 @@ Cross-instance transfer uses pre-signed URLs mediated by a signed token. No Tone
 **Revocation:** token IDs stored in Redis with TTL = `expires_at`. `DELETE /api/transfer/{token_id}` invalidates immediately. The destination instance checks revocation before fetching each pre-signed URL — not just at transfer start.
 
 **Integrity:** destination verifies `intake_sha256` from the sidecar against the received bytes before writing any DB row. Mismatch → reject, log event, do not write. No silent corruption.
+
+**Pre-signed URL expiry alignment:** the token hard-caps at 72 hours, but pre-signed URLs for the actual object downloads have their own expiry — MinIO and S3 defaults vary and are often shorter. If a destination instance fetches the manifest immediately but streams objects lazily (large library, slow connection), pre-signed URLs issued with a short system default may expire while the token is still valid. **Rule:** pre-signed URLs MUST be issued with `expiry = token.expires_at`, not the backend system default. This applies to both the source instance when issuing URLs and to any tooling that wraps the transfer protocol.
 
 **Trust on import:** `owner_hint` and `trust_hint` from the received sidecar are presented to the importing user for confirmation. No `media_permissions` row is written automatically. See D2 trust policy.
 
