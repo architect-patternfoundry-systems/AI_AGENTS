@@ -132,8 +132,6 @@ ClusterIP Service → Pod (namespace: cloudflared-public)
 - `cloudflared` namespace has egress allowed only to `443/tcp` external and ingress only from `cloudflared-public` namespace.
 - `cloudflared-public` namespace has egress only to `cloudflared` namespace and BYOB S3 endpoints.
 
----
-
 ## Origin Hardening Rules
 
 1. **No direct inbound ports**: Host firewall (Tailscale ACL + cloud security group) drops all inbound traffic not sourced from `100.64.0.0/10`. Tunneled services are unreachable by IP.
