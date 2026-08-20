@@ -23,6 +23,7 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-027 | Standardize ToneRoot Logging | Accepted | 2026-08-01 | Platform Team | Observability |
 | ADR-028 | Service Delivery and Break-Glass Recovery Framework | Accepted (Certified) | 2026-08-16 | Platform Team | Infrastructure |
 | ADR-029 | Continuous DR Runbook Graph and Automated Recertification | Accepted | 2026-08-17 | Platform Team | Operations |
+| ADR-030 | Model Caches Use Static Local PVs on cortex | Accepted (Implemented) | 2026-08-19 | Platform Team | Infrastructure |
 
 ## Categories
 
