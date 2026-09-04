@@ -525,7 +525,7 @@ preconditions must be satisfied:
 
 ### Canary status (2026-09-04)
 
-**Degradation-path canary: PASSED.** One job (`job_20260904125749_0_q`)
+**Degradation-path canary #1 (`job_20260904125749_0_q`): PASSED.** One job
 completed the full non-enrichment lifecycle. The nanny registered the
 Ollama intent and successfully scaled the Deployment from 0 to 1. The
 enrichment canary timed out because the first pull of the uncached 3.7 GB
@@ -533,10 +533,33 @@ Ollama image took ~120 seconds, exceeding the 90-second readiness budget.
 The lease was released cleanly and the workflow completed with
 `status=success, stage=enrichment, cause=completed, chunks=1/1`.
 
-**Enrichment-path canary: PENDING.** Requires image pinning, pre-cache,
-and strict lease admission (preconditions 1–3 above). The 90-second
-readiness budget is correct for the intended operating condition (cached
-image, model on hostPath). Measured cold-start with cached image: ~18s.
+**Degradation-path canary #2 (`job_20260904204251_0_q`): PASSED.** Image
+was cached (pre-pull DaemonSet active), transcription succeeded. Lease
+`lease_aee7f56c` created but stayed QUEUED — all 4 GPU slots occupied by
+Whisper. Strict admission correctly refused inference without ACTIVE
+lease. Timed out with precise diagnostics:
+`lease not admitted (state=QUEUED) within 90s`. Lease released cleanly,
+workflow COMPLETED with `status=success, chunks=1/1`.
+
+**Success-path canary (`job_20260904220838_0_q`): PASSED.** With free GPU
+slots and the `llama3:8b` model pre-loaded, the full enrichment lifecycle
+completed:
+
+1. CTS pilot submission (`source_type=cts_temporal_pilot`)
+2. Ollama intent registered → nanny scaled Ollama 0→1
+3. Audio downloaded and chunked
+4. Whisper transcription: 20 segments, 850 chars, 160.3s
+5. Lease acquired: `state=ADMITTED ticket=lease_653e8da0`
+6. Strict admission passed: lease ADMITTED on first poll
+7. Ollama inference: `POST /api/chat "HTTP/1.1 200 OK"`
+8. Enrichment result returned
+9. Lease released: `status=complete`
+10. Terminal record written: `status=success, stage=enrichment, cause=completed, chunks=1/1`
+11. Workflow COMPLETED
+
+All ten lifecycle steps completed successfully. The success-path canary
+was run with `GPU_SLOTS=4` (original capacity), free GPU slots available,
+image pre-cached, and the `llama3:8b` model pre-loaded in Ollama.
 
 ### Expansion criteria
 
@@ -553,24 +576,24 @@ increments, gated on:
 
 ### 4.1 Source-control gates
 
-- [ ] The complete pilot package, routing changes, migration, tests, and
+- [x] The complete pilot package, routing changes, migration, tests, and
       canary script are committed, pushed, and included in a reviewed PR.
-- [ ] The deployed sidecar image is built from a revision containing
+- [x] The deployed sidecar image is built from a revision containing
       `src.temporal_pilot`.
-- [ ] ADR-035 is committed in its governance repository.
-- [ ] The pilot code has a documented rollback commit or image tag.
+- [x] ADR-035 is committed in its governance repository.
+- [x] The pilot code has a documented rollback commit or image tag.
 
 ### 4.2 Functional canary
 
-- [ ] A pilot-tagged job creates one Temporal workflow with the expected
+- [x] A pilot-tagged job creates one Temporal workflow with the expected
       workflow ID.
 - [ ] A repeated start with the same job ID is rejected or attached to an
       existing workflow according to an explicitly documented API behavior.
-- [ ] With Ollama at zero replicas, the nanny receives an intent and scales
+- [x] With Ollama at zero replicas, the nanny receives an intent and scales
       the Deployment from 0 to 1.
-- [ ] The activity does not call Ollama before readiness succeeds.
-- [ ] The activity receives an ACTIVE lease before inference (strict admission).
-- [ ] On normal completion, enrichment output is persisted once and the
+- [x] The activity does not call Ollama before readiness succeeds.
+- [x] The activity receives an ACTIVE lease before inference (strict admission).
+- [x] On normal completion, enrichment output is persisted once and the
       lease is released.
 - [ ] With no active leases, the nanny returns Ollama to zero according to
       its configured idle policy.
@@ -579,11 +602,11 @@ increments, gated on:
 
 - [ ] Nanny unreachable produces a classified degraded enrichment result
       and an observable metric/event.
-- [ ] Ollama cold-start timeout produces a classified degraded enrichment
+- [x] Ollama cold-start timeout produces a classified degraded enrichment
       result without failing the transcript workflow.
 - [ ] A worker restart during an active lease does not result in permanent
       GPU allocation; the TTL/reconciliation path recovers it.
-- [ ] An Activity retry does not produce duplicate enrichment records,
+- [x] An Activity retry does not produce duplicate enrichment records,
       duplicate downstream writes, or leaked leases.
 - [ ] Cancellation releases or expires the lease promptly and does not
       report enrichment as complete.
