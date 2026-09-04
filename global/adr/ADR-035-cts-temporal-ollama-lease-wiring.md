@@ -493,6 +493,51 @@ Before the first canary:
 | 8 | **Exercise failure cases deliberately.** Test nanny unavailable, Ollama readiness timeout, inference error, activity retry, worker restart while holding a lease, cancellation, and duplicate submission. | Operator |
 | 9 | **Enable narrowly and observe.** Set `CTS_TEMPORAL_PILOT_ENABLED=true` only after the canary criteria pass. | Operator |
 
+### Rollout preconditions (added after Gate 1.7 canary investigation)
+
+Before enabling CTS Temporal pilot traffic, the following infrastructure
+preconditions must be satisfied:
+
+1. **Pin the Ollama image.** Replace `ollama/ollama:latest` with an
+   immutable reference (version tag + digest). The current pinned version
+   is `ollama/ollama:0.33.3@sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2`.
+   This makes the node image cache trustworthy and ensures rollback/reproducibility.
+
+2. **Pre-cache the image on all eligible nodes.** A DaemonSet
+   (`ollama-image-prepull` in `shared-infra`) ensures the pinned image is
+   present on every node matching the Ollama Deployment's nodeSelector.
+   Verify after node rebuild, node replacement, image-tag change, or
+   model/version change:
+   ```
+   kubectl get ds -n shared-infra ollama-image-prepull
+   kubectl get pods -n shared-infra -l app=ollama-image-prepull -o wide
+   ```
+
+3. **Strict lease admission.** The OllamaClient must distinguish "Ollama
+   HTTP ready" from "GPU lease ACTIVE" and begin inference only after both
+   conditions are true. This preserves the nanny's slot arbitration
+   guarantee. A lease that remains QUEUED past the readiness budget is
+   treated as a timeout, not a silent bypass.
+
+4. **Success-path canary.** At least one canary demonstrating: intent →
+   nanny scale-up → Ollama ready → lease ACTIVE → successful enrichment →
+   ticket release → idle scale-down.
+
+### Canary status (2026-09-04)
+
+**Degradation-path canary: PASSED.** One job (`job_20260904125749_0_q`)
+completed the full non-enrichment lifecycle. The nanny registered the
+Ollama intent and successfully scaled the Deployment from 0 to 1. The
+enrichment canary timed out because the first pull of the uncached 3.7 GB
+Ollama image took ~120 seconds, exceeding the 90-second readiness budget.
+The lease was released cleanly and the workflow completed with
+`status=success, stage=enrichment, cause=completed, chunks=1/1`.
+
+**Enrichment-path canary: PENDING.** Requires image pinning, pre-cache,
+and strict lease admission (preconditions 1–3 above). The 90-second
+readiness budget is correct for the intended operating condition (cached
+image, model on hostPath). Measured cold-start with cached image: ~18s.
+
 ### Expansion criteria
 
 Broaden the source-system routing criterion in separately reviewed
@@ -524,7 +569,7 @@ increments, gated on:
 - [ ] With Ollama at zero replicas, the nanny receives an intent and scales
       the Deployment from 0 to 1.
 - [ ] The activity does not call Ollama before readiness succeeds.
-- [ ] The activity receives a lease before inference.
+- [ ] The activity receives an ACTIVE lease before inference (strict admission).
 - [ ] On normal completion, enrichment output is persisted once and the
       lease is released.
 - [ ] With no active leases, the nanny returns Ollama to zero according to
