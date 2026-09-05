@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -211,6 +211,32 @@ from .credential_discovery_workflow import (
     REPORT_VERSION,
 )
 
+# observation safety (Phase 1 defense-in-depth)
+from .observation_safety import (
+    UnsafeObservationError,
+    assert_observation_safe,
+    assert_observations_safe,
+    FORBIDDEN_MARKERS,
+)
+
+# kubernetes discovery adapter (Phase 1 first real adapter)
+from .kubernetes_discovery_adapter import (
+    discover_kubernetes_credentials,
+    KubernetesDiscoveryClient,
+    WorkloadMetadata,
+    WorkloadEnvVar,
+    WorkloadEnvFrom,
+    WorkloadVolumeSecret,
+    ExternalSecretMetadata,
+    RISK_SIGNAL_K8S_SECRET_DELIVERY,
+    RISK_SIGNAL_INLINE_ENV_SECRET,
+    RISK_SIGNAL_RUNTIME_DB_ACCESS,
+    RISK_SIGNAL_OBJECT_STORAGE_ACCESS,
+    RISK_SIGNAL_EXTERNAL_SECRET_REF,
+    RISK_SIGNAL_SHARED_SECRET_ACROSS_NAMESPACES,
+    RISK_SIGNAL_NO_SECRET_REF,
+)
+
 __all__ = [
     "__version__",
     # workflow_envelope
@@ -405,4 +431,24 @@ __all__ = [
     "COVERAGE_SOURCE_GIT_FINDINGS",
     "ALL_COVERAGE_SOURCES",
     "REPORT_VERSION",
+    # observation safety (Phase 1 defense-in-depth)
+    "UnsafeObservationError",
+    "assert_observation_safe",
+    "assert_observations_safe",
+    "FORBIDDEN_MARKERS",
+    # kubernetes discovery adapter (Phase 1 first real adapter)
+    "discover_kubernetes_credentials",
+    "KubernetesDiscoveryClient",
+    "WorkloadMetadata",
+    "WorkloadEnvVar",
+    "WorkloadEnvFrom",
+    "WorkloadVolumeSecret",
+    "ExternalSecretMetadata",
+    "RISK_SIGNAL_K8S_SECRET_DELIVERY",
+    "RISK_SIGNAL_INLINE_ENV_SECRET",
+    "RISK_SIGNAL_RUNTIME_DB_ACCESS",
+    "RISK_SIGNAL_OBJECT_STORAGE_ACCESS",
+    "RISK_SIGNAL_EXTERNAL_SECRET_REF",
+    "RISK_SIGNAL_SHARED_SECRET_ACROSS_NAMESPACES",
+    "RISK_SIGNAL_NO_SECRET_REF",
 ]

@@ -114,6 +114,22 @@ from platform_orchestration_contracts import (
     COVERAGE_SOURCE_GIT_FINDINGS,
     ALL_COVERAGE_SOURCES,
     REPORT_VERSION,
+    UnsafeObservationError,
+    assert_observation_safe,
+    assert_observations_safe,
+    FORBIDDEN_MARKERS,
+    discover_kubernetes_credentials,
+    KubernetesDiscoveryClient,
+    WorkloadMetadata,
+    WorkloadEnvVar,
+    WorkloadEnvFrom,
+    WorkloadVolumeSecret,
+    ExternalSecretMetadata,
+    RISK_SIGNAL_K8S_SECRET_DELIVERY,
+    RISK_SIGNAL_INLINE_ENV_SECRET,
+    RISK_SIGNAL_RUNTIME_DB_ACCESS,
+    RISK_SIGNAL_OBJECT_STORAGE_ACCESS,
+    RISK_SIGNAL_NO_SECRET_REF,
     EnrollmentResult,
     SOURCE_KUBERNETES,
     SOURCE_GIT,
@@ -3437,3 +3453,495 @@ def test_posture_report_no_secret_values_in_coverage_output():
     json_output = report.to_json()
     assert "password" not in json_output.lower()
     assert "access_key" not in json_output.lower()
+
+
+# --- Observation safety validation ---
+
+
+def _make_safe_observation(observation_id: str = "obs-safe") -> CredentialObservation:
+    """Create a known-safe observation for testing."""
+    return CredentialObservation(
+        observation_id=observation_id,
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        credential_class="postgresql_login",
+        provider_ref="postgresql:infra-data",
+        secret_authority_ref="kubernetes-secret:cts/cts-db-secret#uri",
+        consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+        owner_hint=OwnerRef(team="infra"),
+        risk_signals=("runtime-database-access",),
+        evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+    )
+
+
+def test_assert_observation_safe_passes_for_clean_observation():
+    """A clean observation with no secret material passes validation."""
+    obs = _make_safe_observation()
+    assert_observation_safe(obs)  # should not raise
+
+
+def test_assert_observation_safe_rejects_plaintext_retained_true():
+    """Observation with plaintext_retained=True is rejected."""
+    obs = CredentialObservation(
+        observation_id="obs-bad",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        plaintext_retained=True,
+    )
+    with pytest.raises(UnsafeObservationError, match="plaintext_retained"):
+        assert_observation_safe(obs)
+
+
+def test_assert_observation_safe_rejects_password_in_ref():
+    """Observation with password= in provider_ref is rejected."""
+    obs = CredentialObservation(
+        observation_id="obs-leak",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        provider_ref="postgresql://user:password=secret@host:5432/db",
+    )
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_observation_safe(obs)
+
+
+def test_assert_observation_safe_rejects_dsn_in_secret_authority():
+    """Observation with postgres:// DSN in secret_authority_ref is rejected."""
+    obs = CredentialObservation(
+        observation_id="obs-dsn",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        secret_authority_ref="postgres://user:pass@host:5432/db",
+    )
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_observation_safe(obs)
+
+
+def test_assert_observation_safe_rejects_aws_secret_in_evidence():
+    """Observation with aws_secret_access_key in evidence_ref is rejected."""
+    obs = CredentialObservation(
+        observation_id="obs-aws",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        evidence_ref="aws_secret_access_key=ABC123",
+    )
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_observation_safe(obs)
+
+
+def test_assert_observation_safe_rejects_private_key():
+    """Observation with BEGIN PRIVATE KEY is rejected."""
+    obs = CredentialObservation(
+        observation_id="obs-pkey",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        evidence_ref="-----BEGIN PRIVATE KEY-----",
+    )
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_observation_safe(obs)
+
+
+def test_assert_observations_safe_batch():
+    """Batch validation raises on first unsafe observation."""
+    safe_obs = _make_safe_observation("obs-1")
+    unsafe_obs = CredentialObservation(
+        observation_id="obs-2",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        provider_ref="password=secret",
+    )
+    with pytest.raises(UnsafeObservationError, match="obs-2"):
+        assert_observations_safe((safe_obs, unsafe_obs))
+
+
+def test_assert_observations_safe_all_clean():
+    """Batch validation passes when all observations are clean."""
+    obs1 = _make_safe_observation("obs-1")
+    obs2 = _make_safe_observation("obs-2")
+    assert_observations_safe((obs1, obs2))  # should not raise
+
+
+def test_forbidden_markers_is_not_empty():
+    """FORBIDDEN_MARKERS contains expected entries."""
+    assert "password=" in FORBIDDEN_MARKERS
+    assert "postgres://" in FORBIDDEN_MARKERS
+    assert "aws_secret_access_key=" in FORBIDDEN_MARKERS
+
+
+# --- Kubernetes discovery adapter ---
+
+
+class SyntheticK8sClient:
+    """Synthetic Kubernetes client for testing with CTS-like workloads."""
+
+    def __init__(self, workloads: tuple[WorkloadMetadata, ...]):
+        self._workloads = workloads
+
+    def list_workloads(self, namespace: str) -> tuple[WorkloadMetadata, ...]:
+        return tuple(w for w in self._workloads if w.namespace == namespace)
+
+    def list_external_secrets(self, namespace: str) -> tuple[ExternalSecretMetadata, ...]:
+        return ()
+
+
+def _make_cts_backend_workload() -> WorkloadMetadata:
+    """Create synthetic CTS backend workload metadata (no secret values)."""
+    return WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-backend",
+        container_name="cts-backend",
+        env_vars=(
+            # POSTGRES_DSN with inline value (the adapter must NOT propagate the value)
+            WorkloadEnvVar(name="POSTGRES_DSN", value="dbname=mydatabase user=admin password=SECRET"),
+            # AWS_SECRET_ACCESS_KEY with inline value
+            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", value="cNJ3+eCdYQoRSbdxpikZp9cG"),
+            # Non-credential env var (should be ignored)
+            WorkloadEnvVar(name="PORT", value="8001"),
+            # Credential with secretKeyRef (good pattern)
+            WorkloadEnvVar(name="DATABASE_URL", secret_ref_name="cts-db-secret", secret_ref_key="uri"),
+        ),
+        env_from=(),
+        volume_secrets=(),
+        service_account="cts-backend-sa",
+        owner_annotations={"team": "cts-platform", "service": "attunement-weaver"},
+        resource_version="12345",
+    )
+
+
+def _make_cts_watchdog_workload() -> WorkloadMetadata:
+    """Create synthetic CTS watchdog workload metadata."""
+    return WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-watchdog",
+        container_name="cts-watchdog",
+        env_vars=(
+            WorkloadEnvVar(name="POSTGRES_DSN", value="dbname=mydatabase user=admin password=SECRET"),
+            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", value="cNJ3+eCdYQoRSbdxpikZp9cG"),
+        ),
+        env_from=(
+            WorkloadEnvFrom(secret_ref_name="cts-shared-secrets"),
+        ),
+        volume_secrets=(),
+        service_account="cts-watchdog-sa",
+        owner_annotations={"team": "cts-platform"},
+        resource_version="12346",
+    )
+
+
+def _make_cts_with_volume_secret() -> WorkloadMetadata:
+    """Create workload with volume-mounted secret."""
+    return WorkloadMetadata(
+        kind="StatefulSet",
+        namespace="cts",
+        name="cts-data-processor",
+        container_name="processor",
+        env_vars=(),
+        env_from=(),
+        volume_secrets=(
+            WorkloadVolumeSecret(volume_name="tls-certs", secret_ref_name="cts-tls-secret", mount_path="/etc/tls"),
+        ),
+        owner_annotations={"team": "infra"},
+        resource_version="12347",
+    )
+
+
+def test_k8s_adapter_discovers_inline_postgres_dsn():
+    """Adapter discovers POSTGRES_DSN env var and classifies it correctly."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    # Should find POSTGRES_DSN, AWS_SECRET_ACCESS_KEY, DATABASE_URL (PORT is not credential)
+    obs_ids = [o.observation_id for o in observations]
+    assert any("POSTGRES_DSN" in oid for oid in obs_ids)
+    assert any("AWS_SECRET_ACCESS_KEY" in oid for oid in obs_ids)
+    assert any("DATABASE_URL" in oid for oid in obs_ids)
+    # PORT should NOT appear
+    assert not any("PORT" in oid for oid in obs_ids)
+
+
+def test_k8s_adapter_classifies_credential_class():
+    """Adapter correctly classifies credential class from env var name."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.credential_class == "postgresql_login"
+
+    aws_obs = next(o for o in observations if "AWS_SECRET_ACCESS_KEY" in o.observation_id)
+    assert aws_obs.credential_class == "object_storage_key"
+
+
+def test_k8s_adapter_emits_inline_secret_risk_signal():
+    """Adapter flags inline env var secrets with correct risk signal."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    # POSTGRES_DSN has inline value, not secretKeyRef
+    assert RISK_SIGNAL_INLINE_ENV_SECRET in pg_obs.risk_signals
+    assert RISK_SIGNAL_NO_SECRET_REF in pg_obs.risk_signals
+    assert RISK_SIGNAL_RUNTIME_DB_ACCESS in pg_obs.risk_signals
+
+
+def test_k8s_adapter_emits_secret_ref_risk_signal():
+    """Adapter flags secretKeyRef-based credentials with k8s-secret-delivery signal."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
+    assert RISK_SIGNAL_K8S_SECRET_DELIVERY in db_url_obs.risk_signals
+    assert RISK_SIGNAL_INLINE_ENV_SECRET not in db_url_obs.risk_signals
+
+
+def test_k8s_adapter_does_not_propagate_secret_values():
+    """Adapter output contains no plaintext secret values."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    # Check that no observation contains the actual secret values
+    for obs in observations:
+        json_str = json.dumps(obs.to_dict())
+        assert "cNJ3+eCdYQoRSbdxpikZp9cG" not in json_str
+        assert "password=SECRET" not in json_str
+        assert "dbname=mydatabase" not in json_str
+
+
+def test_k8s_adapter_all_observations_pass_safety_check():
+    """All adapter output passes assert_observation_safe."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(), _make_cts_watchdog_workload()))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    assert len(observations) > 0
+    assert_observations_safe(observations)  # should not raise
+
+
+def test_k8s_adapter_extracts_owner_hint():
+    """Adapter extracts owner hint from workload annotations."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.owner_hint is not None
+    assert pg_obs.owner_hint.team == "cts-platform"
+    assert pg_obs.owner_hint.service == "attunement-weaver"
+
+
+def test_k8s_adapter_builds_consumer_ref():
+    """Adapter builds correct consumer references."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert len(pg_obs.consumer_refs) == 1
+    consumer = pg_obs.consumer_refs[0]
+    assert consumer.kind == "Deployment"
+    assert consumer.namespace == "cts"
+    assert consumer.name == "cts-backend"
+    assert consumer.container == "cts-backend"
+
+
+def test_k8s_adapter_builds_evidence_ref():
+    """Adapter builds opaque evidence references."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert "kubernetes://" in pg_obs.evidence_ref
+    assert "cts-backend" in pg_obs.evidence_ref
+    assert "12345" in pg_obs.evidence_ref  # resource_version
+
+
+def test_k8s_adapter_handles_env_from():
+    """Adapter discovers envFrom secret references."""
+    client = SyntheticK8sClient((_make_cts_watchdog_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    envfrom_obs = [o for o in observations if "envfrom" in o.observation_id]
+    assert len(envfrom_obs) == 1
+    assert "cts-shared-secrets" in envfrom_obs[0].secret_authority_ref
+
+
+def test_k8s_adapter_handles_volume_secrets():
+    """Adapter discovers volume-mounted secret references."""
+    client = SyntheticK8sClient((_make_cts_with_volume_secret(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    vol_obs = [o for o in observations if "volume" in o.observation_id]
+    assert len(vol_obs) == 1
+    assert "cts-tls-secret" in vol_obs[0].secret_authority_ref
+
+
+def test_k8s_adapter_filters_by_namespace():
+    """Adapter only returns workloads from the specified namespace."""
+    other_workload = WorkloadMetadata(
+        kind="Deployment",
+        namespace="other-ns",
+        name="other-app",
+        env_vars=(WorkloadEnvVar(name="POSTGRES_DSN", value="x"),),
+    )
+    client = SyntheticK8sClient((_make_cts_backend_workload(), other_workload))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    for obs in observations:
+        assert "cts" in obs.observation_id
+        assert "other-ns" not in obs.observation_id
+
+
+def test_k8s_adapter_source_is_kubernetes():
+    """All observations from k8s adapter have source='kubernetes'."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    for obs in observations:
+        assert obs.source == COVERAGE_SOURCE_KUBERNETES
+
+
+def test_k8s_adapter_empty_namespace():
+    """Adapter returns empty tuple for namespace with no workloads."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="empty-ns",
+        environment="dev",
+    )
+    assert len(observations) == 0
+
+
+def test_k8s_adapter_no_credential_env_vars():
+    """Adapter ignores non-credential env vars."""
+    workload = WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="no-creds-app",
+        env_vars=(
+            WorkloadEnvVar(name="PORT", value="8001"),
+            WorkloadEnvVar(name="LOG_LEVEL", value="info"),
+            WorkloadEnvVar(name="MAX_CONNECTIONS", value="100"),
+        ),
+    )
+    client = SyntheticK8sClient((workload,))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    assert len(observations) == 0
+
+
+def test_k8s_adapter_inline_secret_authority_ref():
+    """Adapter builds inline-env authority ref for env vars without secretKeyRef."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert "inline-env" in pg_obs.secret_authority_ref
+    assert "cts-backend" in pg_obs.secret_authority_ref
+
+
+def test_k8s_adapter_secret_key_ref_authority():
+    """Adapter builds kubernetes-secret authority ref for secretKeyRef env vars."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
+    assert "kubernetes-secret" in db_url_obs.secret_authority_ref
+    assert "cts-db-secret" in db_url_obs.secret_authority_ref
+    assert "uri" in db_url_obs.secret_authority_ref
+
+
+def test_k8s_adapter_multiple_workloads():
+    """Adapter handles multiple workloads in the same namespace."""
+    client = SyntheticK8sClient((
+        _make_cts_backend_workload(),
+        _make_cts_watchdog_workload(),
+        _make_cts_with_volume_secret(),
+    ))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    # cts-backend: POSTGRES_DSN, AWS_SECRET_ACCESS_KEY, DATABASE_URL
+    # cts-watchdog: POSTGRES_DSN, AWS_SECRET_ACCESS_KEY, envFrom:cts-shared-secrets
+    # cts-data-processor: volume:cts-tls-secret
+    assert len(observations) >= 6
+    # All should pass safety check
+    assert_observations_safe(observations)
+
+
+def test_k8s_adapter_observed_at_timestamp():
+    """Adapter uses provided timestamp or generates one."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+        observed_at="2026-09-05T23:30:00+00:00",
+    )
+    for obs in observations:
+        assert obs.observed_at == "2026-09-05T23:30:00+00:00"
+
+
+def test_k8s_adapter_environment_label():
+    """Adapter applies environment label to observations."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="prod",
+    )
+    for obs in observations:
+        assert obs.environment == "prod"
