@@ -1,0 +1,21 @@
+schema_version: v1
+profile_id: antigravity-cli
+provider: antigravity
+display_name: Antigravity CLI
+capabilities:
+  can_commit: true
+  can_push: true
+  can_create_pr: true
+  can_run_tests: true
+  can_edit_files: true
+  can_use_mcp: false
+  can_use_subagents: false
+delivery:
+  prompt_format: markdown
+  system_instruction_key: system_prompt
+  config_directory: .agents
+  instructions_file: AGENTS.md
+notes: |
+  Antigravity loads repository instructions from AGENTS.md.
+  No MCP support in current version.
+  Session artifacts saved to /home/cortex/snap/antigravity-cli/.../brain/<conversation-id>/.

@@ -1,0 +1,21 @@
+schema_version: v1
+profile_id: devin
+provider: devin
+display_name: Devin (Cognition)
+capabilities:
+  can_commit: true
+  can_push: true
+  can_create_pr: true
+  can_run_tests: true
+  can_edit_files: true
+  can_use_mcp: true
+  can_use_subagents: true
+delivery:
+  prompt_format: markdown
+  system_instruction_key: instructions
+  config_directory: .devin
+  instructions_file: .devin/instructions.md
+notes: |
+  Devin loads repository instructions from .devin/instructions.md.
+  Skills are discovered from .devin/skills/.
+  MCP config is in .devin/mcp_config.json (shared) and .devin/mcp_config.local.json (secrets).

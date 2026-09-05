@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-agents.patternfoundry.dev/schemas/invocation-envelope-v1.json",
+  "title": "Agent Invocation Envelope v1",
+  "description": "Structured artifact produced by the agent-invoke composer. Contains policy, task, identity, capabilities, and evidence contract.",
+  "type": "object",
+  "required": ["schema_version", "invocation_id", "created_at", "task", "policy", "capabilities", "evidence", "rendering"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "v1"},
+    "invocation_id": {"type": "string", "pattern": "^inv_\\d{8}_"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "task": {
+      "type": "object",
+      "required": ["title", "mode", "scope", "acceptance_criteria"],
+      "properties": {
+        "title": {"type": "string"},
+        "mode": {"type": "string", "enum": ["assess", "implement", "fix", "infra", "security", "review"]},
+        "requested_by": {"type": "string", "default": "human"},
+        "scope": {
+          "type": "object",
+          "required": ["repositories"],
+          "properties": {
+            "repositories": {"type": "array", "items": {"type": "string"}},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "live_systems": {"type": "boolean", "default": false}
+          }
+        },
+        "acceptance_criteria": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "object",
+          "properties": {
+            "provider": {"type": "string"},
+            "profile": {"type": "string"}
+          }
+        },
+        "execution": {
+          "type": "object",
+          "properties": {
+            "worktree": {"type": "string"},
+            "branch": {"type": "string"},
+            "base_sha": {"type": "string"}
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": ["global", "domain", "repository"],
+      "properties": {
+        "global": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "version": {"type": "string"}, "digest": {"type": "string"}}}},
+        "domain": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "version": {"type": "string"}}}},
+        "repository": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "version": {"type": "string"}}}},
+        "task_overrides": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "version": {"type": "string"}}}}
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["allowed", "requires_confirmation", "forbidden"],
+      "properties": {
+        "allowed": {"type": "array", "items": {"type": "string"}},
+        "requires_confirmation": {"type": "array", "items": {"type": "string"}},
+        "forbidden": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["required"],
+      "properties": {
+        "required": {"type": "array", "items": {"type": "string"}},
+        "classification": {"type": "array", "items": {"type": "string", "enum": ["observed", "inferred", "unverified"]}}
+      }
+    },
+    "rendering": {
+      "type": "object",
+      "required": ["format", "include"],
+      "properties": {
+        "format": {"type": "string", "enum": ["markdown", "json", "text"]},
+        "include": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

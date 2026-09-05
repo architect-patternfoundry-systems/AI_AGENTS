@@ -1,0 +1,42 @@
+schema_version: v1
+title: Assess Attunement Simulator runtime dispatcher
+mode: assess
+agent_profile: antigravity-cli
+
+scope:
+  repositories:
+    - neural_mesh_canvas
+  paths:
+    - attunement-simulator.py
+  permitted_operations:
+    - read
+    - git-status
+    - git-diff
+    - git-log
+    - local-tests
+  prohibited_operations:
+    - modify-source
+    - deploy
+    - network-policy-change
+    - cloudflare-change
+    - neo4j-write
+    - begin-phase-2
+
+acceptance_criteria:
+  - Enumerate each dispatcher entry point (Streamlit, --output, --auto, --cli-sim) with file and line references
+  - Identify any invocation path that could accidentally run terminal input in a Streamlit process
+  - Identify imports or initialization paths that could cause side effects before mode selection
+  - Confirm or reject whether Port 8516 Streamlit behavior is preserved by tracked source code
+  - Report only evidence from tracked files
+  - Run no live-service mutation commands
+  - Produce the complete final-report format with no repository changes
+
+notes: |
+  Read before acting:
+  - AGENTS.md
+  - ARTIFACTS.md
+  - docs/artifacts/attunement_simulator_v2_integration_assessment.md
+  - config/app-intent.yaml entry for attunement-simulator
+  - existing deployment/runbook documentation for Port 8516
+
+  Phase 2 / Port 8538 is out of scope.

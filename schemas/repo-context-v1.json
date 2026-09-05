@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-agents.patternfoundry.dev/schemas/repo-context-v1.json",
+  "title": "Repository Context Manifest v1",
+  "description": "Per-repository context: policy roots, artifact governance, sensitive paths, verification profiles.",
+  "type": "object",
+  "required": ["schema_version", "repository", "policy_roots"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "v1"},
+    "repository": {"type": "string"},
+    "path": {"type": "string", "description": "Absolute path to the repository root"},
+    "policy_roots": {"type": "array", "items": {"type": "string"}},
+    "artifact_governance": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "taxonomy": {"type": "array", "items": {"type": "string"}},
+        "mirror_directory": {"type": "string"},
+        "index_file": {"type": "string"}
+      }
+    },
+    "sensitive_paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "classification"],
+        "properties": {
+          "path": {"type": "string"},
+          "classification": {"type": "string"},
+          "required_approval": {"type": "string"},
+          "validation": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "verification_profiles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "working_directory": {"type": "string"},
+          "commands": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "known_services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "port": {"type": "integer"},
+          "domain": {"type": "string"},
+          "classification": {"type": "string"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,99 @@
+schema_version: v1
+repository: neural_mesh_canvas
+path: /home/cortex/workspace/neural_mesh_canvas
+
+policy_roots:
+  - AGENTS.md
+  - .devin/instructions.md
+
+artifact_governance:
+  enabled: true
+  taxonomy:
+    - PROPOSAL
+    - SPEC
+    - RUNBOOK
+    - CHECKLIST
+    - REPORT
+  mirror_directory: docs/artifacts
+  index_file: ARTIFACTS.md
+
+sensitive_paths:
+  - path: attunement-simulator.py
+    classification: production-sensitive
+    required_approval: explicit-user
+    note: Production Streamlit app on Port 8516 with multi-mode dispatcher
+  - path: config/app-intent.yaml
+    classification: fleet-control-plane
+    required_approval: explicit-user
+    validation:
+      - python3 -m shared.manifest_loader verify-all
+      - python3 scripts/verify_app_dependencies.py --all
+    note: 46+ workloads. Do not add/remove/rename/exempt without documenting owner, verification, and rollback.
+  - path: lazy_canvas_gateway.py
+    classification: production-sensitive
+    required_approval: explicit-user
+    note: Ingress gateway with WebSocket readiness polling
+  - path: scripts/verify_app_dependencies.py
+    classification: verification-harness
+    required_approval: explicit-user
+  - path: tests/test_manifest_loader.py
+    classification: verification-harness
+    required_approval: explicit-user
+    note: Contains KNOWN_VERIFICATION_EXCEPTIONS
+  - path: start_apps.sh
+    classification: fleet-startup
+    required_approval: explicit-user
+    note: Authoritative source for workload counts and port allocations
+
+verification_profiles:
+  dialethia-news:
+    working_directory: apps/dialethia-news
+    commands:
+      - npm run generate-issues
+      - npm run validate-content
+      - npm run test:parser
+      - npm run check-generated
+      - npm run build
+      - node scripts/test-rendered.mjs
+  repository-wide:
+    working_directory: .
+    commands:
+      - python3 -m pytest tests/test_manifest_loader.py -x -q
+      - python3 -m shared.manifest_loader verify-all
+      - python3 scripts/verify_app_dependencies.py --all
+  infrastructure:
+    working_directory: <infrastructure-worktree>/opentofu/cloudflare/envs/prod
+    commands:
+      - tofu plan
+    note: Use the path discovered during start-of-task checklist. Do not assume /home/cortex/workspace/... exists.
+
+known_services:
+  - name: attunement-simulator
+    port: 8516
+    domain: attunement-canvas.patternfoundry.dev
+    classification: production-sensitive
+  - name: governed-intentionality
+    port: 8505
+    domain: governance.patternfoundry.dev
+    classification: production-sensitive
+  - name: resonance-engine
+    port: 8527
+    domain: resonance.patternfoundry.dev
+    classification: production-sensitive
+  - name: quiet-bench
+    port: 8541
+    domain: bench-canvas.patternfoundry.dev
+    classification: production
+  - name: needs-literacy-observatory
+    port: 8538
+    domain: needs-canvas.patternfoundry.dev
+    classification: not-yet-deployed
+    note: Phase 2 — out of scope unless explicitly assigned
+
+generated_artifacts:
+  - source: Dialethia_News/ (Git submodule)
+    generator: npm run generate-issues
+    output: apps/dialethia-news/src/data/issues.generated.ts
+    policy: committed-for-review
+    deterministic: true
+    note: Do not hand-edit. Regenerate from Markdown sources.

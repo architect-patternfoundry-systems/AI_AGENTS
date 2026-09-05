@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# agent-invoke: convenience wrapper for the Agent Invocation Control Plane
+# Usage: agent-invoke <command> [options]
+#   agent-invoke discover --repo /path/to/repo
+#   agent-invoke compose --repo neural_mesh_canvas --agent antigravity-cli --task-file attunement-dispatcher-assessment.yaml
+#   agent-invoke doctor
+
+exec python3 "$(dirname "$0")/agent_invoke/cli.py" "$@"
