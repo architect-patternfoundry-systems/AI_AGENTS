@@ -90,6 +90,7 @@ from platform_orchestration_contracts import (
     RotationExecutionGates,
     RotationEligibility,
     evaluate_rotation_eligibility,
+    RotationBlocked,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -1839,3 +1840,230 @@ def test_eligibility_is_rotation_eligibility_type():
         capabilities=_full_caps(),
     )
     assert isinstance(eligibility, RotationEligibility)
+
+
+# --- Input validation, fingerprint binding, RotationBlocked ---
+
+
+def test_eligibility_has_input_fingerprint():
+    """Eligibility record includes an input fingerprint for immutable binding."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-minio-writer",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    assert eligibility.input_fingerprint.startswith("sha256:")
+    assert len(eligibility.input_fingerprint) > len("sha256:")
+
+
+def test_eligibility_fingerprint_changes_with_inputs():
+    """Different inputs produce different fingerprints."""
+    caps = _full_caps()
+    e1 = evaluate_rotation_eligibility(
+        credential_set_id="cts-minio",
+        risk_tier=RISK_LOW,
+        capabilities=caps,
+        policy_version="1",
+    )
+    e2 = evaluate_rotation_eligibility(
+        credential_set_id="cts-postgres",
+        risk_tier=RISK_LOW,
+        capabilities=caps,
+        policy_version="1",
+    )
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_eligibility_fingerprint_changes_with_risk_tier():
+    """Same credential at different risk tiers produces different fingerprints."""
+    caps = _full_caps()
+    e1 = evaluate_rotation_eligibility(
+        credential_set_id="cts-cred",
+        risk_tier=RISK_LOW,
+        capabilities=caps,
+        policy_version="1",
+    )
+    e2 = evaluate_rotation_eligibility(
+        credential_set_id="cts-cred",
+        risk_tier=RISK_HIGH,
+        capabilities=caps,
+        policy_version="1",
+    )
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_eligibility_fingerprint_changes_with_policy_version():
+    """Different policy versions produce different fingerprints."""
+    caps = _full_caps()
+    e1 = evaluate_rotation_eligibility(
+        credential_set_id="cts-cred",
+        risk_tier=RISK_LOW,
+        capabilities=caps,
+        policy_version="1",
+    )
+    e2 = evaluate_rotation_eligibility(
+        credential_set_id="cts-cred",
+        risk_tier=RISK_LOW,
+        capabilities=caps,
+        policy_version="2",
+    )
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_eligibility_fingerprint_changes_with_gates():
+    """Critical eligibility with different gates produces different fingerprints."""
+    caps = _full_caps()
+    e1 = evaluate_rotation_eligibility(
+        credential_set_id="cts-admin",
+        risk_tier=RISK_CRITICAL,
+        capabilities=caps,
+        gates=_full_gates(),
+        policy_version="1",
+    )
+    e2 = evaluate_rotation_eligibility(
+        credential_set_id="cts-admin",
+        risk_tier=RISK_CRITICAL,
+        capabilities=caps,
+        gates=RotationExecutionGates(
+            approval_policy_configured=True,
+            canary_cutover_configured=True,
+            immutable_evidence_store=True,
+            emergency_recovery_plan_verified=False,
+        ),
+        policy_version="1",
+    )
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_eligibility_fingerprint_deterministic():
+    """Same inputs produce the same fingerprint."""
+    caps = _full_caps()
+    e1 = evaluate_rotation_eligibility(
+        credential_set_id="cts-cred",
+        risk_tier=RISK_MEDIUM,
+        capabilities=caps,
+        policy_version="1",
+    )
+    e2 = evaluate_rotation_eligibility(
+        credential_set_id="cts-cred",
+        risk_tier=RISK_MEDIUM,
+        capabilities=caps,
+        policy_version="1",
+    )
+    assert e1.input_fingerprint == e2.input_fingerprint
+
+
+def test_eligibility_invalid_risk_tier_raises():
+    """Unknown risk tier raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="risk_tier"):
+        evaluate_rotation_eligibility(
+            credential_set_id="cts-cred",
+            risk_tier="unknown",
+            capabilities=_full_caps(),
+        )
+
+
+def test_eligibility_invalid_credential_set_id_raises():
+    """Invalid credential_set_id grammar raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="credential_set_id"):
+        evaluate_rotation_eligibility(
+            credential_set_id="UPPERCASE-BAD",
+            risk_tier=RISK_LOW,
+            capabilities=_full_caps(),
+        )
+
+
+def test_eligibility_empty_credential_set_id_raises():
+    """Empty credential_set_id raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="credential_set_id"):
+        evaluate_rotation_eligibility(
+            credential_set_id="",
+            risk_tier=RISK_LOW,
+            capabilities=_full_caps(),
+        )
+
+
+def test_eligibility_empty_policy_version_raises():
+    """Empty policy_version raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError, match="policy_version"):
+        evaluate_rotation_eligibility(
+            credential_set_id="cts-cred",
+            risk_tier=RISK_LOW,
+            capabilities=_full_caps(),
+            policy_version="",
+        )
+
+
+def test_eligibility_all_blockers_deduplicated():
+    """all_blockers deduplicates entries that appear in both dimensions."""
+    # Construct an eligibility where the same blocker could appear in both
+    # provider and execution blockers. We test the property directly.
+    eligibility = RotationEligibility(
+        credential_set_id="test",
+        risk_tier=RISK_CRITICAL,
+        provider_ready=False,
+        execution_ready=False,
+        eligible=False,
+        provider_blockers=("secret_authority", "overlap_support"),
+        execution_blockers=("secret_authority", "approval_policy_configured"),
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        policy_version="1",
+        input_fingerprint="sha256:test",
+    )
+    combined = eligibility.all_blockers
+    # "secret_authority" appears in both but should only appear once
+    assert combined.count("secret_authority") == 1
+    assert "overlap_support" in combined
+    assert "approval_policy_configured" in combined
+
+
+def test_rotation_blocked_exception():
+    """RotationBlocked carries credential_set_id, blockers, and policy_version."""
+    exc = RotationBlocked(
+        credential_set_id="cts-postgres-admin",
+        blockers=("approval_policy_configured", "canary_cutover_configured"),
+        policy_version="2",
+    )
+    assert exc.credential_set_id == "cts-postgres-admin"
+    assert "approval_policy_configured" in exc.blockers
+    assert exc.policy_version == "2"
+    assert "cts-postgres-admin" in str(exc)
+
+
+def test_rotation_blocked_from_eligibility():
+    """RotationBlocked can be raised from an ineligible eligibility decision."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-admin",
+        risk_tier=RISK_CRITICAL,
+        capabilities=_full_caps(),
+        gates=None,  # no gates → not eligible
+        policy_version="1",
+    )
+    assert eligibility.eligible is False
+    if not eligibility.eligible:
+        exc = RotationBlocked(
+            credential_set_id=eligibility.credential_set_id,
+            blockers=eligibility.all_blockers,
+            policy_version=eligibility.policy_version,
+        )
+    assert "rotation_execution_gates_missing" in exc.blockers
+
+
+def test_high_tier_execution_gates_intentionally_not_evaluated():
+    """High-tier eligibility does not check execution gates (documented policy)."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-postgres-runtime",
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        gates=None,  # no gates provided, but high-tier doesn't need them
+        policy_version="1",
+    )
+    # High-tier: execution_ready is True even without gates
+    assert eligibility.execution_ready is True
+    assert eligibility.execution_blockers == ()
+    assert eligibility.eligible is True
