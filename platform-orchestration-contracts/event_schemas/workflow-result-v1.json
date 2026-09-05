@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://patternfoundry.dev/schemas/workflow-result-v1.json",
+  "title": "Workflow Result Envelope v1",
+  "description": "Standard portable result produced by every Temporal workflow on completion (ADR-036).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["workflow_id", "run_id", "status"],
+  "properties": {
+    "workflow_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "completed_with_warnings",
+        "failed",
+        "cancelled",
+        "awaiting_approval",
+        "degraded"
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requested_items": { "type": "integer", "minimum": 0 },
+        "generated_items": { "type": "integer", "minimum": 0 },
+        "skipped_items": { "type": "integer", "minimum": 0 },
+        "failed_items": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "uri", "checksum"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "uri": { "type": "string", "minLength": 1 },
+          "checksum": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+        }
+      }
+    },
+    "catalog_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["system", "entity_type", "entity_id"],
+        "properties": {
+          "system": { "type": "string", "minLength": 1 },
+          "entity_type": { "type": "string", "minLength": 1 },
+          "entity_id": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "scope"],
+        "properties": {
+          "code": { "type": "string", "minLength": 1 },
+          "scope": { "type": "string", "minLength": 1 },
+          "message": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "correlation_id": { "type": ["string", "null"] }
+  }
+}

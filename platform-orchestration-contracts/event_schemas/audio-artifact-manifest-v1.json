@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://patternfoundry.dev/schemas/audio-artifact-manifest-v1.json",
+  "title": "Audio Artifact Manifest v1",
+  "description": "Canonical manifest accepted by Nexus and emitted by CTS, Casting Signal, ToneRoot, and any audio producer (ADR-036).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "manifest_id", "batch_id", "workflow_id", "source_app", "tenant_id", "provenance", "files"],
+  "properties": {
+    "manifest_version": { "type": "string", "const": "1" },
+    "manifest_id": { "type": "string", "minLength": 1 },
+    "batch_id": { "type": "string", "minLength": 1 },
+    "workflow_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string" },
+    "correlation_id": { "type": ["string", "null"] },
+    "source_app": { "type": "string", "minLength": 1 },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": ["string", "null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_script_checksum"],
+      "properties": {
+        "source_script_checksum": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "voice_reference_id": { "type": ["string", "null"] },
+        "voice_reference_checksum": { "type": ["string", "null"] },
+        "engine": { "type": "string", "minLength": 1 },
+        "engine_version": { "type": ["string", "null"] },
+        "model_id": { "type": ["string", "null"] },
+        "generation_parameters": { "type": "object" }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "format", "sample_rate_hz", "channels", "duration_seconds", "checksum", "locale", "voice"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "format": { "type": "string", "enum": ["wav", "mp3", "flac", "ogg"] },
+          "sample_rate_hz": { "type": "integer", "minimum": 1 },
+          "channels": { "type": "integer", "minimum": 1 },
+          "duration_seconds": { "type": "number", "minimum": 0 },
+          "checksum": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "locale": { "type": "string", "minLength": 1 },
+          "voice": { "type": "string", "minLength": 1 },
+          "node": { "type": ["string", "null"] },
+          "normalized": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    "nexus_catalog_id": { "type": ["string", "null"] },
+    "playback_base_url": { "type": ["string", "null"] }
+  }
+}
