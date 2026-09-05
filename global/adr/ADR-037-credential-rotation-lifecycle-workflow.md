@@ -432,15 +432,160 @@ The workflow uses the standard `WorkflowEnvelope` with `contract_version`, `work
 
 The rotation input and result are specialized envelope types (`RotationInput`, `RotationResult`) that extend the base contract with credential-specific fields while preserving the secret-safe property: no credential values appear in any serialized form.
 
-## 16. Practical rollout path
+## 16. Ownership model
+
+A single "Owner" column is insufficient. Credential rotation involves three distinct roles with different responsibilities. Making these explicit prevents the quiet failure mode where "operator rotates password" becomes a permanent, undocumented operating model.
+
+### 16.1 Three-role model
+
+| Role | Responsibility | Human or platform? |
+|---|---|---|
+| **Credential owner** | Defines business purpose, allowed consumers, risk tier, and rotation policy | A named team/service owner; accountable but not performing rotations |
+| **Rotation executor** | Generates/stages/cuts over/revokes credentials and collects evidence | `CredentialRotationWorkflow` plus provider-specific workers |
+| **Exception approver** | Approves only policy-defined high-risk steps or resolves failed rotations | Human only when required by policy or incident severity |
+
+### 16.2 Example assignments
+
+| Credential set | Credential owner | Rotation executor | Exception approver |
+|---|---|---|---|
+| `cts-postgres-runtime` | CTS platform owner | `CredentialRotationWorkflow` | Database/platform approver for first enrollment or emergency revocation |
+| `cts-minio-writer` | CTS platform owner | `CredentialRotationWorkflow` | Security approver only if policy requires |
+| `nexus-s3-publisher` | Nexus owner | `CredentialRotationWorkflow` | Nexus/security approver for destructive scope changes |
+
+### 16.3 Why a one-time operator step exists
+
+The first rotation is special because automation cannot safely rotate a secret it does not yet control. The platform currently has these bootstrapping gaps:
+
+1. The exposed credentials must be invalidated immediately.
+2. Kubernetes Secrets need to be seeded with post-rotation values.
+3. Secret-manager authority may not yet be deployed or trusted by workloads.
+4. The `CredentialRotationWorkflow` worker and provider adapters are not implemented yet.
+5. PostgreSQL runtime identities need to be split away from an administrative connection identity.
+6. MinIO needs a scoped service-account model or a similar replacement identity.
+7. The workflow needs a credential with authority to create/revoke successor credentials — but that authority itself must be carefully scoped and protected.
+
+The right approach is a **one-time bootstrap rotation**, followed immediately by enrolling the new credential set into automated management. The existing exposed credential must not remain active until full automation exists.
+
+### 16.4 Two kinds of manual work
+
+**Manual once: establish trust.** A human must initially commission the control plane:
+- Deploy/configure secret authority.
+- Create scoped rotation identities.
+- Seed the initial managed secret version.
+- Give the rotation worker narrowly scoped capability to create/revoke successors.
+- Enroll workloads and validate rollout/reload behavior.
+- Validate that evidence does not leak secret material.
+- Approve the policy for first automatic rotation.
+
+This is infrastructure commissioning, not routine credential operation.
+
+**Automatic thereafter: rotate normally.** Once enrolled:
+- Temporal Schedule triggers rotation.
+- Workflow obtains rotation lock.
+- Provider adapter creates successor credentials.
+- Secret authority stores a new version.
+- External Secrets syncs / Kubernetes rollout applies it.
+- Verification activities test real workload behavior.
+- Workflow drains/revokes predecessor.
+- Evidence is written.
+- Owners receive an outcome notification.
+
+No person needs to copy a password, type a password, create a Secret manually, or restart pods manually during a normal rotation.
+
+### 16.5 RACI for the mature state
+
+| Activity | Platform security | App owner | Rotation workflow | Secret provider | Human operator |
+|---|---|---|---|---|---|
+| Define rotation policy | A/R | C | I | I | I |
+| Register credential/consumers | A | R | I | I | C |
+| Generate successor | I | I | R | Executes | I |
+| Deliver updated secret | I | I | R | Stores/version-controls | I |
+| Roll consumers | I | I | R | I | I |
+| Verify cutover | I | I | R | I | I |
+| Revoke predecessor | A | I | R | Executes | I |
+| Review evidence | A | C | Produces | I | I |
+| Handle failed rotation | A | C | Detects/escalates | C | R only by exception |
+| Emergency exposure event | A | C | R for policy-approved path | Executes | R only if automation cannot safely proceed |
+
+The human operator is **not on the normal-path execution flow**. They are an exception handler.
+
+## 17. Enrollment lifecycle
+
+A credential set moves through a defined lifecycle from discovery to automated management. The lifecycle state determines whether human intervention is expected, allowed, or prohibited.
+
+### 17.1 Lifecycle states
+
+```text
+discovered
+  → bootstrap_required
+  → enrolled
+  → rotation_ready
+  → automatically_managed
+  → rotation_degraded
+  → emergency_rotation
+  → retired
+```
+
+| State | Meaning | Rotation behavior |
+|---|---|---|
+| `discovered` | Credential exists but has not been inventoried | No automated action |
+| `bootstrap_required` | Credential is known, but secret authority/workload integration is not ready | One-time human-assisted remediation |
+| `enrolled` | Secret is stored in approved authority and consumers are mapped | Validation only |
+| `rotation_ready` | Successor creation, deployment cutover, verification, rollback, and revocation paths have passed a dry run | Scheduled workflow may be enabled |
+| `automatically_managed` | Normal state | Scheduled and event-driven rotations are workflow-owned |
+| `rotation_degraded` | Automation cannot complete safely | Preserve current credential; alert and open exception workflow |
+| `emergency_rotation` | Exposure or compromise trigger | Automated fast path; human approval only if policy requires |
+| `retired` | Credential set no longer in use | Revoke, delete secrets, archive evidence |
+
+### 17.2 Transition plan
+
+A credential set listed as human-assisted must have an explicit transition plan. "Operator" is a **transition executor**, not the permanent owner of a recurring task.
+
+| Item | Current executor | Target executor | Transition criterion |
+|---|---|---|---|
+| Rotate exposed PostgreSQL credential | Human-assisted bootstrap | `CredentialRotationWorkflow` | Runtime roles, secret authority, rollout verification, and revoke adapter are enrolled |
+| Rotate MinIO root/service credential | Human-assisted bootstrap | `CredentialRotationWorkflow` | Scoped service account and MinIO provider adapter exist |
+| Create workload-facing Kubernetes secret | Bootstrap deployment action | External Secrets Operator or equivalent | Secret authority source and sync policy are configured |
+| Restart/reload consumers | Bootstrap deployment action | Rotation workflow + rollout adapter | Workload health and dependency probes are automated |
+| Verify old secret invalidation | Human oversight initially | Rotation verification activity | Old credential rejection probe succeeds |
+| Recurring rotation | Not yet enabled | Temporal Schedule → rotation workflow | Credential set reaches `rotation_ready` |
+
+### 17.3 Automation tracking field
+
+Each credential set carries an automation tracking record that makes the human burden visible, temporary, measurable, and removable:
+
+```yaml
+automation:
+  lifecycle_state: bootstrap_required
+  target_state: automatically_managed
+  enrollment_deadline: 2026-10-01
+  current_exception: "exposed static password; secret authority not yet enrolled"
+  manual_steps_remaining:
+    - rotate current exposed credential
+    - provision scoped rotation identity
+    - seed first managed secret version
+    - validate end-to-end dry run
+```
+
+### 17.4 Bootstrap boundary statement
+
+Bootstrap rotations are a temporary remediation state, not an operating model. A credential set may be listed as human-assisted only while it is in `bootstrap_required` or `rotation_ready` enrollment. It must have:
+- a named transition plan,
+- an automation target,
+- an enrollment deadline,
+- an owner accountable for making it `automatically_managed`.
+
+Routine scheduled rotations for `automatically_managed` credential sets must be performed by `CredentialRotationWorkflow` without human handling of secret values.
+
+## 18. Practical rollout path
 
 ### Phase 1: Make static secrets safer (current)
 
-- Rotate the already exposed credentials immediately (manual, per runbook).
+- Rotate the already exposed credentials immediately (manual bootstrap, per runbook).
 - Move all runtime secrets to Kubernetes Secrets referenced by `secretKeyRef` (CTS PR #4).
 - Introduce non-owner, least-privilege runtime roles.
 - Add secret scanning in pre-commit and CI.
-- Add a credential inventory with owner, consumers, secret backend, last rotation, and next due date.
+- Add a credential inventory with owner, consumers, secret backend, last rotation, next due date, and lifecycle state.
 
 ### Phase 2: Automate safe rotations
 
@@ -450,6 +595,7 @@ The rotation input and result are specialized envelope types (`RotationInput`, `
 - Start with a low-risk MinIO scoped service account.
 - Add verification and rollback evidence.
 - Run in staging, then rotate one production-like credential with an operator approval gate.
+- Move credential sets from `bootstrap_required` → `enrolled` → `rotation_ready` → `automatically_managed`.
 
 ### Phase 3: Reduce static credential use
 
@@ -458,7 +604,7 @@ The rotation input and result are specialized envelope types (`RotationInput`, `
 - Use certificates and automatic renewal where possible.
 - Treat password rotation as an exception path for remaining legacy dependencies.
 
-## 17. Recommended first automated rotation
+## 19. Recommended first automated rotation
 
 1. **CTS MinIO scoped service account rotation** — lowest risk, proves the full workflow without touching the database path.
 2. **CTS PostgreSQL blue/green runtime roles** — second, after separating runtime privileges from `cortex_db_admin`.
@@ -466,7 +612,7 @@ The rotation input and result are specialized envelope types (`RotationInput`, `
 
 That sequence proves the entire secure workflow — generate, stage, synchronize, roll, verify, revoke, audit — without putting the main CTS database path at risk first.
 
-## 18. Acceptance criteria
+## 20. Acceptance criteria
 
 ADR-037 is **adopted** when:
 
@@ -478,7 +624,27 @@ ADR-037 is **adopted** when:
 6. The rotation survived a simulated consumer failure with successful rollback.
 7. An emergency rotation trigger was tested and completed within the emergency grace period.
 
-## 19. References
+### 20.1 Operator-free rotation criterion
+
+For an `automatically_managed` credential set, a normal scheduled rotation must complete without a human accessing, seeing, copying, generating, transporting, or manually applying the secret value.
+
+Measurable acceptance:
+
+```text
+Given a scheduled rotation of an enrolled non-production credential:
+  - no human shell command is required;
+  - no plaintext secret appears in workflow input, logs, activity result,
+    Kubernetes manifest, Git diff, or ticket;
+  - a successor is generated and stored only in the secret authority;
+  - consumers are updated and verified;
+  - predecessor is revoked;
+  - workflow evidence proves success;
+  - a human receives only a notification/result, not the secret.
+```
+
+This is the definition of done for the steady-state operating model.
+
+## 21. References
 
 - ADR-032: Federated Governance & Multi-Plane Evidence Architecture
 - ADR-036: Temporal Integration Standard — Cross-App Durable Orchestration

@@ -64,6 +64,45 @@ VERIFICATION_READ_WRITE_PROBE = "read_write_probe"
 VERIFICATION_OBJECT_STORAGE_ACCESS = "object_storage_access"
 VERIFICATION_OLD_CREDENTIAL_REJECTED = "old_credential_rejected"
 
+# --- Enrollment lifecycle states (ADR-037 section 17) ---
+#
+# A credential set moves through these states from discovery to
+# automated management. The lifecycle state determines whether human
+# intervention is expected, allowed, or prohibited.
+
+LIFECYCLE_DISCOVERED = "discovered"
+LIFECYCLE_BOOTSTRAP_REQUIRED = "bootstrap_required"
+LIFECYCLE_ENROLLED = "enrolled"
+LIFECYCLE_ROTATION_READY = "rotation_ready"
+LIFECYCLE_AUTOMATICALLY_MANAGED = "automatically_managed"
+LIFECYCLE_ROTATION_DEGRADED = "rotation_degraded"
+LIFECYCLE_EMERGENCY_ROTATION = "emergency_rotation"
+LIFECYCLE_RETIRED = "retired"
+
+ALL_LIFECYCLE_STATES = (
+    LIFECYCLE_DISCOVERED,
+    LIFECYCLE_BOOTSTRAP_REQUIRED,
+    LIFECYCLE_ENROLLED,
+    LIFECYCLE_ROTATION_READY,
+    LIFECYCLE_AUTOMATICALLY_MANAGED,
+    LIFECYCLE_ROTATION_DEGRADED,
+    LIFECYCLE_EMERGENCY_ROTATION,
+    LIFECYCLE_RETIRED,
+)
+
+# States where human-assisted rotation is expected (temporary)
+HUMAN_ASSISTED_STATES = frozenset({
+    LIFECYCLE_DISCOVERED,
+    LIFECYCLE_BOOTSTRAP_REQUIRED,
+})
+
+# States where the workflow owns rotation (steady state)
+WORKFLOW_OWNED_STATES = frozenset({
+    LIFECYCLE_ROTATION_READY,
+    LIFECYCLE_AUTOMATICALLY_MANAGED,
+    LIFECYCLE_EMERGENCY_ROTATION,
+})
+
 
 @dataclass(frozen=True)
 class SecretRef:
@@ -265,3 +304,46 @@ class RotationLock:
     state: str  # "rotating" | "completed" | "failed" | "expired"
     lock_owner_workflow_id: str
     lock_expires_at: str  # ISO timestamp
+
+
+@dataclass(frozen=True)
+class AutomationTracking:
+    """Tracks the enrollment lifecycle of a credential set.
+
+    Makes the human burden visible, temporary, measurable, and removable.
+    A credential set listed as human-assisted must have an explicit
+    transition plan with a target state and enrollment deadline.
+
+    See ADR-037 section 17.
+    """
+
+    credential_set_id: str
+    lifecycle_state: str  # one of ALL_LIFECYCLE_STATES
+    target_state: str = LIFECYCLE_AUTOMATICALLY_MANAGED
+    enrollment_deadline: Optional[str] = None  # ISO date
+    current_exception: Optional[str] = None
+    manual_steps_remaining: tuple[str, ...] = ()
+
+    @property
+    def is_human_assisted(self) -> bool:
+        """True if this credential set currently requires human intervention."""
+        return self.lifecycle_state in HUMAN_ASSISTED_STATES
+
+    @property
+    def is_workflow_owned(self) -> bool:
+        """True if rotation is owned by the workflow (steady state)."""
+        return self.lifecycle_state in WORKFLOW_OWNED_STATES
+
+    @property
+    def is_behind_deadline(self) -> bool:
+        """True if enrollment deadline has passed and not yet automatically managed."""
+        if not self.enrollment_deadline:
+            return False
+        if self.lifecycle_state == LIFECYCLE_AUTOMATICALLY_MANAGED:
+            return False
+        from datetime import date
+        try:
+            deadline = date.fromisoformat(self.enrollment_deadline)
+            return date.today() > deadline
+        except ValueError:
+            return False

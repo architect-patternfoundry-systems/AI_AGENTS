@@ -60,6 +60,19 @@ from platform_orchestration_contracts import (
     TRIGGER_SCHEDULED,
     TRIGGER_EXPOSURE,
     ROTATION_STEPS,
+    # enrollment lifecycle
+    AutomationTracking,
+    LIFECYCLE_DISCOVERED,
+    LIFECYCLE_BOOTSTRAP_REQUIRED,
+    LIFECYCLE_ENROLLED,
+    LIFECYCLE_ROTATION_READY,
+    LIFECYCLE_AUTOMATICALLY_MANAGED,
+    LIFECYCLE_ROTATION_DEGRADED,
+    LIFECYCLE_EMERGENCY_ROTATION,
+    LIFECYCLE_RETIRED,
+    ALL_LIFECYCLE_STATES,
+    HUMAN_ASSISTED_STATES,
+    WORKFLOW_OWNED_STATES,
 )
 
 
@@ -647,3 +660,101 @@ def test_security_task_queues():
         TASK_QUEUE_SECURITY_OBJECT_STORAGE,
     }
     assert media_queues.isdisjoint(security_queues)
+
+
+# --- Enrollment Lifecycle (ADR-037 section 17) ---
+
+
+def test_lifecycle_states_complete():
+    """All 8 lifecycle states are defined."""
+    assert len(ALL_LIFECYCLE_STATES) == 8
+    assert LIFECYCLE_DISCOVERED in ALL_LIFECYCLE_STATES
+    assert LIFECYCLE_AUTOMATICALLY_MANAGED in ALL_LIFECYCLE_STATES
+    assert LIFECYCLE_RETIRED in ALL_LIFECYCLE_STATES
+
+
+def test_human_assisted_states():
+    """discovered and bootstrap_required are human-assisted."""
+    assert LIFECYCLE_DISCOVERED in HUMAN_ASSISTED_STATES
+    assert LIFECYCLE_BOOTSTRAP_REQUIRED in HUMAN_ASSISTED_STATES
+    assert LIFECYCLE_AUTOMATICALLY_MANAGED not in HUMAN_ASSISTED_STATES
+    assert LIFECYCLE_ENROLLED not in HUMAN_ASSISTED_STATES
+
+
+def test_workflow_owned_states():
+    """rotation_ready, automatically_managed, and emergency_rotation are workflow-owned."""
+    assert LIFECYCLE_ROTATION_READY in WORKFLOW_OWNED_STATES
+    assert LIFECYCLE_AUTOMATICALLY_MANAGED in WORKFLOW_OWNED_STATES
+    assert LIFECYCLE_EMERGENCY_ROTATION in WORKFLOW_OWNED_STATES
+    assert LIFECYCLE_BOOTSTRAP_REQUIRED not in WORKFLOW_OWNED_STATES
+    assert LIFECYCLE_DISCOVERED not in WORKFLOW_OWNED_STATES
+
+
+def test_automation_tracking_bootstrap():
+    """A bootstrap_required credential set is human-assisted."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-postgres-runtime",
+        lifecycle_state=LIFECYCLE_BOOTSTRAP_REQUIRED,
+        target_state=LIFECYCLE_AUTOMATICALLY_MANAGED,
+        enrollment_deadline="2026-10-01",
+        current_exception="exposed static password; secret authority not yet enrolled",
+        manual_steps_remaining=(
+            "rotate current exposed credential",
+            "provision scoped rotation identity",
+            "seed first managed secret version",
+            "validate end-to-end dry run",
+        ),
+    )
+    assert tracking.is_human_assisted is True
+    assert tracking.is_workflow_owned is False
+    assert tracking.is_behind_deadline is False  # deadline is in the future
+
+
+def test_automation_tracking_automatically_managed():
+    """An automatically_managed credential set is workflow-owned."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-minio-writer",
+        lifecycle_state=LIFECYCLE_AUTOMATICALLY_MANAGED,
+    )
+    assert tracking.is_human_assisted is False
+    assert tracking.is_workflow_owned is True
+    assert tracking.is_behind_deadline is False
+
+
+def test_automation_tracking_behind_deadline():
+    """A bootstrap_required set with a past deadline is behind."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-postgres-runtime",
+        lifecycle_state=LIFECYCLE_BOOTSTRAP_REQUIRED,
+        enrollment_deadline="2020-01-01",  # past
+    )
+    assert tracking.is_behind_deadline is True
+
+
+def test_automation_tracking_no_deadline():
+    """No deadline means not behind."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-postgres-runtime",
+        lifecycle_state=LIFECYCLE_BOOTSTRAP_REQUIRED,
+    )
+    assert tracking.is_behind_deadline is False
+
+
+def test_automation_tracking_managed_ignores_deadline():
+    """automatically_managed is never behind deadline regardless of date."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-postgres-runtime",
+        lifecycle_state=LIFECYCLE_AUTOMATICALLY_MANAGED,
+        enrollment_deadline="2020-01-01",  # past, but already managed
+    )
+    assert tracking.is_behind_deadline is False
+
+
+def test_automation_tracking_discovered_is_human_assisted():
+    """discovered state is human-assisted (not yet inventoried)."""
+    tracking = AutomationTracking(
+        credential_set_id="unknown-credential",
+        lifecycle_state=LIFECYCLE_DISCOVERED,
+    )
+    assert tracking.is_human_assisted is True
+    assert tracking.is_workflow_owned is False
