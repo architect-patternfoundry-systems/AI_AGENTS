@@ -1,0 +1,87 @@
+schema_version: v1
+title: Fix encoding corruption in issues.generated.ts from Issue 21 commit
+mode: fix
+agent_profile: antigravity-cli
+
+scope:
+  repositories:
+    - neural_mesh_canvas
+  paths:
+    - apps/dialethia-news/src/data/issues.generated.ts
+    - apps/dialethia-news/scripts/generate-issues.mjs
+  permitted_operations:
+    - read
+    - git-status
+    - git-diff
+    - git-log
+    - git-commit
+    - git-push
+    - edit-files
+    - run-tests
+    - create-pull-request
+    - install-nodejs
+  prohibited_operations:
+    - deploy
+    - modify-source-non-dialethia
+    - cloudflare-change
+    - neo4j-write
+    - kubernetes-apply
+    - begin-phase-2
+
+acceptance_criteria:
+  - "Run the agent-invoke CLI to compose and read your own operating protocol before starting work"
+  - "Identify the encoding corruption — commit 281dc34c introduced \\uXXXX escape sequences across 70 lines in issues.generated.ts (em-dashes, curly quotes, Roman numerals, box-drawing characters converted to ASCII escapes by Python json.dumps with ensure_ascii=True)"
+  - "Regenerate issues.generated.ts using the canonical Node.js generator (npm run generate-issues), NOT a Python script"
+  - "If Node.js is not installed, install it (nvm, fnm, or apt) and verify npm is available before proceeding"
+  - "Verify the regenerated file contains proper UTF-8 characters (em-dashes as —, not \\u2014) by inspecting the diff"
+  - "Run the full Dialethia validation pipeline — npm run generate-issues, npm run validate-content, npm run test:parser, npm run check-generated, npm run build, node scripts/test-rendered.mjs"
+  - "All 30 parser tests must pass, all 9 rendered tests must pass, all parity checks must pass"
+  - "Amend commit 281dc34c or create a new fix commit on the feature/dialethia-issue21-the-ethics-engine branch"
+  - "Open a PR for the feature branch if one does not already exist"
+  - "Do not modify any files outside apps/dialethia-news/ except to install Node.js"
+  - "Report the exact validation commands run and their pass/fail results"
+  - "Produce the complete final-report format"
+
+notes: |
+  ## Context
+
+  A previous agent (Antigravity) created Issue 21 of the Dialethia News correctly in the
+  Markdown source and content submodule, but corrupted the generated TypeScript file
+  (issues.generated.ts) by using Python's json.dumps() with ensure_ascii=True instead of
+  the canonical Node.js generator. This converted all non-ASCII characters across ALL 20
+  existing issues to \uXXXX escape sequences.
+
+  The Markdown source (issue-21.md) and content submodule are correct — only the
+  generated TypeScript file needs regeneration.
+
+  ## How to use the agent-invoke CLI
+
+  Before starting work, compose your operating protocol:
+
+  ```bash
+  python3 /home/cortex/workspace/AI_AGENTS/cli/agent_invoke/cli.py compose \
+    --repo neural_mesh_canvas \
+    --agent antigravity-cli \
+    --task-file /home/cortex/workspace/AI_AGENTS/tasks/fix-issue21-encoding-corruption.yaml \
+    --format markdown
+  ```
+
+  Read the output carefully. It contains the cross-agent operating protocol, repository
+  context (sensitive files, validation commands), and this task's scope and acceptance
+  criteria.
+
+  ## Key constraint
+
+  Do NOT hand-edit issues.generated.ts. Run `npm run generate-issues` to regenerate it
+  from the Markdown sources. The generator is the canonical source of truth for this file.
+  Hand-editing generated files is prohibited by the operating protocol.
+
+  ## Node.js discovery
+
+  If `which node` or `which npm` fails, try:
+  - `source ~/.nvm/nvm.sh && nvm use node` or `nvm use --lts`
+  - `export PATH="$HOME/.local/share/fnm/aliases/default/bin:$PATH"`
+  - Install via nvm: `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash && source ~/.nvm/nvm.sh && nvm install --lts`
+  - Or via apt: `sudo apt-get update && sudo apt-get install -y nodejs npm`
+
+  Verify: `node --version && npm --version`
