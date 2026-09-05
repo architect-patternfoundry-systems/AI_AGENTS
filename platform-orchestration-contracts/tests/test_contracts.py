@@ -93,6 +93,7 @@ from platform_orchestration_contracts import (
     evaluate_rotation_eligibility,
     RotationBlocked,
     WorkflowExecutionAuthorization,
+    evaluate_workflow_execution_authorization,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -2233,61 +2234,99 @@ def test_rotation_subject_to_dict():
 
 
 def test_workflow_execution_authorization_all_checks_pass():
-    """All execution checks passing means authorized."""
-    auth = WorkflowExecutionAuthorization(
-        credential_set_id="cts-postgres-runtime",
+    """All execution checks passing means authorized (derived, not caller-supplied)."""
+    eligibility = evaluate_rotation_eligibility(
+        subject=_make_subject("cts-postgres-runtime"),
         risk_tier=RISK_HIGH,
-        authorized=True,
-        blockers=(),
-        evaluated_at="2026-01-01T00:00:00+00:00",
+        capabilities=_full_caps(),
         policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=_make_subject("cts-postgres-runtime"),
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
         immutable_evidence_sink_available=True,
         rollback_plan_validated=True,
         approval_requirement_resolved=True,
         cutover_scope_matches_approved_plan=True,
         no_active_incident_freeze=True,
+        policy_version="1",
     )
     assert auth.authorized is True
     assert auth.all_blockers == ()
 
 
 def test_workflow_execution_authorization_missing_checks():
-    """Missing execution checks produce blockers."""
-    auth = WorkflowExecutionAuthorization(
-        credential_set_id="cts-postgres-runtime",
+    """Missing execution checks produce blockers and authorized is False (derived)."""
+    eligibility = evaluate_rotation_eligibility(
+        subject=_make_subject("cts-postgres-runtime"),
         risk_tier=RISK_HIGH,
-        authorized=False,
-        blockers=(),
-        evaluated_at="2026-01-01T00:00:00+00:00",
+        capabilities=_full_caps(),
         policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=_make_subject("cts-postgres-runtime"),
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
         immutable_evidence_sink_available=False,
         rollback_plan_validated=True,
         approval_requirement_resolved=False,
         cutover_scope_matches_approved_plan=True,
         no_active_incident_freeze=True,
+        policy_version="1",
     )
     blockers = auth.all_blockers
     assert "immutable_evidence_sink_unavailable" in blockers
     assert "approval_requirement_unresolved" in blockers
     assert "rollback_plan_not_validated" not in blockers
+    assert auth.authorized is False
 
 
 def test_workflow_execution_authorization_incident_freeze():
-    """Active incident freeze blocks execution."""
-    auth = WorkflowExecutionAuthorization(
-        credential_set_id="cts-postgres-runtime",
+    """Active incident freeze blocks execution (authorized derived as False)."""
+    eligibility = evaluate_rotation_eligibility(
+        subject=_make_subject("cts-postgres-runtime"),
         risk_tier=RISK_HIGH,
-        authorized=False,
-        blockers=(),
-        evaluated_at="2026-01-01T00:00:00+00:00",
+        capabilities=_full_caps(),
         policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=_make_subject("cts-postgres-runtime"),
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
         immutable_evidence_sink_available=True,
         rollback_plan_validated=True,
         approval_requirement_resolved=True,
         cutover_scope_matches_approved_plan=True,
         no_active_incident_freeze=False,
+        policy_version="1",
     )
     assert "active_incident_freeze" in auth.all_blockers
+    assert auth.authorized is False
+
+
+def test_workflow_execution_authorization_policy_blocker_denies():
+    """Explicit policy blocker with all checks true still denies authorization."""
+    eligibility = evaluate_rotation_eligibility(
+        subject=_make_subject("cts-cred"),
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=_make_subject("cts-cred"),
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_blockers=("manual_hold",),
+        policy_version="1",
+    )
+    assert auth.authorized is False
+    assert "manual_hold" in auth.all_blockers
 
 
 def test_high_tier_requires_both_eligibility_and_authorization():
@@ -2298,20 +2337,257 @@ def test_high_tier_requires_both_eligibility_and_authorization():
         capabilities=_full_caps(),
         policy_version="1",
     )
-    auth = WorkflowExecutionAuthorization(
-        credential_set_id="cts-postgres-runtime",
+    auth = evaluate_workflow_execution_authorization(
+        subject=_make_subject("cts-postgres-runtime"),
         risk_tier=RISK_HIGH,
-        authorized=False,
-        blockers=(),
-        evaluated_at="2026-01-01T00:00:00+00:00",
-        policy_version="1",
+        eligibility=eligibility,
         immutable_evidence_sink_available=True,
         rollback_plan_validated=True,
         approval_requirement_resolved=False,
         cutover_scope_matches_approved_plan=True,
         no_active_incident_freeze=True,
+        policy_version="1",
     )
     can_rotate = eligibility.eligible and auth.authorized
     assert eligibility.eligible is True
     assert auth.authorized is False
     assert can_rotate is False
+
+
+def test_authorization_subject_fingerprint_matches_eligibility():
+    """Authorization subject_fingerprint matches the eligibility input_fingerprint."""
+    subject = _make_subject("cts-postgres-runtime")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    assert auth.subject_fingerprint == eligibility.input_fingerprint
+    assert auth.matches_eligibility(eligibility) is True
+
+
+def test_authorization_subject_fingerprint_mismatch_blocks_mutation():
+    """Subject fingerprint mismatch between eligibility and authorization blocks mutation."""
+    subject_a = _make_subject("cts-cred-a")
+    subject_b = _make_subject("cts-cred-b")
+    eligibility_a = evaluate_rotation_eligibility(
+        subject=subject_a,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    # Create authorization bound to a different eligibility (different subject)
+    eligibility_b = evaluate_rotation_eligibility(
+        subject=subject_b,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth_for_b = evaluate_workflow_execution_authorization(
+        subject=subject_b,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility_b,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    # auth_for_b does NOT match eligibility_a
+    assert auth_for_b.matches_eligibility(eligibility_a) is False
+
+
+def test_authorization_execution_fingerprint_changes_with_inputs():
+    """Execution fingerprint changes when execution-time inputs change."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth1 = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    auth2 = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=False,  # changed
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    assert auth1.execution_fingerprint != auth2.execution_fingerprint
+
+
+def test_authorization_execution_fingerprint_changes_with_incident_freeze():
+    """Execution fingerprint changes when incident freeze state changes."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth1 = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    auth2 = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=False,  # incident freeze appeared
+        policy_version="1",
+    )
+    assert auth1.execution_fingerprint != auth2.execution_fingerprint
+
+
+def test_authorization_execution_fingerprint_deterministic():
+    """Same execution inputs produce the same execution fingerprint."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth1 = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    auth2 = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    assert auth1.execution_fingerprint == auth2.execution_fingerprint
+
+
+def test_critical_gate_fails_blocks_mutation_even_with_workflow_auth():
+    """Critical platform gate failure blocks mutation even if workflow auth passes."""
+    subject = _make_subject("cts-admin")
+    caps = _full_caps()
+    # Critical with missing gates → eligibility.eligible is False
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_CRITICAL,
+        capabilities=caps,
+        gates=None,
+        policy_version="1",
+    )
+    # Workflow authorization passes
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_CRITICAL,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    can_rotate = eligibility.eligible and auth.authorized
+    assert eligibility.eligible is False  # critical gates missing
+    assert auth.authorized is True  # workflow checks pass
+    assert can_rotate is False  # but mutation is still blocked
+
+
+def test_stale_authorization_after_consumer_version_change():
+    """Authorization is stale after consumer-set version changes (fingerprint mismatch)."""
+    subject_v1 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:pg",
+        provider_identity_ref="role:cts_runtime",
+        secret_authority_ref="vault:secret/cts/db",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:12345",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
+    subject_v2 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:pg",
+        provider_identity_ref="role:cts_runtime",
+        secret_authority_ref="vault:secret/cts/db",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:99999",  # changed
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
+    eligibility_v1 = evaluate_rotation_eligibility(
+        subject=subject_v1,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth_for_v1 = evaluate_workflow_execution_authorization(
+        subject=subject_v1,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility_v1,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+    )
+    # Consumer set changed → new eligibility has different fingerprint
+    eligibility_v2 = evaluate_rotation_eligibility(
+        subject=subject_v2,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    # Old authorization does not match new eligibility
+    assert auth_for_v1.matches_eligibility(eligibility_v2) is False
+    assert eligibility_v1.input_fingerprint != eligibility_v2.input_fingerprint

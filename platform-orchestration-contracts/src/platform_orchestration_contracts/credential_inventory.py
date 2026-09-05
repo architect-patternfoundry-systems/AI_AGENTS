@@ -510,7 +510,7 @@ class RotationBlocked(Exception):
 
 @dataclass(frozen=True)
 class WorkflowExecutionAuthorization:
-    """Workflow-level execution authorization for high-tier rotations.
+    """Workflow-level execution authorization for a specific rotation.
 
     This is distinct from RotationEligibility (provider capability
     readiness). For high-tier credentials, eligibility.eligible means
@@ -519,37 +519,63 @@ class WorkflowExecutionAuthorization:
 
     The workflow must call both:
         provider_eligibility = evaluate_rotation_eligibility(...)
-        execution_authorization = evaluate_workflow_execution_policy(...)
+        execution_auth = evaluate_workflow_execution_authorization(...)
 
     And require both before mutation:
         if not provider_eligibility.eligible:
             raise RotationBlocked(...)
-        if not execution_authorization.authorized:
+        if not execution_auth.authorized:
             raise RotationBlocked(...)
+
+    Additionally, the subject_fingerprint must match the eligibility
+    decision's input_fingerprint:
+        if execution_auth.subject_fingerprint != eligibility.input_fingerprint:
+            raise RotationBlocked(..., blockers=("subject_fingerprint_mismatch",))
 
     For critical-tier credentials, execution gates are already evaluated
     by evaluate_rotation_eligibility(). This authorization is an
     additional workflow-level check for high and critical tiers.
+
+    Critical-tier gate precedence:
+
+    1. Evaluate provider capability readiness (evaluate_rotation_eligibility).
+    2. Evaluate critical platform execution gates (RotationExecutionGates,
+       inside eligibility for critical tier).
+    3. Evaluate workflow-specific execution authorization
+       (evaluate_workflow_execution_authorization).
+    4. Bind eligibility and authorization to the same subject/plan fingerprint.
+    5. Only then invoke a provider mutation activity.
+    6. Reevaluate after any material plan, identity, consumer, policy, or
+       incident-state change.
+
+    Do not construct this object directly in production code. Use
+    evaluate_workflow_execution_authorization() so that `authorized` is
+    derived from the execution checks, not caller-supplied.
     """
 
     credential_set_id: str
     risk_tier: str
-    authorized: bool
-    blockers: tuple[str, ...]
-    evaluated_at: str  # ISO timestamp
     policy_version: str
+    evaluated_at: str  # ISO timestamp
 
-    # Execution checks that the workflow policy must evaluate
+    # Execution checks (observable inputs — the evaluator derives authorized)
     immutable_evidence_sink_available: bool = False
     rollback_plan_validated: bool = False
     approval_requirement_resolved: bool = False
     cutover_scope_matches_approved_plan: bool = False
     no_active_incident_freeze: bool = False
 
+    # Additional policy-level blockers not covered by the Boolean checks
+    policy_blockers: tuple[str, ...] = ()
+
+    # Fingerprint binding to the matching eligibility decision
+    subject_fingerprint: str = ""  # must match eligibility.input_fingerprint
+    execution_fingerprint: str = ""  # hash of execution-time inputs
+
     @property
     def all_blockers(self) -> tuple[str, ...]:
-        """List of missing execution checks."""
-        missing: list[str] = list(self.blockers)
+        """All execution blockers — derived from checks plus policy blockers."""
+        missing: list[str] = list(self.policy_blockers)
         if not self.immutable_evidence_sink_available:
             missing.append("immutable_evidence_sink_unavailable")
         if not self.rollback_plan_validated:
@@ -560,7 +586,7 @@ class WorkflowExecutionAuthorization:
             missing.append("cutover_scope_mismatch")
         if not self.no_active_incident_freeze:
             missing.append("active_incident_freeze")
-        # Deduplicate
+        # Deduplicate while preserving order
         seen: set[str] = set()
         result: list[str] = []
         for b in missing:
@@ -568,6 +594,24 @@ class WorkflowExecutionAuthorization:
                 seen.add(b)
                 result.append(b)
         return tuple(result)
+
+    @property
+    def authorized(self) -> bool:
+        """True if all execution checks pass and no policy blockers exist.
+
+        Derived from the execution checks, not caller-supplied. This
+        prevents inconsistent instances where authorized=True but
+        immutable_evidence_sink_available=False.
+        """
+        return len(self.all_blockers) == 0
+
+    def matches_eligibility(self, eligibility: "RotationEligibility") -> bool:
+        """True if this authorization is bound to the given eligibility decision.
+
+        The subject_fingerprint must match the eligibility's input_fingerprint.
+        This prevents reusing an authorization after material conditions change.
+        """
+        return self.subject_fingerprint == eligibility.input_fingerprint
 
 
 # Valid risk tiers for input validation
@@ -731,6 +775,108 @@ def evaluate_rotation_eligibility(
         evaluated_at=_utc_now_iso(),
         policy_version=policy_version,
         input_fingerprint=fingerprint,
+    )
+
+
+def _compute_execution_fingerprint(
+    *,
+    subject_fingerprint: str,
+    immutable_evidence_sink_available: bool,
+    rollback_plan_validated: bool,
+    approval_requirement_resolved: bool,
+    cutover_scope_matches_approved_plan: bool,
+    no_active_incident_freeze: bool,
+    policy_blockers: tuple[str, ...],
+    policy_version: str,
+) -> str:
+    """Compute a SHA-256 fingerprint over execution-time inputs.
+
+    This binds the authorization to the exact execution conditions it
+    evaluated. If approval state, incident freeze, cutover scope, or
+    evidence sink availability changes, the fingerprint differs.
+    """
+    import hashlib
+    import json
+
+    payload = {
+        "subject_fingerprint": subject_fingerprint,
+        "immutable_evidence_sink_available": immutable_evidence_sink_available,
+        "rollback_plan_validated": rollback_plan_validated,
+        "approval_requirement_resolved": approval_requirement_resolved,
+        "cutover_scope_matches_approved_plan": cutover_scope_matches_approved_plan,
+        "no_active_incident_freeze": no_active_incident_freeze,
+        "policy_blockers": list(policy_blockers),
+        "policy_version": policy_version,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def evaluate_workflow_execution_authorization(
+    *,
+    subject: RotationSubject,
+    risk_tier: str,
+    eligibility: RotationEligibility,
+    immutable_evidence_sink_available: bool,
+    rollback_plan_validated: bool,
+    approval_requirement_resolved: bool,
+    cutover_scope_matches_approved_plan: bool,
+    no_active_incident_freeze: bool,
+    policy_blockers: tuple[str, ...] = (),
+    policy_version: str = "1",
+) -> WorkflowExecutionAuthorization:
+    """Evaluate workflow-level execution authorization for a rotation.
+
+    This is the canonical evaluator for workflow execution authorization.
+    Callers supply observable execution-time inputs; the library derives
+    the `authorized` decision. Do not construct
+    WorkflowExecutionAuthorization directly in production code.
+
+    The eligibility parameter binds this authorization to a specific
+    eligibility decision via subject_fingerprint. The workflow must
+    verify that execution_auth.matches_eligibility(eligibility) is True
+    before proceeding to mutation.
+
+    Precedence for critical-tier rotations:
+    1. evaluate_rotation_eligibility (provider caps + critical gates)
+    2. evaluate_workflow_execution_authorization (this function)
+    3. Verify fingerprint binding
+    4. Only then invoke provider mutation
+
+    Raises:
+        ValueError: If risk_tier is invalid, credential_set_id is
+            malformed, or policy_version is empty.
+    """
+    _validate_eligibility_inputs(
+        credential_set_id=subject.credential_set_id,
+        risk_tier=risk_tier,
+        policy_version=policy_version,
+    )
+
+    exec_fp = _compute_execution_fingerprint(
+        subject_fingerprint=eligibility.input_fingerprint,
+        immutable_evidence_sink_available=immutable_evidence_sink_available,
+        rollback_plan_validated=rollback_plan_validated,
+        approval_requirement_resolved=approval_requirement_resolved,
+        cutover_scope_matches_approved_plan=cutover_scope_matches_approved_plan,
+        no_active_incident_freeze=no_active_incident_freeze,
+        policy_blockers=policy_blockers,
+        policy_version=policy_version,
+    )
+
+    return WorkflowExecutionAuthorization(
+        credential_set_id=subject.credential_set_id,
+        risk_tier=risk_tier,
+        policy_version=policy_version,
+        evaluated_at=_utc_now_iso(),
+        immutable_evidence_sink_available=immutable_evidence_sink_available,
+        rollback_plan_validated=rollback_plan_validated,
+        approval_requirement_resolved=approval_requirement_resolved,
+        cutover_scope_matches_approved_plan=cutover_scope_matches_approved_plan,
+        no_active_incident_freeze=no_active_incident_freeze,
+        policy_blockers=policy_blockers,
+        subject_fingerprint=eligibility.input_fingerprint,
+        execution_fingerprint=exec_fp,
     )
 
 
