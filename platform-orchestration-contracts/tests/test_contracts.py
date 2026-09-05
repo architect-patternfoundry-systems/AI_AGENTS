@@ -93,11 +93,35 @@ from platform_orchestration_contracts import (
     EXPOSURE_EXPOSED_ROTATED_PENDING_ENROLLMENT,
     RISK_CRITICAL,
     RISK_HIGH,
+    RISK_MEDIUM,
     RISK_LOW,
     ALL_RISK_TIERS,
     ENROLLMENT_MODE_OBSERVE_ONLY,
     ENROLLMENT_MODE_EXECUTE,
     ENROLLMENT_STEPS,
+    # discovery and correlation
+    DISCOVERY_STEPS,
+    EXPOSURE_CLASS_ACTIVE_IN_SOURCE,
+    EXPOSURE_CLASS_HISTORICAL_IDENTITY_VALID,
+    EXPOSURE_CLASS_HISTORICAL_REVOKED,
+    EXPOSURE_CLASS_PATTERN_ONLY,
+    ALL_EXPOSURE_CLASSES,
+    EXPOSURE_DEFAULT_ACTIONS,
+    CORRELATION_CONFIDENCE_HIGH,
+    CORRELATION_CONFIDENCE_MEDIUM,
+    CORRELATION_CONFIDENCE_LOW,
+    CORRELATION_BASIS_EXPLICIT_ANNOTATION,
+    CORRELATION_BASIS_PROVIDER_IDENTITY,
+    CORRELATION_BASIS_NAME_INFERENCE,
+    EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+    RETENTION_CRITICAL_DAYS,
+    RETENTION_HIGH_DAYS,
+    RETENTION_LOW_DAYS,
+    RETENTION_BY_RISK_TIER,
+    CorrelationEvidence,
+    CredentialCorrelation,
+    CredentialException,
+    InventoryRetentionPolicy,
 )
 
 
@@ -1118,3 +1142,238 @@ def test_source_finding_redacted():
     assert finding.secret_fingerprint.startswith("hmac-sha256:")
     # No actual secret value
     assert "password" not in finding.location_ref.lower()
+
+
+# --- Risk-tiered readiness, correlation, exceptions, retention ---
+
+
+def test_rotation_capabilities_risk_tiered_low():
+    """Low tier: base capabilities sufficient, overlap not required."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        overlap_support=False,  # not required for low
+    )
+    assert caps.rotation_ready is True
+    assert caps.is_rotation_ready_for_risk(RISK_LOW) is True
+    assert caps.is_rotation_ready_for_risk(RISK_MEDIUM) is False
+
+
+def test_rotation_capabilities_risk_tiered_medium():
+    """Medium tier: requires overlap_support in addition to base."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        overlap_support=True,
+        audit_observability=False,  # not required for medium
+    )
+    assert caps.is_rotation_ready_for_risk(RISK_LOW) is True
+    assert caps.is_rotation_ready_for_risk(RISK_MEDIUM) is True
+    assert caps.is_rotation_ready_for_risk(RISK_HIGH) is False
+
+
+def test_rotation_capabilities_risk_tiered_high():
+    """High tier: requires audit, owner confirmation, rollback verification."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        overlap_support=True,
+        audit_observability=True,
+        owner_confirmation=True,
+        rollback_verification=True,
+    )
+    assert caps.is_rotation_ready_for_risk(RISK_HIGH) is True
+    assert caps.is_rotation_ready_for_risk(RISK_CRITICAL) is True
+
+
+def test_rotation_capabilities_blockers_for_risk_high():
+    """High-tier blockers include audit and rollback if missing."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        overlap_support=True,
+        audit_observability=False,
+        owner_confirmation=False,
+        rollback_verification=False,
+    )
+    high_blockers = caps.blockers_for_risk(RISK_HIGH)
+    assert "audit_observability" in high_blockers
+    assert "owner_confirmation" in high_blockers
+    assert "rollback_verification" in high_blockers
+    assert "successor_creation" not in high_blockers
+
+
+def test_automation_tracking_can_promote_after_rotation():
+    """Promotion to automatically_managed requires successful rotations."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-minio-writer",
+        lifecycle_state=LIFECYCLE_ROTATION_READY,
+        managed_rotation_count=0,
+        required_successful_rotations=1,
+    )
+    assert tracking.can_promote_to_automatically_managed is False
+
+    tracking_after = AutomationTracking(
+        credential_set_id="cts-minio-writer",
+        lifecycle_state=LIFECYCLE_ROTATION_READY,
+        managed_rotation_count=1,
+        required_successful_rotations=1,
+        first_successful_rotation_at="2026-09-10T12:00:00Z",
+    )
+    assert tracking_after.can_promote_to_automatically_managed is True
+
+
+def test_automation_tracking_no_promote_from_wrong_state():
+    """Cannot promote from bootstrap_required even with rotations."""
+    tracking = AutomationTracking(
+        credential_set_id="cts-postgres-runtime",
+        lifecycle_state=LIFECYCLE_BOOTSTRAP_REQUIRED,
+        managed_rotation_count=5,
+    )
+    assert tracking.can_promote_to_automatically_managed is False
+
+
+def test_discovery_steps_complete():
+    """DISCOVERY_STEPS contains all 11 Phase 1 controller steps."""
+    assert len(DISCOVERY_STEPS) == 11
+    assert DISCOVERY_STEPS[0] == "discover_kubernetes_references"
+    assert DISCOVERY_STEPS[5] == "correlate_findings"
+    assert DISCOVERY_STEPS[10] == "write_redacted_evidence_report"
+
+
+def test_exposure_classes_complete():
+    """All 6 exposure classes are defined with default actions."""
+    assert len(ALL_EXPOSURE_CLASSES) == 6
+    assert EXPOSURE_CLASS_ACTIVE_IN_SOURCE in ALL_EXPOSURE_CLASSES
+    assert EXPOSURE_CLASS_HISTORICAL_REVOKED in ALL_EXPOSURE_CLASSES
+    # Each class has a default action
+    for cls in ALL_EXPOSURE_CLASSES:
+        assert cls in EXPOSURE_DEFAULT_ACTIONS
+
+
+def test_exposure_class_actions_differ():
+    """Active source requires emergency rotation; revoked is closed."""
+    assert EXPOSURE_DEFAULT_ACTIONS[EXPOSURE_CLASS_ACTIVE_IN_SOURCE] == "emergency_rotation"
+    assert EXPOSURE_DEFAULT_ACTIONS[EXPOSURE_CLASS_HISTORICAL_REVOKED] == "retain_evidence_closed"
+    assert EXPOSURE_DEFAULT_ACTIONS[EXPOSURE_CLASS_PATTERN_ONLY] == "triage"
+
+
+def test_correlation_evidence():
+    """CorrelationEvidence links a finding to a credential set."""
+    evidence = CorrelationEvidence(
+        finding_type="kubernetes_consumer",
+        confidence=CORRELATION_CONFIDENCE_HIGH,
+        matching_basis=CORRELATION_BASIS_EXPLICIT_ANNOTATION,
+    )
+    assert evidence.confidence == CORRELATION_CONFIDENCE_HIGH
+    assert evidence.matching_basis == CORRELATION_BASIS_EXPLICIT_ANNOTATION
+
+
+def test_credential_correlation_highest_confidence():
+    """Correlation returns the highest confidence across evidence."""
+    corr = CredentialCorrelation(
+        canonical_credential_set_id="cts-postgres-runtime",
+        evidence=(
+            CorrelationEvidence(
+                finding_type="git_finding",
+                confidence=CORRELATION_CONFIDENCE_MEDIUM,
+                matching_basis=CORRELATION_BASIS_NAME_INFERENCE,
+            ),
+            CorrelationEvidence(
+                finding_type="kubernetes_consumer",
+                confidence=CORRELATION_CONFIDENCE_HIGH,
+                matching_basis=CORRELATION_BASIS_EXPLICIT_ANNOTATION,
+            ),
+        ),
+    )
+    assert corr.highest_confidence == CORRELATION_CONFIDENCE_HIGH
+    assert corr.has_explicit_annotation is True
+
+
+def test_credential_correlation_no_explicit_annotation():
+    """Correlation without explicit annotation is unconfirmed."""
+    corr = CredentialCorrelation(
+        canonical_credential_set_id="inferred-cred",
+        evidence=(
+            CorrelationEvidence(
+                finding_type="git_finding",
+                confidence=CORRELATION_CONFIDENCE_LOW,
+                matching_basis=CORRELATION_BASIS_NAME_INFERENCE,
+            ),
+        ),
+    )
+    assert corr.has_explicit_annotation is False
+    assert corr.highest_confidence == CORRELATION_CONFIDENCE_LOW
+
+
+def test_credential_exception_not_expired():
+    """A future-dated exception is not expired."""
+    exc = CredentialException(
+        exception_id="sec-exc-2026-001",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2026-09-05T00:00:00Z",
+        expires_at="2099-01-01T00:00:00Z",
+        compensating_controls=("IP restriction", "alert on use"),
+        remediation_target="migrate-to-vault",
+    )
+    assert exc.is_expired is False
+    assert exc.reason_code == EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY
+
+
+def test_credential_exception_expired():
+    """A past-dated exception is expired."""
+    exc = CredentialException(
+        exception_id="sec-exc-2026-001",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2020-01-01T00:00:00Z",
+        expires_at="2020-06-01T00:00:00Z",
+    )
+    assert exc.is_expired is True
+
+
+def test_inventory_retention_policy_defaults():
+    """Default retention policy has correct periods by risk tier."""
+    policy = InventoryRetentionPolicy()
+    assert policy.encrypt_at_rest is True
+    assert policy.raw_shell_history_ingestion is False
+    assert policy.retention_days_for(RISK_CRITICAL) == RETENTION_CRITICAL_DAYS
+    assert policy.retention_days_for(RISK_HIGH) == RETENTION_HIGH_DAYS
+    assert policy.retention_days_for(RISK_LOW) == RETENTION_LOW_DAYS
+
+
+def test_inventory_retention_custom():
+    """Custom retention policy overrides defaults."""
+    policy = InventoryRetentionPolicy(
+        retention_days_by_risk={RISK_LOW: 30, RISK_MEDIUM: 90, RISK_HIGH: 180, RISK_CRITICAL: 365},
+        raw_shell_history_ingestion=True,
+    )
+    assert policy.retention_days_for(RISK_LOW) == 30
+    assert policy.retention_days_for(RISK_CRITICAL) == 365
+    assert policy.raw_shell_history_ingestion is True
+
+
+def test_retention_by_risk_tier_mapping():
+    """RETENTION_BY_RISK_TIER maps all 4 risk tiers."""
+    assert len(RETENTION_BY_RISK_TIER) == 4
+    assert RETENTION_BY_RISK_TIER[RISK_CRITICAL] > RETENTION_BY_RISK_TIER[RISK_HIGH]
+    assert RETENTION_BY_RISK_TIER[RISK_HIGH] > RETENTION_BY_RISK_TIER[RISK_LOW]

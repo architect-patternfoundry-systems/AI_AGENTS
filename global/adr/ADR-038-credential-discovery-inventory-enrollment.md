@@ -271,20 +271,63 @@ A powerful enrollment helper does not merely say "found secret." It determines w
 | `predecessor_revocation` | Disable old role/key through provider API | Can complete rotation safely |
 | `audit_observability` | Provider usage logs identify active key/role | Can prove predecessor is drained/revoked |
 
-### 7.1 Readiness calculation
+### 7.1 Risk-tiered readiness calculation
+
+Readiness is not a universal Boolean. A low-risk application-scoped MinIO service account may be safe to rotate without provider audit logs. A broad PostgreSQL admin-capable role should not be considered rotation-ready without evidence that the old identity can be observed, drained, and rejected.
+
+| Risk tier | Required for `rotation_ready` |
+|---|---|
+| Low | successor_creation, secret_authority, delivery, consumer_reload, positive_probe, predecessor_revocation |
+| Medium | Low-tier + overlap_support |
+| High | Medium-tier + audit_observability, owner_confirmation, rollback_verification |
+| Critical/admin | High-tier (same requirements; approval policy, canary cutover, immutable evidence, and emergency recovery plan are workflow-level gates) |
 
 ```text
-rotation_ready =
+# Base (low-tier):
+rotation_ready_base =
   successor_creation
-  AND overlap_support
   AND secret_authority
   AND delivery
   AND consumer_reload
   AND positive_probe
   AND predecessor_revocation
+
+# Medium adds:
+  AND overlap_support
+
+# High/Critical add:
+  AND audit_observability
+  AND owner_confirmation
+  AND rollback_verification
 ```
 
-Anything missing becomes a structured enrollment task, not tribal knowledge.
+Anything missing becomes a structured blocker for that risk tier, not tribal knowledge.
+
+### 7.2 Lifecycle promotion: rotation_ready → automatically_managed
+
+A credential set is **not** `automatically_managed` merely because a schedule exists. Promotion requires at least one completed workflow-owned rotation cycle:
+
+```text
+bootstrap_required
+  → enrolled
+  → rotation_ready
+  → first managed rotation scheduled
+  → candidate cutover verified
+  → predecessor revocation verified
+  → automatically_managed
+```
+
+Track this with:
+
+```yaml
+automation:
+  lifecycle_state: rotation_ready
+  managed_rotation_count: 0
+  first_successful_rotation_at: null
+  required_successful_rotations: 1
+```
+
+Promotion to `automatically_managed` is a guarded workflow transition: `managed_rotation_count >= required_successful_rotations` AND `lifecycle_state == rotation_ready`.
 
 ## 8. Human burden reduction
 
@@ -312,9 +355,66 @@ The human should be asked questions only where automation cannot safely infer in
 
 They should **not** be asked to copy a password into `kubectl`, edit a DSN, restart pods, or verify a credential manually during normal enrollment.
 
-## 9. Kubernetes-native interface
+## 9. Exposure classification
 
-A CRD or Git-managed custom resource provides a declarative onboarding interface:
+A secret detected in **current runtime configuration** and one found in **old Git history** are different operational states. The inventory must not conflate remediated historical evidence with a live credential exposure.
+
+| Finding type | Default action |
+|---|---|
+| Active secret in current source/config | Critical; immediate emergency rotation/enrollment |
+| Secret in current cluster Secret with no external authority | High; enroll/rotate promptly |
+| Historical Git secret, identity still valid | Critical; rotate/revoke immediately |
+| Historical Git secret, verified revoked | Retain redacted evidence; remediation closed |
+| Pattern-only potential secret | Triage; do not automatically classify as active |
+| Test fixture/example credential | Policy-dependent; ideally eliminate or use invalid markers |
+
+Each discovery finding carries an exposure class that determines its default action and dashboard treatment.
+
+## 10. Deduplication and correlation
+
+The hardest part is not scanning; it is correlating observations into one `CredentialSetRecord`. One database credential may appear as a Kubernetes Secret reference, a DSN environment variable, a PostgreSQL login role, a PgBouncer connection source, a Gitleaks finding, a Vault path, and a CI variable.
+
+Do **not** merge records only by a secret name, role name, or an unkeyed fingerprint. Use a confidence-based correlation model:
+
+```yaml
+correlation:
+  canonical_credential_set_id: cts-postgres-runtime
+  evidence:
+    - type: kubernetes_consumer
+      confidence: high
+      matching_basis: explicit_annotation
+    - type: postgres_role
+      confidence: high
+      matching_basis: provider_identity
+    - type: secret_authority_path
+      confidence: high
+      matching_basis: secret_authority_path
+    - type: git_finding
+      confidence: medium
+      matching_basis: name_inference
+  confirmed: false  # until owner or policy resolves ambiguity
+```
+
+Prioritize explicit workload annotations over inference. The controller can infer candidates, but marks them `unconfirmed` until an owner or approved policy resolves ambiguity.
+
+### 10.1 Fingerprint safety
+
+A scanner often sees plaintext only in the exact situations where you want to minimize propagation. A discovery worker that has both broad repository access and the global HMAC key becomes more valuable to compromise.
+
+Safer choices:
+
+- **Kubernetes metadata scanner:** no secret read, therefore no fingerprint.
+- **Git scanner:** use Gitleaks' redacted detector output; do not recompute fingerprints unless the scanner runs in a hardened environment with the inventory HMAC key.
+- **Provider scanner:** identify by provider-native immutable ID, key ID, version ID, role name, or secret path — not value fingerprint.
+- **Secret authority:** may calculate a fingerprint internally if needed, but return only a version/identity reference.
+
+Prefer a separate, tightly controlled correlation service to create HMAC fingerprints only where they are necessary.
+
+## 11. Kubernetes-native interface
+
+A CRD or Git-managed custom resource provides a declarative onboarding interface. Use it as a **desired-state declaration** — never as a source of credential values.
+
+Separate declarative desired state (spec) from observed state (status):
 
 ```yaml
 apiVersion: security.patternfoundry.dev/v1alpha1
@@ -350,7 +450,17 @@ spec:
   enrollment:
     mode: observe_only
     targetState: automatically_managed
+status:
+  lifecycleState: rotation_ready
+  observedGeneration: 4
+  activeSecretVersion: redacted-version-id
+  blockers:
+    - predecessor_revocation_not_automated
+  lastDiscoveryAt: "2026-09-05T..."
+  lastEnrollmentWorkflowId: "security:credential-enrollment:..."
 ```
+
+This lets GitOps own policy while controllers own observed state. The `spec` never contains `password` or any credential value.
 
 A controller reconciles this resource:
 
@@ -362,7 +472,7 @@ A controller reconciles this resource:
 
 This gives a repeatable onboarding interface for both existing unmanaged credentials and new credentials introduced by future apps.
 
-## 10. Platform components
+## 12. Platform components
 
 | Component | Implementation shape | Privilege |
 |---|---|---|
@@ -377,7 +487,7 @@ This gives a repeatable onboarding interface for both existing unmanaged credent
 
 Keep discovery and rotation workers separate. A scanner that can list every Secret should not automatically receive database-admin or MinIO-admin capability.
 
-## 11. Inventory health metrics
+## 13. Inventory health metrics
 
 ```text
 credential_inventory_total{state,credential_class,environment}
@@ -394,7 +504,7 @@ credential_shared_across_apps_total
 credential_exposure_findings_total{source,severity}
 ```
 
-### 11.1 Operational views
+### 13.1 Operational views
 
 - Credentials discovered but not owned.
 - Credentials owned but unmanaged.
@@ -405,9 +515,9 @@ credential_exposure_findings_total{source,severity}
 - Secrets that appear in Git history or incident artifacts.
 - Scheduled rotations due or overdue.
 
-## 12. Integration with ADR-036 and ADR-037
+## 14. Integration with ADR-036 and ADR-037
 
-### 12.1 ADR-036 alignment
+### 14.1 ADR-036 alignment
 
 The enrollment workflow uses the standard `WorkflowEnvelope` with `contract_version`, `workflow_type`, and `idempotency_key`. The workflow type is:
 
@@ -417,7 +527,7 @@ security.credential-enrollment.v1
 
 It runs on the `security-workflows` task queue defined in ADR-037 section 4. Provider-specific activities use the security sub-queues (`security-database`, `security-object-storage`, `security-kubernetes`, `security-secret-provider`).
 
-### 12.2 ADR-037 alignment
+### 14.2 ADR-037 alignment
 
 The enrollment workflow transitions a credential set through the lifecycle states defined in ADR-037 section 17:
 
@@ -427,7 +537,7 @@ discovered → bootstrap_required → enrolled → rotation_ready → automatica
 
 The `AutomationTracking` record from ADR-037 is updated at each transition. The enrollment workflow is the mechanism that moves a credential set from `bootstrap_required` to `rotation_ready`. The rotation workflow (ADR-037) takes over from `rotation_ready` to `automatically_managed` and beyond.
 
-### 12.3 Separation from rotation
+### 14.3 Separation from rotation
 
 Enrollment and rotation are distinct workflows with distinct identities:
 
@@ -438,30 +548,107 @@ Enrollment and rotation are distinct workflows with distinct identities:
 
 Enrollment may create the first successor identity and seed the secret authority. Rotation uses the established authority to create subsequent successors. Enrollment is run once per credential set (or again if the set needs re-enrollment after a major change). Rotation runs on a schedule.
 
-## 13. Phased implementation
+## 15. Inventory data retention policy
 
-### Phase 1: Inventory-only
+The inventory contains security-sensitive metadata even without secret values. An attacker who knows every secret path, Kubernetes namespace, privileged DB role, provider account, and workload dependency graph has valuable reconnaissance material.
 
-Build `CredentialDiscoveryWorkflow` or a scheduled discovery job that:
+Requirements:
 
-- Scans Kubernetes Secret references and workload consumers.
-- Scans known repositories and CI/deployment configuration.
-- Lists PostgreSQL roles and MinIO access identities.
-- Produces redacted findings and inventory records.
-- Does not change infrastructure or retrieve/persist plaintext values.
+- Evidence retention period by severity (critical: ~7 years, high: ~3 years, medium: 1 year, low: 90 days).
+- Redacted finding retention with periodic review.
+- Access control: inventory readers versus rotation operators versus evidence auditors.
+- Encryption at rest for the metadata database and evidence store.
+- Deletion/archival rules for retired credentials.
+- Limits on path, repository, workload, and role metadata visibility.
+- No raw shell-history ingestion by default; require explicit local opt-in and redaction.
 
-This immediately replaces ad hoc searching with a repeatable posture report.
+## 16. Exception system
+
+The governing rule permits credentials to be "explicitly excepted with expiry." Define that record fully:
+
+```yaml
+exception:
+  exception_id: sec-exc-2026-...
+  reason_code: provider_no_secondary_key
+  risk_accepted_by: security-owner
+  approved_at: "..."
+  expires_at: "..."
+  compensating_controls:
+    - IP restriction
+    - least-privilege scope
+    - alert on use
+    - manual rotation cadence
+  remediation_target: migrate-to-provider-x
+```
+
+A scheduled controller alerts before expiry and reopens enrollment automatically if the exception is not renewed. Exceptions are never a path to permanent unmanaged status — they are time-bounded with a remediation target.
+
+## 17. Phase 1: Inventory-only controller
+
+The most important next step is to implement Phase 1 as an inventory-only controller before building any broadly privileged enrollment or rotation automation. This gives immediate visibility while preserving a read-only blast radius.
+
+### 17.1 Discovery workflow
+
+```text
+CredentialDiscoveryWorkflow v1
+  ├── DiscoverKubernetesReferences
+  ├── DiscoverExternalSecretResources
+  ├── DiscoverPostgresRoles
+  ├── DiscoverMinioAccounts
+  ├── IngestGitScannerFindings
+  ├── CorrelateFindings
+  ├── UpsertCredentialInventory
+  ├── ClassifyRiskAndLifecycle
+  ├── DetectOwnershipGaps
+  ├── EmitPostureMetrics
+  └── WriteRedactedEvidenceReport
+```
+
+Run daily, plus on Git/security events. Initial permissions are narrow:
+
+- Read Kubernetes workload and Secret metadata, not Secret data.
+- Read `ExternalSecret`, `SecretStore`, and workload resource metadata.
+- Read PostgreSQL role metadata only.
+- Read MinIO identity/policy metadata only.
+- Read already-redacted Gitleaks/CI findings.
+- Write only to the inventory/evidence store.
+
+### 17.2 Posture report
+
+The controller yields immediate answers:
+
+```text
+Which credentials exist?
+Which workloads consume them?
+Which are shared?
+Which are broad or privileged?
+Which lack an owner?
+Which lack a secret authority?
+Which are already rotating?
+Which have not been used recently?
+```
+
+The report lists, per credential set: credential set ID, class, environment, owner, lifecycle state, consumer count, provider identity/path reference, secret-authority status, rotation readiness and blockers, exposure status, last observed use, enrollment deadline, and recommended next action.
+
+Start with CTS and its immediate dependencies. This gives an operator a real assistant for onboarding unmanaged credentials — without requiring them to inspect every repository, manifest, database role, or object-store account by hand.
+
+## 18. Phased implementation
+
+### Phase 1: Inventory-only (section 17)
+
+Build `CredentialDiscoveryWorkflow` as a scheduled discovery job with read-only permissions. Produces redacted findings and inventory records. Does not change infrastructure or retrieve/persist plaintext values.
 
 ### Phase 2: Enrollment planning
 
 Add:
 
-- Capability assessment.
+- Capability assessment with risk-tiered readiness.
 - Deduplication/correlation across source, runtime, and provider findings.
 - Owner assignment and escalation.
 - Generated enrollment plans.
 - `observe_only` `CredentialSet` resources.
 - Deadline/SLA tracking via the `AutomationTracking` model.
+- Exposure classification for Git-history vs active findings.
 
 ### Phase 3: Low-risk automatic enrollment
 
@@ -473,25 +660,29 @@ Start with MinIO scoped service accounts:
 - Restart/reload one canary workload.
 - Verify prefix-scoped object put/get.
 - Roll back safely before old-key revocation.
-- Promote to `automatically_managed`.
+- Complete first managed rotation.
+- Promote to `automatically_managed` after `managed_rotation_count >= required_successful_rotations`.
 
 ### Phase 4: Database enrollment
 
 Add blue/green PostgreSQL runtime roles, connection-pool cutover, read/write verification, grace period, and predecessor rejection verification.
 
-## 14. Acceptance criteria
+## 19. Acceptance criteria
 
 ADR-038 is **adopted** when:
 
 1. A discovery scan produces inventory records for all known credential sets across the platform without retaining plaintext values.
 2. Each inventory record has an assigned owner, risk tier, and lifecycle state.
-3. The capability assessment matrix correctly identifies which credential sets are `rotation_ready` and which have blockers.
+3. The capability assessment matrix correctly identifies which credential sets are `rotation_ready` for their risk tier and which have blockers.
 4. At least one credential set has been enrolled end-to-end through `CredentialEnrollmentWorkflow` from `bootstrap_required` to `rotation_ready`.
 5. The enrollment workflow in observe-only mode produces a plan without making infrastructure changes.
 6. Inventory health metrics are exposed and alert on unowned, unmanaged, or overdue credentials.
 7. No plaintext secret value appears in the inventory database, workflow history, logs, metrics, or CRD status fields.
+8. Exposure classification correctly distinguishes active exposures from remediated historical evidence.
+9. Promotion to `automatically_managed` requires at least one completed workflow-owned rotation, not merely a registered schedule.
+10. Exceptions are time-bounded with a remediation target and automatic reopening on expiry.
 
-## 15. References
+## 20. References
 
 - ADR-032: Federated Governance & Multi-Plane Evidence Architecture
 - ADR-036: Temporal Integration Standard — Cross-App Durable Orchestration

@@ -314,6 +314,10 @@ class AutomationTracking:
     A credential set listed as human-assisted must have an explicit
     transition plan with a target state and enrollment deadline.
 
+    Promotion to automatically_managed requires at least
+    required_successful_rotations completed workflow-owned rotations,
+    not merely a registered schedule.
+
     See ADR-037 section 17.
     """
 
@@ -323,6 +327,9 @@ class AutomationTracking:
     enrollment_deadline: Optional[str] = None  # ISO date
     current_exception: Optional[str] = None
     manual_steps_remaining: tuple[str, ...] = ()
+    managed_rotation_count: int = 0
+    first_successful_rotation_at: Optional[str] = None  # ISO timestamp
+    required_successful_rotations: int = 1
 
     @property
     def is_human_assisted(self) -> bool:
@@ -347,3 +354,16 @@ class AutomationTracking:
             return date.today() > deadline
         except ValueError:
             return False
+
+    @property
+    def can_promote_to_automatically_managed(self) -> bool:
+        """True if enough workflow-owned rotations have succeeded to promote.
+
+        A credential set is not automatically_managed merely because a
+        schedule exists. It must have completed at least
+        required_successful_rotations full rotation cycles through the
+        CredentialRotationWorkflow.
+        """
+        if self.lifecycle_state != LIFECYCLE_ROTATION_READY:
+            return False
+        return self.managed_rotation_count >= self.required_successful_rotations

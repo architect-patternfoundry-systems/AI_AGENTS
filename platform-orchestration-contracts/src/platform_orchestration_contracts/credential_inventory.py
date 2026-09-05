@@ -92,6 +92,88 @@ ENROLLMENT_STEPS = (
     "schedule_first_managed_rotation",
 )
 
+# --- Discovery workflow steps (Phase 1 controller) ---
+
+DISCOVERY_STEPS = (
+    "discover_kubernetes_references",
+    "discover_external_secret_resources",
+    "discover_postgres_roles",
+    "discover_minio_accounts",
+    "ingest_git_scanner_findings",
+    "correlate_findings",
+    "upsert_credential_inventory",
+    "classify_risk_and_lifecycle",
+    "detect_ownership_gaps",
+    "emit_posture_metrics",
+    "write_redacted_evidence_report",
+)
+
+# --- Exposure classification ---
+#
+# A secret in current runtime config and one in old Git history are
+# different operational states. This prevents the dashboard from
+# conflating remediated historical evidence with live exposure.
+
+EXPOSURE_CLASS_ACTIVE_IN_SOURCE = "active_in_source"
+EXPOSURE_CLASS_ACTIVE_IN_CLUSTER_NO_AUTHORITY = "active_in_cluster_no_authority"
+EXPOSURE_CLASS_HISTORICAL_IDENTITY_VALID = "historical_identity_valid"
+EXPOSURE_CLASS_HISTORICAL_REVOKED = "historical_revoked"
+EXPOSURE_CLASS_PATTERN_ONLY = "pattern_only"
+EXPOSURE_CLASS_TEST_FIXTURE = "test_fixture"
+
+ALL_EXPOSURE_CLASSES = (
+    EXPOSURE_CLASS_ACTIVE_IN_SOURCE,
+    EXPOSURE_CLASS_ACTIVE_IN_CLUSTER_NO_AUTHORITY,
+    EXPOSURE_CLASS_HISTORICAL_IDENTITY_VALID,
+    EXPOSURE_CLASS_HISTORICAL_REVOKED,
+    EXPOSURE_CLASS_PATTERN_ONLY,
+    EXPOSURE_CLASS_TEST_FIXTURE,
+)
+
+# Default action by exposure class
+EXPOSURE_DEFAULT_ACTIONS = {
+    EXPOSURE_CLASS_ACTIVE_IN_SOURCE: "emergency_rotation",
+    EXPOSURE_CLASS_ACTIVE_IN_CLUSTER_NO_AUTHORITY: "enroll_and_rotate",
+    EXPOSURE_CLASS_HISTORICAL_IDENTITY_VALID: "rotate_and_revoke",
+    EXPOSURE_CLASS_HISTORICAL_REVOKED: "retain_evidence_closed",
+    EXPOSURE_CLASS_PATTERN_ONLY: "triage",
+    EXPOSURE_CLASS_TEST_FIXTURE: "policy_dependent",
+}
+
+# --- Correlation confidence levels ---
+
+CORRELATION_CONFIDENCE_HIGH = "high"
+CORRELATION_CONFIDENCE_MEDIUM = "medium"
+CORRELATION_CONFIDENCE_LOW = "low"
+
+# Correlation matching basis — prioritize explicit annotations over inference
+CORRELATION_BASIS_EXPLICIT_ANNOTATION = "explicit_annotation"
+CORRELATION_BASIS_SECRET_AUTHORITY_PATH = "secret_authority_path"
+CORRELATION_BASIS_PROVIDER_IDENTITY = "provider_identity"
+CORRELATION_BASIS_FINGERPRINT_MATCH = "fingerprint_match"
+CORRELATION_BASIS_NAME_INFERENCE = "name_inference"
+
+# --- Exception reason codes ---
+
+EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY = "provider_no_secondary_key"
+EXCEPTION_REASON_LEGACY_SYSTEM_NO_API = "legacy_system_no_api"
+EXCEPTION_REASON_VENDOR_LOCKED_CREDENTIAL = "vendor_locked_credential"
+EXCEPTION_REASON_MIGRATION_IN_PROGRESS = "migration_in_progress"
+
+# --- Data retention defaults ---
+
+RETENTION_CRITICAL_DAYS = 2555  # ~7 years
+RETENTION_HIGH_DAYS = 1095  # ~3 years
+RETENTION_MEDIUM_DAYS = 365
+RETENTION_LOW_DAYS = 90
+
+RETENTION_BY_RISK_TIER = {
+    RISK_CRITICAL: RETENTION_CRITICAL_DAYS,
+    RISK_HIGH: RETENTION_HIGH_DAYS,
+    RISK_MEDIUM: RETENTION_MEDIUM_DAYS,
+    RISK_LOW: RETENTION_LOW_DAYS,
+}
+
 
 @dataclass(frozen=True)
 class OwnerRef:
@@ -169,17 +251,18 @@ class RotationCapabilities:
     positive_probe: bool = False
     predecessor_revocation: bool = False
     audit_observability: bool = False
+    owner_confirmation: bool = False
+    rollback_verification: bool = False
 
     @property
     def rotation_ready(self) -> bool:
-        """True if all required capabilities are present.
+        """True if all base-tier required capabilities are present.
 
-        audit_observability is recommended but not required for
-        rotation_ready — it is required for automatically_managed.
+        This is the low-tier check. Use is_rotation_ready_for_risk for
+        risk-tiered assessment.
         """
         return (
             self.successor_creation
-            and self.overlap_support
             and self.secret_authority
             and self.delivery
             and self.consumer_reload
@@ -187,14 +270,37 @@ class RotationCapabilities:
             and self.predecessor_revocation
         )
 
+    def is_rotation_ready_for_risk(self, risk_tier: str) -> bool:
+        """Risk-tiered readiness assessment.
+
+        | Risk tier | Required for rotation_ready |
+        |---|---|
+        | Low | successor, authority, delivery, reload, probe, revocation |
+        | Medium | Low + overlap_support |
+        | High | Medium + audit_observability, owner_confirmation, rollback_verification |
+        | Critical | High (same requirements; approval/canary/evidence are workflow-level) |
+        """
+        if not self.rotation_ready:
+            return False
+        if risk_tier == RISK_LOW:
+            return True
+        if risk_tier == RISK_MEDIUM:
+            return self.overlap_support
+        if risk_tier in (RISK_HIGH, RISK_CRITICAL):
+            return (
+                self.overlap_support
+                and self.audit_observability
+                and self.owner_confirmation
+                and self.rollback_verification
+            )
+        return False
+
     @property
     def blockers(self) -> tuple[str, ...]:
-        """List of missing required capabilities."""
+        """List of missing base-tier required capabilities."""
         missing = []
         if not self.successor_creation:
             missing.append("successor_creation")
-        if not self.overlap_support:
-            missing.append("overlap_support")
         if not self.secret_authority:
             missing.append("secret_authority")
         if not self.delivery:
@@ -207,6 +313,21 @@ class RotationCapabilities:
             missing.append("predecessor_revocation")
         return tuple(missing)
 
+    def blockers_for_risk(self, risk_tier: str) -> tuple[str, ...]:
+        """List of missing capabilities for the given risk tier."""
+        missing = list(self.blockers)
+        if risk_tier in (RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL):
+            if not self.overlap_support:
+                missing.append("overlap_support")
+        if risk_tier in (RISK_HIGH, RISK_CRITICAL):
+            if not self.audit_observability:
+                missing.append("audit_observability")
+            if not self.owner_confirmation:
+                missing.append("owner_confirmation")
+            if not self.rollback_verification:
+                missing.append("rollback_verification")
+        return tuple(missing)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "successor_creation": self.successor_creation,
@@ -217,6 +338,8 @@ class RotationCapabilities:
             "positive_probe": self.positive_probe,
             "predecessor_revocation": self.predecessor_revocation,
             "audit_observability": self.audit_observability,
+            "owner_confirmation": self.owner_confirmation,
+            "rollback_verification": self.rollback_verification,
             "rotation_ready": self.rotation_ready,
             "blockers": list(self.blockers),
         }
@@ -380,3 +503,101 @@ class EnrollmentResult:
             "error_code": self.error_code,
             "error_message": self.error_message,
         }
+
+
+@dataclass(frozen=True)
+class CorrelationEvidence:
+    """Evidence linking a discovery finding to a credential set.
+
+    Used by the correlation service to deduplicate observations from
+    multiple scanners into a single CredentialSetRecord. Prioritizes
+    explicit annotations over inference.
+    """
+
+    finding_type: str  # e.g. "kubernetes_consumer", "postgres_role", "git_finding"
+    confidence: str  # "high" | "medium" | "low"
+    matching_basis: str  # one of CORRELATION_BASIS_* constants
+    finding_ref: Optional[str] = None  # reference to the source finding
+
+
+@dataclass(frozen=True)
+class CredentialCorrelation:
+    """Result of correlating multiple findings into one credential set.
+
+    Do not merge records only by secret name, role name, or an unkeyed
+    fingerprint. Use confidence-based correlation with explicit
+    annotations prioritized over inference.
+    """
+
+    canonical_credential_set_id: str
+    evidence: tuple[CorrelationEvidence, ...]
+    confirmed: bool = False  # True only after owner or policy resolves ambiguity
+
+    @property
+    def highest_confidence(self) -> str:
+        """Returns the highest confidence level across all evidence."""
+        if any(e.confidence == CORRELATION_CONFIDENCE_HIGH for e in self.evidence):
+            return CORRELATION_CONFIDENCE_HIGH
+        if any(e.confidence == CORRELATION_CONFIDENCE_MEDIUM for e in self.evidence):
+            return CORRELATION_CONFIDENCE_MEDIUM
+        return CORRELATION_CONFIDENCE_LOW
+
+    @property
+    def has_explicit_annotation(self) -> bool:
+        """True if any evidence is based on explicit workload annotation."""
+        return any(
+            e.matching_basis == CORRELATION_BASIS_EXPLICIT_ANNOTATION
+            for e in self.evidence
+        )
+
+
+@dataclass(frozen=True)
+class CredentialException:
+    """A formally approved exception allowing a credential to remain
+    in a non-automatically-managed state with expiry.
+
+    The governing rule permits credentials to be "explicitly excepted
+    with expiry." This record defines that exception fully. A scheduled
+    controller should alert before expiry and reopen enrollment
+    automatically if the exception is not renewed.
+    """
+
+    exception_id: str
+    credential_set_id: str
+    reason_code: str  # one of EXCEPTION_REASON_* constants
+    risk_accepted_by: str  # name/identity of approver
+    approved_at: str  # ISO timestamp
+    expires_at: str  # ISO timestamp
+    compensating_controls: tuple[str, ...] = ()
+    remediation_target: Optional[str] = None  # e.g. "migrate-to-provider-x"
+
+    @property
+    def is_expired(self) -> bool:
+        """True if the exception has passed its expiry."""
+        from datetime import datetime
+        try:
+            expiry = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+            return datetime.now(expiry.tzinfo) > expiry
+        except (ValueError, AttributeError):
+            return False
+
+
+@dataclass(frozen=True)
+class InventoryRetentionPolicy:
+    """Data retention rules for the credential inventory.
+
+    The inventory contains security-sensitive metadata even without
+    secret values. An attacker who knows every secret path, namespace,
+    privileged role, and workload dependency graph has valuable
+    reconnaissance material.
+    """
+
+    retention_days_by_risk: dict[str, int] = field(default_factory=lambda: dict(RETENTION_BY_RISK_TIER))
+    encrypt_at_rest: bool = True
+    access_control_enabled: bool = True
+    raw_shell_history_ingestion: bool = False  # opt-in only
+    archive_on_retire: bool = True
+
+    def retention_days_for(self, risk_tier: str) -> int:
+        """Returns the retention period in days for the given risk tier."""
+        return self.retention_days_by_risk.get(risk_tier, RETENTION_LOW_DAYS)
