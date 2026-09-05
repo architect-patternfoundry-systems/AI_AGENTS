@@ -55,6 +55,7 @@ from platform_orchestration_contracts import (
     RotationLock,
     CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
     CREDENTIAL_CLASS_OBJECT_STORAGE_KEY,
+    CREDENTIAL_CLASS_API_KEY,
     STRATEGY_DUAL_LOGIN_ROLE,
     STRATEGY_KEY_VERSION_ROTATION,
     TRIGGER_SCHEDULED,
@@ -73,6 +74,30 @@ from platform_orchestration_contracts import (
     ALL_LIFECYCLE_STATES,
     HUMAN_ASSISTED_STATES,
     WORKFLOW_OWNED_STATES,
+    # credential inventory (ADR-038)
+    OwnerRef,
+    AuthorityRef,
+    ConsumerRef,
+    SourceFinding,
+    RiskAssessment,
+    RotationCapabilities,
+    CredentialSetRecord,
+    DiscoveryFinding,
+    EnrollmentPlan,
+    EnrollmentInput,
+    EnrollmentResult,
+    SOURCE_KUBERNETES,
+    SOURCE_GIT,
+    SOURCE_GITLEAKS,
+    ALL_DISCOVERY_SOURCES,
+    EXPOSURE_EXPOSED_ROTATED_PENDING_ENROLLMENT,
+    RISK_CRITICAL,
+    RISK_HIGH,
+    RISK_LOW,
+    ALL_RISK_TIERS,
+    ENROLLMENT_MODE_OBSERVE_ONLY,
+    ENROLLMENT_MODE_EXECUTE,
+    ENROLLMENT_STEPS,
 )
 
 
@@ -758,3 +783,338 @@ def test_automation_tracking_discovered_is_human_assisted():
     )
     assert tracking.is_human_assisted is True
     assert tracking.is_workflow_owned is False
+
+
+# --- Credential Inventory (ADR-038) ---
+
+
+def test_credential_set_record_basic():
+    """A credential set record holds metadata without secret values."""
+    record = CredentialSetRecord(
+        credential_set_id="cts-postgres-runtime",
+        display_name="CTS PostgreSQL runtime access",
+        credential_class=CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+        environment="dev",
+        lifecycle_state=LIFECYCLE_BOOTSTRAP_REQUIRED,
+        owner=OwnerRef(team="cts-platform", escalation_group="platform-security"),
+        authority=AuthorityRef(
+            provider="kubernetes_secret",
+            namespace="cts",
+            secret_name="cts-db-secret",
+            key_names=("uri", "password"),
+        ),
+        consumers=(
+            ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend", env_var="POSTGRES_DSN"),
+            ConsumerRef(kind="Deployment", namespace="cts", name="cts-watchdog"),
+        ),
+        risk=RiskAssessment(
+            tier=RISK_HIGH,
+            has_admin_privileges=True,
+            exposure_status=EXPOSURE_EXPOSED_ROTATED_PENDING_ENROLLMENT,
+        ),
+    )
+    assert record.credential_set_id == "cts-postgres-runtime"
+    assert record.owner.team == "cts-platform"
+    assert len(record.consumers) == 2
+    assert record.is_unowned is False
+    assert record.is_unmanaged is True
+    assert record.is_orphaned is False
+    assert record.is_shared_across_apps is False
+
+
+def test_credential_set_record_unowned():
+    """A record with no owner is unowned."""
+    record = CredentialSetRecord(
+        credential_set_id="unknown-cred",
+        display_name="Unknown credential",
+        credential_class=CREDENTIAL_CLASS_API_KEY,
+        environment="dev",
+        lifecycle_state=LIFECYCLE_DISCOVERED,
+    )
+    assert record.is_unowned is True
+    assert record.is_unmanaged is True
+
+
+def test_credential_set_record_orphaned():
+    """A credential with provider identity but no consumers is orphaned."""
+    record = CredentialSetRecord(
+        credential_set_id="old-api-key",
+        display_name="Old API key",
+        credential_class=CREDENTIAL_CLASS_API_KEY,
+        environment="dev",
+        lifecycle_state=LIFECYCLE_ENROLLED,
+        consumers=(),  # no consumers
+    )
+    assert record.is_orphaned is True
+
+
+def test_credential_set_record_shared_across_apps():
+    """A credential consumed in multiple namespaces is shared."""
+    record = CredentialSetRecord(
+        credential_set_id="shared-db",
+        display_name="Shared DB",
+        credential_class=CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+        environment="dev",
+        lifecycle_state=LIFECYCLE_AUTOMATICALLY_MANAGED,
+        consumers=(
+            ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),
+            ConsumerRef(kind="Deployment", namespace="nexus", name="nexus-worker"),
+        ),
+    )
+    assert record.is_shared_across_apps is True
+
+
+def test_credential_set_record_same_namespace_not_shared():
+    """Multiple consumers in the same namespace are not shared across apps."""
+    record = CredentialSetRecord(
+        credential_set_id="cts-db",
+        display_name="CTS DB",
+        credential_class=CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+        environment="dev",
+        lifecycle_state=LIFECYCLE_AUTOMATICALLY_MANAGED,
+        consumers=(
+            ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),
+            ConsumerRef(kind="Deployment", namespace="cts", name="cts-watchdog"),
+        ),
+    )
+    assert record.is_shared_across_apps is False
+
+
+def test_rotation_capabilities_all_present():
+    """rotation_ready is True when all required capabilities are present."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        audit_observability=True,
+    )
+    assert caps.rotation_ready is True
+    assert caps.blockers == ()
+
+
+def test_rotation_capabilities_missing():
+    """rotation_ready is False and blockers list missing capabilities."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=False,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=False,
+    )
+    assert caps.rotation_ready is False
+    assert "secret_authority" in caps.blockers
+    assert "predecessor_revocation" in caps.blockers
+    assert "successor_creation" not in caps.blockers
+
+
+def test_rotation_capabilities_to_dict():
+    """to_dict includes rotation_ready and blockers."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+    )
+    d = caps.to_dict()
+    assert d["rotation_ready"] is True
+    assert d["blockers"] == []
+    assert d["successor_creation"] is True
+
+
+def test_discovery_finding_no_plaintext():
+    """A discovery finding never retains plaintext."""
+    finding = DiscoveryFinding(
+        finding_id="finding_001",
+        source=SOURCE_GITLEAKS,
+        detector="gitleaks",
+        rule_id="postgres-dsn",
+        location_ref="git:cts/deploy-dev.yaml@commit:abc123:line:37",
+        credential_class_hint=CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+        confidence="high",
+        secret_fingerprint="hmac-sha256:abc123",
+        plaintext_retained=False,
+        severity=RISK_CRITICAL,
+    )
+    assert finding.plaintext_retained is False
+    # No secret value in the finding
+    assert "password" not in str(finding.location_ref).lower()
+
+
+def test_enrollment_plan_observe_only():
+    """An observe-only plan cannot execute."""
+    plan = EnrollmentPlan(
+        credential_set_id="cts-postgres-runtime",
+        target_strategy=STRATEGY_DUAL_LOGIN_ROLE,
+        capabilities=RotationCapabilities(),
+        mode=ENROLLMENT_MODE_OBSERVE_ONLY,
+    )
+    assert plan.can_execute is False
+    assert plan.mode == ENROLLMENT_MODE_OBSERVE_ONLY
+
+
+def test_enrollment_plan_execute_with_blockers():
+    """An execute plan with blockers cannot proceed."""
+    plan = EnrollmentPlan(
+        credential_set_id="cts-postgres-runtime",
+        target_strategy=STRATEGY_DUAL_LOGIN_ROLE,
+        capabilities=RotationCapabilities(),  # all False
+        mode=ENROLLMENT_MODE_EXECUTE,
+        blockers=("secret_authority", "delivery"),
+    )
+    assert plan.can_execute is False
+
+
+def test_enrollment_plan_execute_ready():
+    """An execute plan with no blockers and no approval can proceed."""
+    plan = EnrollmentPlan(
+        credential_set_id="cts-minio-writer",
+        target_strategy=STRATEGY_KEY_VERSION_ROTATION,
+        capabilities=RotationCapabilities(
+            successor_creation=True,
+            overlap_support=True,
+            secret_authority=True,
+            delivery=True,
+            consumer_reload=True,
+            positive_probe=True,
+            predecessor_revocation=True,
+        ),
+        mode=ENROLLMENT_MODE_EXECUTE,
+    )
+    assert plan.can_execute is True
+
+
+def test_enrollment_plan_execute_needs_approval():
+    """An execute plan requiring approval cannot proceed without it."""
+    plan = EnrollmentPlan(
+        credential_set_id="cts-postgres-runtime",
+        target_strategy=STRATEGY_DUAL_LOGIN_ROLE,
+        capabilities=RotationCapabilities(
+            successor_creation=True,
+            overlap_support=True,
+            secret_authority=True,
+            delivery=True,
+            consumer_reload=True,
+            positive_probe=True,
+            predecessor_revocation=True,
+        ),
+        mode=ENROLLMENT_MODE_EXECUTE,
+        requires_approval=True,
+        approval_reason="First enrollment of high-risk database credential",
+    )
+    assert plan.can_execute is False  # approval must be obtained separately
+
+
+def test_enrollment_input_roundtrip():
+    """EnrollmentInput roundtrips without exposing secrets."""
+    inp = EnrollmentInput(
+        credential_set_id="cts-minio-writer",
+        mode=ENROLLMENT_MODE_OBSERVE_ONLY,
+        discovery_finding_ids=("finding_001", "finding_002"),
+        target_strategy=STRATEGY_KEY_VERSION_ROTATION,
+        enrollment_deadline="2026-10-01",
+        correlation_id="corr_01JTEST",
+    )
+    d = inp.to_dict()
+    assert d["credential_set_id"] == "cts-minio-writer"
+    assert d["mode"] == ENROLLMENT_MODE_OBSERVE_ONLY
+    assert d["discovery_finding_ids"] == ["finding_001", "finding_002"]
+    assert d["contract_version"] == "1.0"
+    # No secret values
+    assert "password" not in str(d).lower()
+
+
+def test_enrollment_result_completed():
+    """A completed enrollment result references lifecycle state, not secrets."""
+    result = EnrollmentResult(
+        credential_set_id="cts-minio-writer",
+        status="completed",
+        lifecycle_state=LIFECYCLE_ROTATION_READY,
+        capabilities=RotationCapabilities(
+            successor_creation=True,
+            overlap_support=True,
+            secret_authority=True,
+            delivery=True,
+            consumer_reload=True,
+            positive_probe=True,
+            predecessor_revocation=True,
+        ),
+        correlation_id="corr_01JTEST",
+    )
+    d = result.to_dict()
+    assert d["status"] == "completed"
+    assert d["lifecycle_state"] == LIFECYCLE_ROTATION_READY
+    assert d["capabilities"]["rotation_ready"] is True
+    # No secret values
+    assert "password" not in str(d).lower()
+
+
+def test_enrollment_result_observe_only_plan():
+    """An observe-only result produces a plan without execution."""
+    plan = EnrollmentPlan(
+        credential_set_id="cts-postgres-runtime",
+        target_strategy=STRATEGY_DUAL_LOGIN_ROLE,
+        capabilities=RotationCapabilities(successor_creation=False),
+        mode=ENROLLMENT_MODE_OBSERVE_ONLY,
+        blockers=("successor_creation",),
+    )
+    result = EnrollmentResult(
+        credential_set_id="cts-postgres-runtime",
+        status="observe_only_plan",
+        lifecycle_state=LIFECYCLE_BOOTSTRAP_REQUIRED,
+        plan=plan,
+    )
+    assert result.status == "observe_only_plan"
+    assert result.plan is not None
+    assert result.plan.mode == ENROLLMENT_MODE_OBSERVE_ONLY
+    assert result.plan.can_execute is False
+
+
+def test_enrollment_steps_complete():
+    """ENROLLMENT_STEPS contains all 17 workflow steps in order."""
+    assert len(ENROLLMENT_STEPS) == 17
+    assert ENROLLMENT_STEPS[0] == "consolidate_discovery_evidence"
+    assert ENROLLMENT_STEPS[3] == "assign_or_escalate_owner"
+    assert ENROLLMENT_STEPS[8] == "await_approval"
+    assert ENROLLMENT_STEPS[15] == "mark_rotation_ready"
+    assert ENROLLMENT_STEPS[16] == "schedule_first_managed_rotation"
+
+
+def test_discovery_sources_complete():
+    """All 6 discovery sources are defined."""
+    assert len(ALL_DISCOVERY_SOURCES) == 6
+    assert SOURCE_KUBERNETES in ALL_DISCOVERY_SOURCES
+    assert SOURCE_GIT in ALL_DISCOVERY_SOURCES
+    assert SOURCE_GITLEAKS in ALL_DISCOVERY_SOURCES
+
+
+def test_risk_tiers_complete():
+    """All 4 risk tiers are defined."""
+    assert len(ALL_RISK_TIERS) == 4
+    assert RISK_CRITICAL in ALL_RISK_TIERS
+    assert RISK_HIGH in ALL_RISK_TIERS
+    assert RISK_LOW in ALL_RISK_TIERS
+
+
+def test_source_finding_redacted():
+    """SourceFinding contains only redacted references."""
+    finding = SourceFinding(
+        scanner="git-history",
+        location_ref="git:cts@commit:abc123:line:37",
+        severity=RISK_CRITICAL,
+        confidence="high",
+        secret_fingerprint="hmac-sha256:redacted",
+        plaintext_retained=False,
+    )
+    assert finding.plaintext_retained is False
+    assert finding.secret_fingerprint.startswith("hmac-sha256:")
+    # No actual secret value
+    assert "password" not in finding.location_ref.lower()

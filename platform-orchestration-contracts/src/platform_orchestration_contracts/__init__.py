@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -113,6 +113,39 @@ from .credential_rotation import (
     HUMAN_ASSISTED_STATES,
     WORKFLOW_OWNED_STATES,
 )
+from .credential_inventory import (
+    OwnerRef,
+    AuthorityRef,
+    ConsumerRef,
+    SourceFinding,
+    RiskAssessment,
+    RotationCapabilities,
+    CredentialSetRecord,
+    DiscoveryFinding,
+    EnrollmentPlan,
+    EnrollmentInput,
+    EnrollmentResult,
+    SOURCE_KUBERNETES,
+    SOURCE_GIT,
+    SOURCE_RUNTIME,
+    SOURCE_PROVIDER,
+    SOURCE_TELEMETRY,
+    SOURCE_GITLEAKS,
+    ALL_DISCOVERY_SOURCES,
+    EXPOSURE_UNKNOWN,
+    EXPOSURE_CLEAN,
+    EXPOSURE_EXPOSED_ROTATED_PENDING_ENROLLMENT,
+    EXPOSURE_EXPOSED_NOT_ROTATED,
+    EXPOSURE_ROTATED_ENROLLED,
+    RISK_CRITICAL,
+    RISK_HIGH,
+    RISK_MEDIUM,
+    RISK_LOW,
+    ALL_RISK_TIERS,
+    ENROLLMENT_MODE_OBSERVE_ONLY,
+    ENROLLMENT_MODE_EXECUTE,
+    ENROLLMENT_STEPS,
+)
 
 __all__ = [
     "__version__",
@@ -215,4 +248,36 @@ __all__ = [
     "ALL_LIFECYCLE_STATES",
     "HUMAN_ASSISTED_STATES",
     "WORKFLOW_OWNED_STATES",
+    # credential inventory (ADR-038)
+    "OwnerRef",
+    "AuthorityRef",
+    "ConsumerRef",
+    "SourceFinding",
+    "RiskAssessment",
+    "RotationCapabilities",
+    "CredentialSetRecord",
+    "DiscoveryFinding",
+    "EnrollmentPlan",
+    "EnrollmentInput",
+    "EnrollmentResult",
+    "SOURCE_KUBERNETES",
+    "SOURCE_GIT",
+    "SOURCE_RUNTIME",
+    "SOURCE_PROVIDER",
+    "SOURCE_TELEMETRY",
+    "SOURCE_GITLEAKS",
+    "ALL_DISCOVERY_SOURCES",
+    "EXPOSURE_UNKNOWN",
+    "EXPOSURE_CLEAN",
+    "EXPOSURE_EXPOSED_ROTATED_PENDING_ENROLLMENT",
+    "EXPOSURE_EXPOSED_NOT_ROTATED",
+    "EXPOSURE_ROTATED_ENROLLED",
+    "RISK_CRITICAL",
+    "RISK_HIGH",
+    "RISK_MEDIUM",
+    "RISK_LOW",
+    "ALL_RISK_TIERS",
+    "ENROLLMENT_MODE_OBSERVE_ONLY",
+    "ENROLLMENT_MODE_EXECUTE",
+    "ENROLLMENT_STEPS",
 ]

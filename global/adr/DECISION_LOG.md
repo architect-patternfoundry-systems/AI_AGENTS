@@ -31,6 +31,7 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-035 | CTS Temporal Pilot — Ollama Lease Wiring | Accepted (Implementation Gated) | 2026-09-04 | Platform Team | Architecture |
 | ADR-036 | Temporal Integration Standard — Cross-App Durable Orchestration | Accepted | 2026-09-05 | Platform Team | Architecture |
 | ADR-037 | Credential Rotation Lifecycle Workflow | Proposed | 2026-09-05 | Platform Team | Security |
+| ADR-038 | Credential Discovery, Inventory, and Enrollment Standard | Proposed | 2026-09-05 | Platform Team | Security |
 
 ## Categories
 
