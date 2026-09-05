@@ -103,6 +103,17 @@ from platform_orchestration_contracts import (
     PostureReport,
     build_posture_entry,
     evaluate_posture,
+    CredentialObservation,
+    COVERAGE_COMPLETED,
+    COVERAGE_NOT_CONFIGURED,
+    COVERAGE_FAILED,
+    COVERAGE_PARTIAL,
+    COVERAGE_SOURCE_KUBERNETES,
+    COVERAGE_SOURCE_POSTGRES,
+    COVERAGE_SOURCE_MINIO,
+    COVERAGE_SOURCE_GIT_FINDINGS,
+    ALL_COVERAGE_SOURCES,
+    REPORT_VERSION,
     EnrollmentResult,
     SOURCE_KUBERNETES,
     SOURCE_GIT,
@@ -3155,3 +3166,274 @@ def test_posture_entry_has_input_fingerprint():
     entry = report.entries[0]
     assert entry.input_fingerprint.startswith("sha256:")
     assert len(entry.input_fingerprint) > len("sha256:")
+
+
+# --- CredentialObservation ---
+
+
+def test_credential_observation_basic():
+    """CredentialObservation holds adapter-neutral discovery output."""
+    obs = CredentialObservation(
+        observation_id="obs-001",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="prod",
+        credential_class="postgresql_login",
+        provider_ref="postgresql:infra-data-postgres",
+        provider_identity_ref="role:cts_runtime",
+        secret_authority_ref="vault:secret/cts/db",
+        consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+        owner_hint=OwnerRef(team="infra"),
+        risk_signals=("admin_privilege",),
+        exposure_class="active_in_cluster_no_authority",
+        evidence_ref="k8s:cts/cts-backend@resource_version:12345",
+    )
+    assert obs.observation_id == "obs-001"
+    assert obs.source == COVERAGE_SOURCE_KUBERNETES
+    assert obs.credential_class == "postgresql_login"
+    assert len(obs.consumer_refs) == 1
+    assert obs.plaintext_retained is False
+
+
+def test_credential_observation_to_dict():
+    """CredentialObservation serializes to dict."""
+    obs = CredentialObservation(
+        observation_id="obs-002",
+        source=COVERAGE_SOURCE_POSTGRES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="prod",
+        credential_class="postgresql_login",
+        provider_ref="postgresql:infra-data-postgres",
+        evidence_ref="pg:infra-data-postgres:role_catalog",
+    )
+    d = obs.to_dict()
+    assert d["observation_id"] == "obs-002"
+    assert d["source"] == COVERAGE_SOURCE_POSTGRES
+    assert d["plaintext_retained"] is False
+    assert d["owner_hint"] is None
+
+
+def test_credential_observation_plaintext_retained_defaults_false():
+    """CredentialObservation defaults plaintext_retained to False."""
+    obs = CredentialObservation(
+        observation_id="obs-003",
+        source=COVERAGE_SOURCE_MINIO,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="prod",
+    )
+    assert obs.plaintext_retained is False
+
+
+# --- Coverage metadata ---
+
+
+def test_posture_report_default_coverage_not_configured():
+    """Report without coverage argument defaults all sources to not_configured."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-default",
+        records=(record,),
+        policy_version="1",
+    )
+    for source in ALL_COVERAGE_SOURCES:
+        assert report.coverage[source] == COVERAGE_NOT_CONFIGURED
+
+
+def test_posture_report_coverage_completed():
+    """Report with completed coverage has no limitations for that source."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-ok",
+        records=(record,),
+        policy_version="1",
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_MINIO: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_GIT_FINDINGS: COVERAGE_COMPLETED,
+        },
+    )
+    assert report.has_coverage_gaps is False
+    assert len(report.limitations) == 0
+
+
+def test_posture_report_coverage_partial_produces_limitation():
+    """Partial coverage produces a limitation."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-partial",
+        records=(record,),
+        policy_version="1",
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_PARTIAL,
+            COVERAGE_SOURCE_MINIO: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_GIT_FINDINGS: COVERAGE_COMPLETED,
+        },
+    )
+    assert report.has_coverage_gaps is True
+    partial_limitations = [l for l in report.limitations if "partially" in l]
+    assert len(partial_limitations) == 1
+
+
+def test_posture_report_coverage_failed_produces_limitation():
+    """Failed coverage produces a limitation."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-failed",
+        records=(record,),
+        policy_version="1",
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_FAILED,
+            COVERAGE_SOURCE_MINIO: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_GIT_FINDINGS: COVERAGE_COMPLETED,
+        },
+    )
+    failed_limitations = [l for l in report.limitations if "failed" in l]
+    assert len(failed_limitations) == 1
+
+
+def test_posture_report_coverage_not_configured_produces_limitation():
+    """Not-configured coverage produces a limitation."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-missing",
+        records=(record,),
+        policy_version="1",
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_NOT_CONFIGURED,
+            COVERAGE_SOURCE_MINIO: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_GIT_FINDINGS: COVERAGE_COMPLETED,
+        },
+    )
+    missing_limitations = [l for l in report.limitations if "not configured" in l]
+    assert len(missing_limitations) == 1
+
+
+def test_posture_report_has_coverage_gaps_true_when_missing():
+    """has_coverage_gaps is True when any source is not completed."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-gaps",
+        records=(record,),
+        policy_version="1",
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_NOT_CONFIGURED,
+            COVERAGE_SOURCE_MINIO: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_GIT_FINDINGS: COVERAGE_COMPLETED,
+        },
+    )
+    assert report.has_coverage_gaps is True
+
+
+def test_posture_report_coverage_in_json():
+    """Coverage metadata appears in JSON output."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-json",
+        records=(record,),
+        policy_version="1",
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+    )
+    json_str = report.to_json()
+    assert "coverage" in json_str
+    assert "limitations" in json_str
+
+
+def test_posture_report_coverage_in_markdown():
+    """Coverage section appears in Markdown output."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-cov-md",
+        records=(record,),
+        policy_version="1",
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+    )
+    md = report.to_markdown()
+    assert "Discovery coverage" in md
+    assert "Limitations" in md
+
+
+# --- Report integrity ---
+
+
+def test_posture_report_has_entries_sha256():
+    """Report includes entries_sha256 for evidence traceability."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-hash",
+        records=(record,),
+        policy_version="1",
+    )
+    assert report.entries_sha256.startswith("sha256:")
+    assert len(report.entries_sha256) > len("sha256:")
+
+
+def test_posture_report_entries_sha256_deterministic():
+    """Same entries produce the same entries_sha256."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report1 = evaluate_posture(run_id="run-1", records=(record,), policy_version="1")
+    report2 = evaluate_posture(run_id="run-2", records=(record,), policy_version="1")
+    assert report1.entries_sha256 == report2.entries_sha256
+
+
+def test_posture_report_entries_sha256_changes_with_different_entries():
+    """Different entries produce different entries_sha256."""
+    record1 = _make_record(credential_set_id="cts-cred-a", risk_tier=RISK_LOW, capabilities=_full_caps())
+    record2 = _make_record(credential_set_id="cts-cred-b", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report1 = evaluate_posture(run_id="run-1", records=(record1,), policy_version="1")
+    report2 = evaluate_posture(run_id="run-2", records=(record2,), policy_version="1")
+    assert report1.entries_sha256 != report2.entries_sha256
+
+
+def test_posture_report_has_report_version():
+    """Report includes report_version."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-ver",
+        records=(record,),
+        policy_version="1",
+    )
+    assert report.report_version == REPORT_VERSION
+
+
+def test_posture_report_has_contract_package_version():
+    """Report includes contract_package_version."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-pkg",
+        records=(record,),
+        policy_version="1",
+    )
+    assert report.contract_package_version != ""
+    assert report.contract_package_version == "0.8.0" or len(report.contract_package_version.split(".")) >= 2
+
+
+def test_posture_report_evidence_manifest_ref():
+    """Report carries evidence_manifest_ref when provided."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-evidence",
+        records=(record,),
+        policy_version="1",
+        evidence_manifest_ref="security-evidence://discovery/2026-09-05/run-001",
+    )
+    assert report.evidence_manifest_ref == "security-evidence://discovery/2026-09-05/run-001"
+    assert "evidence_manifest_ref" in report.to_json()
+
+
+def test_posture_report_no_secret_values_in_coverage_output():
+    """Coverage and limitations contain no secret values."""
+    record = _make_record(credential_set_id="cts-cred", risk_tier=RISK_LOW, capabilities=_full_caps())
+    report = evaluate_posture(
+        run_id="run-safe-cov",
+        records=(record,),
+        policy_version="1",
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+    )
+    json_output = report.to_json()
+    assert "password" not in json_output.lower()
+    assert "access_key" not in json_output.lower()

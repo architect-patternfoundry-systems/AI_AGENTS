@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -197,6 +197,18 @@ from .credential_discovery_workflow import (
     PostureReport,
     build_posture_entry,
     evaluate_posture,
+    CredentialObservation,
+    COVERAGE_COMPLETED,
+    COVERAGE_NOT_CONFIGURED,
+    COVERAGE_FAILED,
+    COVERAGE_PARTIAL,
+    ALL_COVERAGE_STATUSES,
+    COVERAGE_SOURCE_KUBERNETES,
+    COVERAGE_SOURCE_POSTGRES,
+    COVERAGE_SOURCE_MINIO,
+    COVERAGE_SOURCE_GIT_FINDINGS,
+    ALL_COVERAGE_SOURCES,
+    REPORT_VERSION,
 )
 
 __all__ = [
@@ -381,4 +393,16 @@ __all__ = [
     "PostureReport",
     "build_posture_entry",
     "evaluate_posture",
+    "CredentialObservation",
+    "COVERAGE_COMPLETED",
+    "COVERAGE_NOT_CONFIGURED",
+    "COVERAGE_FAILED",
+    "COVERAGE_PARTIAL",
+    "ALL_COVERAGE_STATUSES",
+    "COVERAGE_SOURCE_KUBERNETES",
+    "COVERAGE_SOURCE_POSTGRES",
+    "COVERAGE_SOURCE_MINIO",
+    "COVERAGE_SOURCE_GIT_FINDINGS",
+    "ALL_COVERAGE_SOURCES",
+    "REPORT_VERSION",
 ]

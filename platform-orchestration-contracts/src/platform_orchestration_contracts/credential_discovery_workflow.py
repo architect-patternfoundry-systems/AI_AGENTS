@@ -57,6 +57,100 @@ from .credential_rotation import (
 )
 
 
+# --- Coverage status constants ---
+
+COVERAGE_COMPLETED = "completed"
+COVERAGE_NOT_CONFIGURED = "not_configured"
+COVERAGE_FAILED = "failed"
+COVERAGE_PARTIAL = "partial"
+
+ALL_COVERAGE_STATUSES = (
+    COVERAGE_COMPLETED,
+    COVERAGE_NOT_CONFIGURED,
+    COVERAGE_FAILED,
+    COVERAGE_PARTIAL,
+)
+
+# Discovery source names for coverage tracking
+COVERAGE_SOURCE_KUBERNETES = "kubernetes"
+COVERAGE_SOURCE_POSTGRES = "postgres"
+COVERAGE_SOURCE_MINIO = "minio"
+COVERAGE_SOURCE_GIT_FINDINGS = "git_findings"
+
+ALL_COVERAGE_SOURCES = (
+    COVERAGE_SOURCE_KUBERNETES,
+    COVERAGE_SOURCE_POSTGRES,
+    COVERAGE_SOURCE_MINIO,
+    COVERAGE_SOURCE_GIT_FINDINGS,
+)
+
+# Report version for evidence traceability
+REPORT_VERSION = "credential-posture-report.v1"
+
+
+# --- Adapter-neutral observation contract ---
+
+
+@dataclass(frozen=True)
+class CredentialObservation:
+    """Adapter-neutral output from a single discovery source.
+
+    Every source adapter (Kubernetes, PostgreSQL, MinIO, Git findings)
+    returns a tuple of these. The correlation service consumes them to
+    produce CredentialSetRecord values with explicit confidence decisions.
+
+    This contract stops source-specific details from leaking into the
+    posture evaluator and makes test fixtures easy to build.
+
+    Never contains plaintext secret material. All references are opaque.
+    """
+
+    observation_id: str
+    source: str  # one of ALL_COVERAGE_SOURCES or ALL_DISCOVERY_SOURCES
+    observed_at: str  # ISO timestamp
+    environment: str
+
+    # What was observed (all optional — a source may see partial info)
+    credential_class: Optional[str] = None  # e.g. "postgresql_login"
+    provider_ref: Optional[str] = None  # e.g. "postgresql:infra-data-postgres"
+    provider_identity_ref: Optional[str] = None  # e.g. "role:cts_runtime_a"
+    secret_authority_ref: Optional[str] = None  # e.g. "vault:secret/cts/db"
+
+    consumer_refs: tuple[ConsumerRef, ...] = ()
+    owner_hint: Optional[OwnerRef] = None
+    risk_signals: tuple[str, ...] = ()  # e.g. ("admin_privilege", "broad_access")
+    exposure_class: Optional[str] = None  # from ADR-038 exposure classes
+
+    # Evidence provenance
+    evidence_ref: str = ""  # e.g. "k8s:cts/cts-backend@resource_version:12345"
+    plaintext_retained: bool = False  # must always be False for Phase 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "source": self.source,
+            "observed_at": self.observed_at,
+            "environment": self.environment,
+            "credential_class": self.credential_class,
+            "provider_ref": self.provider_ref,
+            "provider_identity_ref": self.provider_identity_ref,
+            "secret_authority_ref": self.secret_authority_ref,
+            "consumer_refs": [
+                {"kind": c.kind, "namespace": c.namespace, "name": c.name}
+                for c in self.consumer_refs
+            ],
+            "owner_hint": (
+                {"team": self.owner_hint.team, "service": self.owner_hint.service}
+                if self.owner_hint
+                else None
+            ),
+            "risk_signals": list(self.risk_signals),
+            "exposure_class": self.exposure_class,
+            "evidence_ref": self.evidence_ref,
+            "plaintext_retained": self.plaintext_retained,
+        }
+
+
 # --- Posture report types ---
 
 
@@ -117,6 +211,12 @@ class PostureReport:
     This is the primary output of the Phase 1 inventory-only controller.
     It contains redacted metadata only and is safe to persist as evidence
     or display on a security dashboard.
+
+    Coverage metadata prevents a dashboard from turning a scanner outage
+    or missing adapter into a false security assurance. A report with
+    no PostgreSQL adapter data should not conclude that no PostgreSQL
+    credentials exist — it should mark postgres coverage as
+    not_configured and list the limitation.
     """
 
     run_id: str
@@ -131,16 +231,30 @@ class PostureReport:
     summary_by_risk_tier: dict[str, int] = field(default_factory=dict)
     summary_by_lifecycle_state: dict[str, int] = field(default_factory=dict)
 
+    # Coverage and integrity metadata
+    report_version: str = REPORT_VERSION
+    contract_package_version: str = ""  # populated by evaluate_posture
+    coverage: dict[str, str] = field(default_factory=dict)  # source → status
+    limitations: tuple[str, ...] = ()
+    entries_sha256: str = ""  # hash of canonical redacted entries
+    evidence_manifest_ref: Optional[str] = None  # e.g. "security-evidence://..."
+
     def to_dict(self) -> dict[str, Any]:
         return {
+            "report_version": self.report_version,
             "run_id": self.run_id,
             "evaluated_at": self.evaluated_at,
             "policy_version": self.policy_version,
+            "contract_package_version": self.contract_package_version,
             "total_credentials": self.total_credentials,
             "eligible_count": self.eligible_count,
             "blocked_count": self.blocked_count,
             "unowned_count": self.unowned_count,
             "orphaned_count": self.orphaned_count,
+            "coverage": dict(self.coverage),
+            "limitations": list(self.limitations),
+            "entries_sha256": self.entries_sha256,
+            "evidence_manifest_ref": self.evidence_manifest_ref,
             "summary_by_risk_tier": dict(self.summary_by_risk_tier),
             "summary_by_lifecycle_state": dict(self.summary_by_lifecycle_state),
             "entries": [e.to_dict() for e in self.entries],
@@ -150,29 +264,71 @@ class PostureReport:
         import json
         return json.dumps(self.to_dict(), sort_keys=True, indent=2)
 
+    @property
+    def has_coverage_gaps(self) -> bool:
+        """True if any discovery source is not completed."""
+        for source in ALL_COVERAGE_SOURCES:
+            status = self.coverage.get(source, COVERAGE_NOT_CONFIGURED)
+            if status != COVERAGE_COMPLETED:
+                return True
+        return False
+
     def to_markdown(self) -> str:
         """Render a human-readable Markdown posture report."""
         lines = [
             f"# Credential Posture Report",
             f"",
             f"- **Run ID**: `{self.run_id}`",
+            f"- **Report version**: {self.report_version}",
             f"- **Evaluated at**: {self.evaluated_at}",
             f"- **Policy version**: {self.policy_version}",
+            f"- **Contract package version**: {self.contract_package_version}",
             f"- **Total credentials**: {self.total_credentials}",
             f"- **Eligible for rotation**: {self.eligible_count}",
             f"- **Blocked**: {self.blocked_count}",
             f"- **Unowned**: {self.unowned_count}",
             f"- **Orphaned**: {self.orphaned_count}",
+            f"- **Entries SHA-256**: `{self.entries_sha256}`" if self.entries_sha256 else "",
+        ]
+        if self.evidence_manifest_ref:
+            lines.append(f"- **Evidence manifest**: `{self.evidence_manifest_ref}`")
+
+        # Coverage section
+        lines.extend([
+            f"",
+            f"## Discovery coverage",
+            f"",
+            f"| Source | Status |",
+            f"|---|---|",
+        ])
+        for source in ALL_COVERAGE_SOURCES:
+            status = self.coverage.get(source, COVERAGE_NOT_CONFIGURED)
+            lines.append(f"| {source} | {status} |")
+
+        # Limitations
+        if self.limitations:
+            lines.extend([
+                f"",
+                f"## Limitations",
+                f"",
+            ])
+            for limitation in self.limitations:
+                lines.append(f"- {limitation}")
+
+        # Risk tier summary
+        lines.extend([
             f"",
             f"## Summary by risk tier",
             f"",
             f"| Risk tier | Count |",
             f"|---|---|",
-        ]
+        ])
         for tier in ALL_RISK_TIERS:
             count = self.summary_by_risk_tier.get(tier, 0)
             if count > 0:
                 lines.append(f"| {tier} | {count} |")
+
+        # Lifecycle state summary
         lines.extend([
             f"",
             f"## Summary by lifecycle state",
@@ -183,6 +339,8 @@ class PostureReport:
         for state, count in sorted(self.summary_by_lifecycle_state.items()):
             if count > 0:
                 lines.append(f"| {state} | {count} |")
+
+        # Credential details
         lines.extend([
             f"",
             f"## Credential details",
@@ -309,6 +467,44 @@ def build_posture_entry(
     )
 
 
+def _compute_entries_sha256(entries: tuple[CredentialPostureEntry, ...]) -> str:
+    """Compute SHA-256 over canonical redacted entries.
+
+    The hash covers the entry dicts in sorted-key JSON form, not raw
+    scanner output. This makes reports traceable without persisting
+    sensitive source content in the dashboard.
+    """
+    import hashlib
+    import json
+
+    payload = [e.to_dict() for e in entries]
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_limitations(coverage: dict[str, str]) -> tuple[str, ...]:
+    """Build human-readable limitations from coverage status."""
+    limitations: list[str] = []
+    for source in ALL_COVERAGE_SOURCES:
+        status = coverage.get(source, COVERAGE_NOT_CONFIGURED)
+        if status == COVERAGE_NOT_CONFIGURED:
+            limitations.append(
+                f"{source} discovery was not configured; "
+                f"{source} credential inventory may be incomplete."
+            )
+        elif status == COVERAGE_FAILED:
+            limitations.append(
+                f"{source} discovery failed; "
+                f"{source} credential inventory is stale or unavailable."
+            )
+        elif status == COVERAGE_PARTIAL:
+            limitations.append(
+                f"{source} discovery completed partially; "
+                f"some {source} credentials may not be inventoried."
+            )
+    return tuple(limitations)
+
+
 def evaluate_posture(
     *,
     run_id: str,
@@ -316,6 +512,8 @@ def evaluate_posture(
     risk_tier_overrides: Optional[dict[str, str]] = None,
     capability_overrides: Optional[dict[str, RotationCapabilities]] = None,
     policy_version: str = "1",
+    coverage: Optional[dict[str, str]] = None,
+    evidence_manifest_ref: Optional[str] = None,
 ) -> PostureReport:
     """Evaluate posture for a set of credential inventory records.
 
@@ -324,6 +522,9 @@ def evaluate_posture(
        canonical evaluator.
     2. Builds a posture entry for each credential.
     3. Aggregates into a PostureReport with summaries.
+    4. Records coverage metadata so missing adapters don't create
+       false security assurance.
+    5. Computes entries_sha256 for evidence traceability.
 
     The function is read-only and produces only redacted metadata.
     No provider mutation, secret reads, or workload changes occur.
@@ -332,15 +533,19 @@ def evaluate_posture(
         run_id: Unique identifier for this discovery run.
         records: Credential inventory records to evaluate.
         risk_tier_overrides: Optional map of credential_set_id → risk_tier.
-            If not provided, the record's risk tier is used.
         capability_overrides: Optional map of credential_set_id → capabilities.
-            If not provided, the record's capabilities are used.
         policy_version: Policy version for eligibility evaluation.
+        coverage: Map of discovery source name → coverage status. If not
+            provided, all sources default to not_configured. This prevents
+            a dashboard from turning a missing adapter into false assurance.
+        evidence_manifest_ref: Optional reference to the evidence store
+            where the full redacted report is persisted.
 
     Returns:
-        PostureReport with entries for each credential.
+        PostureReport with entries, coverage, limitations, and integrity hash.
     """
     from datetime import datetime, timezone
+    from . import __version__ as package_version
 
     entries: list[CredentialPostureEntry] = []
 
@@ -390,6 +595,15 @@ def evaluate_posture(
     unowned_count = sum(1 for e in entries if e.owner is None)
     orphaned_count = sum(1 for e in entries if e.consumer_count == 0 and e.lifecycle_state != LIFECYCLE_DISCOVERED)
 
+    # Default coverage: all sources not_configured
+    final_coverage = coverage or {}
+    for source in ALL_COVERAGE_SOURCES:
+        if source not in final_coverage:
+            final_coverage[source] = COVERAGE_NOT_CONFIGURED
+
+    limitations = _build_limitations(final_coverage)
+    entries_hash = _compute_entries_sha256(entries_tuple)
+
     return PostureReport(
         run_id=run_id,
         evaluated_at=datetime.now(timezone.utc).isoformat(),
@@ -402,4 +616,10 @@ def evaluate_posture(
         entries=entries_tuple,
         summary_by_risk_tier=_summarize_by_risk_tier(entries_tuple),
         summary_by_lifecycle_state=_summarize_by_lifecycle_state(entries_tuple),
+        report_version=REPORT_VERSION,
+        contract_package_version=package_version,
+        coverage=final_coverage,
+        limitations=limitations,
+        entries_sha256=entries_hash,
+        evidence_manifest_ref=evidence_manifest_ref,
     )
