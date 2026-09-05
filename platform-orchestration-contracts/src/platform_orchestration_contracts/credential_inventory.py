@@ -572,6 +572,11 @@ class WorkflowExecutionAuthorization:
     subject_fingerprint: str = ""  # must match eligibility.input_fingerprint
     execution_fingerprint: str = ""  # hash of execution-time inputs
 
+    # Approval binding for high/critical rotations
+    approval_ref: Optional[str] = None  # e.g. "approval:rotation_01J...:revision_3"
+    approval_subject_fingerprint: Optional[str] = None  # must match subject_fingerprint
+    approval_expires_at: Optional[str] = None  # ISO timestamp; None means unexpired check skipped
+
     @property
     def all_blockers(self) -> tuple[str, ...]:
         """All execution blockers — derived from checks plus policy blockers."""
@@ -586,6 +591,22 @@ class WorkflowExecutionAuthorization:
             missing.append("cutover_scope_mismatch")
         if not self.no_active_incident_freeze:
             missing.append("active_incident_freeze")
+        # Approval binding checks
+        if self.approval_ref is not None:
+            if self.approval_subject_fingerprint is not None:
+                if self.approval_subject_fingerprint != self.subject_fingerprint:
+                    missing.append("approval_subject_fingerprint_mismatch")
+            if self.approval_expires_at is not None:
+                from datetime import datetime, timezone
+                try:
+                    expiry = datetime.fromisoformat(self.approval_expires_at)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    if expiry < now:
+                        missing.append("approval_expired")
+                except (ValueError, TypeError):
+                    missing.append("approval_expiry_malformed")
         # Deduplicate while preserving order
         seen: set[str] = set()
         result: list[str] = []
@@ -824,6 +845,9 @@ def evaluate_workflow_execution_authorization(
     no_active_incident_freeze: bool,
     policy_blockers: tuple[str, ...] = (),
     policy_version: str = "1",
+    approval_ref: Optional[str] = None,
+    approval_subject_fingerprint: Optional[str] = None,
+    approval_expires_at: Optional[str] = None,
 ) -> WorkflowExecutionAuthorization:
     """Evaluate workflow-level execution authorization for a rotation.
 
@@ -833,9 +857,17 @@ def evaluate_workflow_execution_authorization(
     WorkflowExecutionAuthorization directly in production code.
 
     The eligibility parameter binds this authorization to a specific
-    eligibility decision via subject_fingerprint. The workflow must
-    verify that execution_auth.matches_eligibility(eligibility) is True
-    before proceeding to mutation.
+    eligibility decision via subject_fingerprint. The evaluator
+    fail-fast validates that subject, risk_tier, and policy_version
+    are consistent with the eligibility decision. The workflow must
+    also verify execution_auth.matches_eligibility(eligibility) before
+    proceeding to mutation.
+
+    For high/critical rotations, supply approval_ref,
+    approval_subject_fingerprint, and approval_expires_at to bind the
+    authorization to a specific approval. The evaluator checks that the
+    approval's subject fingerprint matches the current subject
+    fingerprint and that the approval has not expired.
 
     Precedence for critical-tier rotations:
     1. evaluate_rotation_eligibility (provider caps + critical gates)
@@ -845,13 +877,31 @@ def evaluate_workflow_execution_authorization(
 
     Raises:
         ValueError: If risk_tier is invalid, credential_set_id is
-            malformed, or policy_version is empty.
+            malformed, policy_version is empty, or subject/risk_tier/
+            policy_version do not match the supplied eligibility.
     """
     _validate_eligibility_inputs(
         credential_set_id=subject.credential_set_id,
         risk_tier=risk_tier,
         policy_version=policy_version,
     )
+
+    # Fail-fast: subject, risk_tier, and policy_version must match eligibility
+    if subject.credential_set_id != eligibility.credential_set_id:
+        raise ValueError(
+            f"subject credential_set_id ({subject.credential_set_id!r}) "
+            f"does not match eligibility ({eligibility.credential_set_id!r})"
+        )
+    if risk_tier != eligibility.risk_tier:
+        raise ValueError(
+            f"risk_tier ({risk_tier!r}) does not match eligibility "
+            f"({eligibility.risk_tier!r})"
+        )
+    if policy_version != eligibility.policy_version:
+        raise ValueError(
+            f"policy_version ({policy_version!r}) does not match eligibility "
+            f"({eligibility.policy_version!r})"
+        )
 
     exec_fp = _compute_execution_fingerprint(
         subject_fingerprint=eligibility.input_fingerprint,
@@ -877,6 +927,9 @@ def evaluate_workflow_execution_authorization(
         policy_blockers=policy_blockers,
         subject_fingerprint=eligibility.input_fingerprint,
         execution_fingerprint=exec_fp,
+        approval_ref=approval_ref,
+        approval_subject_fingerprint=approval_subject_fingerprint,
+        approval_expires_at=approval_expires_at,
     )
 
 

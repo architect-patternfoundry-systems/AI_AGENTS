@@ -2591,3 +2591,217 @@ def test_stale_authorization_after_consumer_version_change():
     # Old authorization does not match new eligibility
     assert auth_for_v1.matches_eligibility(eligibility_v2) is False
     assert eligibility_v1.input_fingerprint != eligibility_v2.input_fingerprint
+
+
+# --- Fail-fast subject/eligibility consistency validation ---
+
+
+def test_evaluator_rejects_subject_eligibility_credential_id_mismatch():
+    """Evaluator raises ValueError when subject credential_set_id != eligibility."""
+    import pytest
+    subject_a = _make_subject("cts-cred-a")
+    eligibility_for_b = evaluate_rotation_eligibility(
+        subject=_make_subject("cts-cred-b"),
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    with pytest.raises(ValueError, match="credential_set_id"):
+        evaluate_workflow_execution_authorization(
+            subject=subject_a,
+            risk_tier=RISK_HIGH,
+            eligibility=eligibility_for_b,
+            immutable_evidence_sink_available=True,
+            rollback_plan_validated=True,
+            approval_requirement_resolved=True,
+            cutover_scope_matches_approved_plan=True,
+            no_active_incident_freeze=True,
+            policy_version="1",
+        )
+
+
+def test_evaluator_rejects_risk_tier_mismatch():
+    """Evaluator raises ValueError when risk_tier != eligibility.risk_tier."""
+    import pytest
+    subject = _make_subject("cts-cred")
+    eligibility_high = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    with pytest.raises(ValueError, match="risk_tier"):
+        evaluate_workflow_execution_authorization(
+            subject=subject,
+            risk_tier=RISK_LOW,  # mismatch
+            eligibility=eligibility_high,
+            immutable_evidence_sink_available=True,
+            rollback_plan_validated=True,
+            approval_requirement_resolved=True,
+            cutover_scope_matches_approved_plan=True,
+            no_active_incident_freeze=True,
+            policy_version="1",
+        )
+
+
+def test_evaluator_rejects_policy_version_mismatch():
+    """Evaluator raises ValueError when policy_version != eligibility.policy_version."""
+    import pytest
+    subject = _make_subject("cts-cred")
+    eligibility_v1 = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    with pytest.raises(ValueError, match="policy_version"):
+        evaluate_workflow_execution_authorization(
+            subject=subject,
+            risk_tier=RISK_HIGH,
+            eligibility=eligibility_v1,
+            immutable_evidence_sink_available=True,
+            rollback_plan_validated=True,
+            approval_requirement_resolved=True,
+            cutover_scope_matches_approved_plan=True,
+            no_active_incident_freeze=True,
+            policy_version="2",  # mismatch
+        )
+
+
+# --- Approval binding ---
+
+
+def test_approval_binding_valid_does_not_block():
+    """Valid approval binding with matching fingerprint and future expiry does not block."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+        approval_ref="approval:rotation_01J:revision_3",
+        approval_subject_fingerprint=eligibility.input_fingerprint,
+        approval_expires_at="2099-01-01T00:00:00+00:00",
+    )
+    assert auth.authorized is True
+    assert "approval_subject_fingerprint_mismatch" not in auth.all_blockers
+    assert "approval_expired" not in auth.all_blockers
+
+
+def test_approval_binding_subject_fingerprint_mismatch_blocks():
+    """Approval with wrong subject fingerprint blocks authorization."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+        approval_ref="approval:rotation_01J:revision_3",
+        approval_subject_fingerprint="sha256:wrong_fingerprint",
+        approval_expires_at="2099-01-01T00:00:00+00:00",
+    )
+    assert auth.authorized is False
+    assert "approval_subject_fingerprint_mismatch" in auth.all_blockers
+
+
+def test_approval_binding_expired_blocks():
+    """Expired approval blocks authorization."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+        approval_ref="approval:rotation_01J:revision_3",
+        approval_subject_fingerprint=eligibility.input_fingerprint,
+        approval_expires_at="2020-01-01T00:00:00+00:00",  # past
+    )
+    assert auth.authorized is False
+    assert "approval_expired" in auth.all_blockers
+
+
+def test_approval_binding_malformed_expiry_blocks():
+    """Malformed approval expiry blocks authorization (fail-closed)."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_HIGH,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+        approval_ref="approval:rotation_01J:revision_3",
+        approval_subject_fingerprint=eligibility.input_fingerprint,
+        approval_expires_at="not-a-date",
+    )
+    assert auth.authorized is False
+    assert "approval_expiry_malformed" in auth.all_blockers
+
+
+def test_approval_binding_none_does_not_add_blockers():
+    """No approval binding (None) does not add approval-related blockers."""
+    subject = _make_subject("cts-cred")
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = evaluate_workflow_execution_authorization(
+        subject=subject,
+        risk_tier=RISK_LOW,
+        eligibility=eligibility,
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+        policy_version="1",
+        # approval_ref, approval_subject_fingerprint, approval_expires_at all None
+    )
+    assert auth.authorized is True
+    assert "approval_subject_fingerprint_mismatch" not in auth.all_blockers
+    assert "approval_expired" not in auth.all_blockers
+    assert "approval_expiry_malformed" not in auth.all_blockers
