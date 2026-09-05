@@ -45,6 +45,12 @@ from platform_orchestration_contracts import (
     TASK_QUEUE_SECURITY_KUBERNETES,
     TASK_QUEUE_SECURITY_DATABASE,
     TASK_QUEUE_SECURITY_OBJECT_STORAGE,
+    TASK_QUEUE_SECURITY_DISCOVERY_KUBERNETES,
+    TASK_QUEUE_SECURITY_DISCOVERY_POSTGRES,
+    TASK_QUEUE_SECURITY_DISCOVERY_MINIO,
+    TASK_QUEUE_SECURITY_DISCOVERY_GIT,
+    TASK_QUEUE_SECURITY_CORRELATION,
+    TASK_QUEUE_SECURITY_INVENTORY_WRITE,
     # credential rotation
     SecretRef,
     ConsumerSelector,
@@ -81,6 +87,7 @@ from platform_orchestration_contracts import (
     SourceFinding,
     RiskAssessment,
     RotationCapabilities,
+    RotationExecutionGates,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -1377,3 +1384,258 @@ def test_retention_by_risk_tier_mapping():
     assert len(RETENTION_BY_RISK_TIER) == 4
     assert RETENTION_BY_RISK_TIER[RISK_CRITICAL] > RETENTION_BY_RISK_TIER[RISK_HIGH]
     assert RETENTION_BY_RISK_TIER[RISK_HIGH] > RETENTION_BY_RISK_TIER[RISK_LOW]
+
+
+# --- Critical execution gates, exception fail-closed, correlation edge cases ---
+
+
+def test_critical_execution_gates_all_configured():
+    """Critical rotation is eligible when all execution gates are configured."""
+    gates = RotationExecutionGates(
+        approval_policy_configured=True,
+        canary_cutover_configured=True,
+        immutable_evidence_store=True,
+        emergency_recovery_plan_verified=True,
+    )
+    assert gates.critical_ready is True
+    assert gates.missing_gates == ()
+
+
+def test_critical_execution_gates_missing():
+    """Critical rotation is blocked when execution gates are absent."""
+    gates = RotationExecutionGates(
+        approval_policy_configured=True,
+        canary_cutover_configured=False,
+        immutable_evidence_store=True,
+        emergency_recovery_plan_verified=False,
+    )
+    assert gates.critical_ready is False
+    assert "canary_cutover_configured" in gates.missing_gates
+    assert "emergency_recovery_plan_verified" in gates.missing_gates
+    assert "approval_policy_configured" not in gates.missing_gates
+
+
+def test_critical_capability_ready_but_execution_gate_absent():
+    """Provider capability ready + execution gate absent = cannot execute."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        audit_observability=True,
+        owner_confirmation=True,
+        rollback_verification=True,
+    )
+    gates = RotationExecutionGates()  # all False
+    provider_ready = caps.is_rotation_ready_for_risk(RISK_CRITICAL)
+    execution_ready = gates.critical_ready
+    eligible = provider_ready and execution_ready
+    assert provider_ready is True
+    assert execution_ready is False
+    assert eligible is False
+
+
+def test_critical_full_eligibility():
+    """Critical rotation eligible only with both provider + execution gates."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        audit_observability=True,
+        owner_confirmation=True,
+        rollback_verification=True,
+    )
+    gates = RotationExecutionGates(
+        approval_policy_configured=True,
+        canary_cutover_configured=True,
+        immutable_evidence_store=True,
+        emergency_recovery_plan_verified=True,
+    )
+    eligible = caps.is_rotation_ready_for_risk(RISK_CRITICAL) and gates.critical_ready
+    assert eligible is True
+
+
+def test_exception_malformed_expiry_fails_closed():
+    """A malformed expiry string is treated as expired (fail closed)."""
+    exc = CredentialException(
+        exception_id="sec-exc-bad",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2026-09-05T00:00:00Z",
+        expires_at="not-a-date",
+    )
+    assert exc.is_expired is True
+    assert exc.is_valid is False
+
+
+def test_exception_missing_expiry_fails_closed():
+    """A None expiry is treated as expired (fail closed)."""
+    exc = CredentialException(
+        exception_id="sec-exc-none",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2026-09-05T00:00:00Z",
+        expires_at=None,  # type: ignore[arg-type]
+    )
+    assert exc.is_expired is True
+    assert exc.is_valid is False
+
+
+def test_exception_at_exact_expiry_is_expired():
+    """An exception at its exact expiry timestamp is expired (>=)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    exc = CredentialException(
+        exception_id="sec-exc-now",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2026-01-01T00:00:00Z",
+        expires_at=now.isoformat(),
+        remediation_target="migrate-to-vault",
+    )
+    assert exc.is_expired is True
+
+
+def test_exception_valid_with_remediation():
+    """A valid exception has parseable expiry and remediation target."""
+    exc = CredentialException(
+        exception_id="sec-exc-valid",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2026-09-05T00:00:00Z",
+        expires_at="2099-01-01T00:00:00Z",
+        remediation_target="migrate-to-vault",
+    )
+    assert exc.is_valid is True
+    assert exc.is_expired is False
+
+
+def test_exception_invalid_without_remediation():
+    """An exception without remediation_target is not valid."""
+    exc = CredentialException(
+        exception_id="sec-exc-no-remediation",
+        credential_set_id="legacy-api",
+        reason_code=EXCEPTION_REASON_PROVIDER_NO_SECONDARY_KEY,
+        risk_accepted_by="security-owner",
+        approved_at="2026-09-05T00:00:00Z",
+        expires_at="2099-01-01T00:00:00Z",
+        remediation_target=None,
+    )
+    assert exc.is_valid is False
+
+
+def test_correlation_empty_evidence_returns_none_confidence():
+    """Empty evidence returns None, not 'low' confidence."""
+    corr = CredentialCorrelation(
+        canonical_credential_set_id="orphan-cred",
+        evidence=(),
+    )
+    assert corr.highest_confidence is None
+    assert corr.has_evidence is False
+
+
+def test_correlation_with_evidence_has_confidence():
+    """Non-empty evidence returns a confidence level."""
+    corr = CredentialCorrelation(
+        canonical_credential_set_id="cts-postgres-runtime",
+        evidence=(
+            CorrelationEvidence(
+                finding_type="kubernetes_consumer",
+                confidence=CORRELATION_CONFIDENCE_LOW,
+                matching_basis=CORRELATION_BASIS_NAME_INFERENCE,
+            ),
+        ),
+    )
+    assert corr.highest_confidence == CORRELATION_CONFIDENCE_LOW
+    assert corr.has_evidence is True
+
+
+def test_correlation_conflicting_high_confidence_unconfirmed():
+    """Conflicting high-confidence evidence stays unconfirmed."""
+    corr = CredentialCorrelation(
+        canonical_credential_set_id="ambiguous-cred",
+        evidence=(
+            CorrelationEvidence(
+                finding_type="kubernetes_consumer",
+                confidence=CORRELATION_CONFIDENCE_HIGH,
+                matching_basis=CORRELATION_BASIS_EXPLICIT_ANNOTATION,
+                finding_ref="finding_a",
+            ),
+            CorrelationEvidence(
+                finding_type="postgres_role",
+                confidence=CORRELATION_CONFIDENCE_HIGH,
+                matching_basis=CORRELATION_BASIS_PROVIDER_IDENTITY,
+                finding_ref="finding_b",
+            ),
+        ),
+        confirmed=False,  # conflicting evidence requires owner resolution
+    )
+    assert corr.highest_confidence == CORRELATION_CONFIDENCE_HIGH
+    assert corr.confirmed is False
+
+
+def test_discovery_task_queues_isolated():
+    """Discovery task queues are distinct from each other and from rotation queues."""
+    discovery_queues = {
+        TASK_QUEUE_SECURITY_DISCOVERY_KUBERNETES,
+        TASK_QUEUE_SECURITY_DISCOVERY_POSTGRES,
+        TASK_QUEUE_SECURITY_DISCOVERY_MINIO,
+        TASK_QUEUE_SECURITY_DISCOVERY_GIT,
+        TASK_QUEUE_SECURITY_CORRELATION,
+        TASK_QUEUE_SECURITY_INVENTORY_WRITE,
+    }
+    rotation_queues = {
+        TASK_QUEUE_SECURITY_WORKFLOWS,
+        TASK_QUEUE_SECURITY_SECRET_PROVIDER,
+        TASK_QUEUE_SECURITY_KUBERNETES,
+        TASK_QUEUE_SECURITY_DATABASE,
+        TASK_QUEUE_SECURITY_OBJECT_STORAGE,
+    }
+    # Discovery queues must not collide with rotation queues
+    assert discovery_queues.isdisjoint(rotation_queues)
+    # All discovery queues are distinct
+    assert len(discovery_queues) == 6
+
+
+def test_low_risk_without_overlap_may_be_ready():
+    """Low-risk credential without overlap can be rotation-ready."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        overlap_support=False,
+    )
+    assert caps.is_rotation_ready_for_risk(RISK_LOW) is True
+
+
+def test_high_risk_lacking_owner_confirmation_not_ready():
+    """High-risk credential without owner confirmation cannot be rotation_ready."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        audit_observability=True,
+        owner_confirmation=False,  # missing
+        rollback_verification=True,
+    )
+    assert caps.is_rotation_ready_for_risk(RISK_HIGH) is False
+    high_blockers = caps.blockers_for_risk(RISK_HIGH)
+    assert "owner_confirmation" in high_blockers

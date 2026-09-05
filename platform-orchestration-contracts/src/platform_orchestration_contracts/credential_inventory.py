@@ -271,14 +271,20 @@ class RotationCapabilities:
         )
 
     def is_rotation_ready_for_risk(self, risk_tier: str) -> bool:
-        """Risk-tiered readiness assessment.
+        """Risk-tiered **provider capability** readiness assessment.
 
-        | Risk tier | Required for rotation_ready |
+        This evaluates whether the provider/infrastructure adapters can
+        support rotation at the given risk tier. It does NOT evaluate
+        workflow-level execution gates (approval policy, canary cutover,
+        immutable evidence, emergency recovery) required for critical
+        credentials. Use RotationExecutionGates for that.
+
+        | Risk tier | Required provider capabilities |
         |---|---|
         | Low | successor, authority, delivery, reload, probe, revocation |
         | Medium | Low + overlap_support |
         | High | Medium + audit_observability, owner_confirmation, rollback_verification |
-        | Critical | High (same requirements; approval/canary/evidence are workflow-level) |
+        | Critical | Same as High (workflow-level gates checked separately) |
         """
         if not self.rotation_ready:
             return False
@@ -343,6 +349,49 @@ class RotationCapabilities:
             "rotation_ready": self.rotation_ready,
             "blockers": list(self.blockers),
         }
+
+
+@dataclass(frozen=True)
+class RotationExecutionGates:
+    """Workflow-level execution gates for critical/admin credential rotation.
+
+    These are distinct from provider capabilities (RotationCapabilities).
+    A critical credential requires both provider-capability readiness
+    AND execution-gate readiness before automated rotation may proceed.
+
+    provider_ready = capabilities.is_rotation_ready_for_risk(RISK_CRITICAL)
+    execution_ready = rotation_gates.critical_ready
+    eligible = provider_ready and execution_ready
+    """
+
+    approval_policy_configured: bool = False
+    canary_cutover_configured: bool = False
+    immutable_evidence_store: bool = False
+    emergency_recovery_plan_verified: bool = False
+
+    @property
+    def critical_ready(self) -> bool:
+        """True if all critical-tier execution gates are configured."""
+        return (
+            self.approval_policy_configured
+            and self.canary_cutover_configured
+            and self.immutable_evidence_store
+            and self.emergency_recovery_plan_verified
+        )
+
+    @property
+    def missing_gates(self) -> tuple[str, ...]:
+        """List of missing execution gates."""
+        missing = []
+        if not self.approval_policy_configured:
+            missing.append("approval_policy_configured")
+        if not self.canary_cutover_configured:
+            missing.append("canary_cutover_configured")
+        if not self.immutable_evidence_store:
+            missing.append("immutable_evidence_store")
+        if not self.emergency_recovery_plan_verified:
+            missing.append("emergency_recovery_plan_verified")
+        return tuple(missing)
 
 
 @dataclass(frozen=True)
@@ -534,13 +583,26 @@ class CredentialCorrelation:
     confirmed: bool = False  # True only after owner or policy resolves ambiguity
 
     @property
-    def highest_confidence(self) -> str:
-        """Returns the highest confidence level across all evidence."""
+    def highest_confidence(self) -> Optional[str]:
+        """Returns the highest confidence level across all evidence.
+
+        Returns None if there is no evidence. This distinguishes "no
+        evidence" from "low-confidence evidence" — an empty-evidence
+        credential set should become an explicit integrity alert,
+        not a low-confidence inference.
+        """
+        if not self.evidence:
+            return None
         if any(e.confidence == CORRELATION_CONFIDENCE_HIGH for e in self.evidence):
             return CORRELATION_CONFIDENCE_HIGH
         if any(e.confidence == CORRELATION_CONFIDENCE_MEDIUM for e in self.evidence):
             return CORRELATION_CONFIDENCE_MEDIUM
         return CORRELATION_CONFIDENCE_LOW
+
+    @property
+    def has_evidence(self) -> bool:
+        """True if any evidence exists for this correlation."""
+        return bool(self.evidence)
 
     @property
     def has_explicit_annotation(self) -> bool:
@@ -573,13 +635,34 @@ class CredentialException:
 
     @property
     def is_expired(self) -> bool:
-        """True if the exception has passed its expiry."""
+        """True if the exception has passed its expiry.
+
+        Fails CLOSED on malformed or missing expiry dates: an invalid
+        expiry is treated as expired, not as valid. This prevents a
+        malformed exception from silently granting perpetual unmanaged
+        status.
+        """
         from datetime import datetime
         try:
             expiry = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
-            return datetime.now(expiry.tzinfo) > expiry
+        except (ValueError, AttributeError):
+            return True
+        return datetime.now(expiry.tzinfo) >= expiry
+
+    @property
+    def is_valid(self) -> bool:
+        """True if the exception has a parseable expiry and a remediation target.
+
+        A valid exception has:
+        - A parseable expires_at timestamp.
+        - A non-empty remediation_target (no permanent exceptions).
+        """
+        from datetime import datetime
+        try:
+            datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             return False
+        return bool(self.remediation_target)
 
 
 @dataclass(frozen=True)

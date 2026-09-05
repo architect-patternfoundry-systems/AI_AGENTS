@@ -33,6 +33,17 @@ TASK_QUEUE_SECURITY_SECRET_PROVIDER = "security-secret-provider"
 TASK_QUEUE_SECURITY_KUBERNETES = "security-kubernetes"
 TASK_QUEUE_SECURITY_DATABASE = "security-database"
 TASK_QUEUE_SECURITY_OBJECT_STORAGE = "security-object-storage"
+# Discovery task queues (ADR-038) — read-only, source-specific isolation.
+# Each discovery source has materially different privileges and failure
+# modes. A Kubernetes metadata scanner should not acquire database
+# catalog permissions; a Git scanner should not obtain object-store
+# identity visibility.
+TASK_QUEUE_SECURITY_DISCOVERY_KUBERNETES = "security-discovery-kubernetes"
+TASK_QUEUE_SECURITY_DISCOVERY_POSTGRES = "security-discovery-postgres"
+TASK_QUEUE_SECURITY_DISCOVERY_MINIO = "security-discovery-minio"
+TASK_QUEUE_SECURITY_DISCOVERY_GIT = "security-discovery-git-findings"
+TASK_QUEUE_SECURITY_CORRELATION = "security-correlation"
+TASK_QUEUE_SECURITY_INVENTORY_WRITE = "security-inventory-write"
 
 # Default namespace for the patternfoundry-dev platform
 DEFAULT_NAMESPACE = "patternfoundry-dev"

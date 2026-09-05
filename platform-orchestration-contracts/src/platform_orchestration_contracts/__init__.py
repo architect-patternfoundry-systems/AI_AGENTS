@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -69,6 +69,12 @@ from .temporal_client import (
     TASK_QUEUE_SECURITY_KUBERNETES,
     TASK_QUEUE_SECURITY_DATABASE,
     TASK_QUEUE_SECURITY_OBJECT_STORAGE,
+    TASK_QUEUE_SECURITY_DISCOVERY_KUBERNETES,
+    TASK_QUEUE_SECURITY_DISCOVERY_POSTGRES,
+    TASK_QUEUE_SECURITY_DISCOVERY_MINIO,
+    TASK_QUEUE_SECURITY_DISCOVERY_GIT,
+    TASK_QUEUE_SECURITY_CORRELATION,
+    TASK_QUEUE_SECURITY_INVENTORY_WRITE,
 )
 from .credential_rotation import (
     SecretRef,
@@ -120,6 +126,7 @@ from .credential_inventory import (
     SourceFinding,
     RiskAssessment,
     RotationCapabilities,
+    RotationExecutionGates,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -237,6 +244,12 @@ __all__ = [
     "TASK_QUEUE_SECURITY_KUBERNETES",
     "TASK_QUEUE_SECURITY_DATABASE",
     "TASK_QUEUE_SECURITY_OBJECT_STORAGE",
+    "TASK_QUEUE_SECURITY_DISCOVERY_KUBERNETES",
+    "TASK_QUEUE_SECURITY_DISCOVERY_POSTGRES",
+    "TASK_QUEUE_SECURITY_DISCOVERY_MINIO",
+    "TASK_QUEUE_SECURITY_DISCOVERY_GIT",
+    "TASK_QUEUE_SECURITY_CORRELATION",
+    "TASK_QUEUE_SECURITY_INVENTORY_WRITE",
     # credential_rotation
     "SecretRef",
     "ConsumerSelector",
@@ -286,6 +299,7 @@ __all__ = [
     "SourceFinding",
     "RiskAssessment",
     "RotationCapabilities",
+    "RotationExecutionGates",
     "CredentialSetRecord",
     "DiscoveryFinding",
     "EnrollmentPlan",
