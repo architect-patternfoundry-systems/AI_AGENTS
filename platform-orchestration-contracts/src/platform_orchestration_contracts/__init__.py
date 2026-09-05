@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -127,6 +127,8 @@ from .credential_inventory import (
     RiskAssessment,
     RotationCapabilities,
     RotationExecutionGates,
+    RotationEligibility,
+    evaluate_rotation_eligibility,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -300,6 +302,8 @@ __all__ = [
     "RiskAssessment",
     "RotationCapabilities",
     "RotationExecutionGates",
+    "RotationEligibility",
+    "evaluate_rotation_eligibility",
     "CredentialSetRecord",
     "DiscoveryFinding",
     "EnrollmentPlan",

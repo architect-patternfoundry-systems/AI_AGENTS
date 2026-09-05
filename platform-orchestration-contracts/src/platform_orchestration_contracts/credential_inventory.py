@@ -395,6 +395,96 @@ class RotationExecutionGates:
 
 
 @dataclass(frozen=True)
+class RotationEligibility:
+    """Canonical rotation eligibility decision for a credential set.
+
+    This is the authoritative output of evaluate_rotation_eligibility().
+    It separates provider-capability readiness from workflow execution
+    readiness so that a future controller or workflow cannot accidentally
+    check only one dimension.
+
+    Use this as the single input to:
+    - CredentialEnrollmentWorkflow promotion decisions.
+    - CredentialRotationWorkflow start checks.
+    - CredentialSet.status.
+    - Security dashboard posture reports.
+    - Alerts describing why a credential is blocked.
+    - Approval gates for high/critical credentials.
+    """
+
+    credential_set_id: str
+    risk_tier: str
+    provider_ready: bool
+    execution_ready: bool
+    eligible: bool
+    provider_blockers: tuple[str, ...]
+    execution_blockers: tuple[str, ...]
+    evaluated_at: str  # ISO timestamp
+    policy_version: str
+
+    @property
+    def all_blockers(self) -> tuple[str, ...]:
+        """Combined provider and execution blockers."""
+        return self.provider_blockers + self.execution_blockers
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO 8601 string."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def evaluate_rotation_eligibility(
+    *,
+    credential_set_id: str,
+    risk_tier: str,
+    capabilities: RotationCapabilities,
+    gates: Optional[RotationExecutionGates] = None,
+    policy_version: str = "1",
+) -> RotationEligibility:
+    """Evaluate whether a credential set is eligible for rotation.
+
+    This is the canonical policy-evaluation function. All consumers
+    (enrollment workflow, rotation workflow, CRD status, dashboards)
+    should call this rather than implementing their own readiness check.
+
+    For critical-tier credentials, execution gates are required. For
+    all other tiers, execution gates are not evaluated (execution_ready
+    is True) and the decision depends only on provider capabilities.
+
+    Note: approval_policy_configured=True means the system knows when
+    and how approval is required — it does NOT mean an approval has been
+    granted for a particular rotation. The workflow must separately
+    track the actual approval signal.
+    """
+    provider_ready = capabilities.is_rotation_ready_for_risk(risk_tier)
+    provider_blockers = capabilities.blockers_for_risk(risk_tier)
+
+    if risk_tier == RISK_CRITICAL:
+        if gates is None:
+            execution_ready = False
+            execution_blockers = ("rotation_execution_gates_missing",)
+        else:
+            execution_ready = gates.critical_ready
+            execution_blockers = gates.missing_gates
+    else:
+        execution_ready = True
+        execution_blockers = ()
+
+    return RotationEligibility(
+        credential_set_id=credential_set_id,
+        risk_tier=risk_tier,
+        provider_ready=provider_ready,
+        execution_ready=execution_ready,
+        eligible=provider_ready and execution_ready,
+        provider_blockers=provider_blockers,
+        execution_blockers=execution_blockers,
+        evaluated_at=_utc_now_iso(),
+        policy_version=policy_version,
+    )
+
+
+@dataclass(frozen=True)
 class CredentialSetRecord:
     """Canonical inventory record for a credential set.
 

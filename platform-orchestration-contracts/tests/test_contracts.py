@@ -88,6 +88,8 @@ from platform_orchestration_contracts import (
     RiskAssessment,
     RotationCapabilities,
     RotationExecutionGates,
+    RotationEligibility,
+    evaluate_rotation_eligibility,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -1639,3 +1641,201 @@ def test_high_risk_lacking_owner_confirmation_not_ready():
     assert caps.is_rotation_ready_for_risk(RISK_HIGH) is False
     high_blockers = caps.blockers_for_risk(RISK_HIGH)
     assert "owner_confirmation" in high_blockers
+
+
+# --- RotationEligibility: canonical policy evaluation ---
+
+
+def _full_caps() -> RotationCapabilities:
+    """Capabilities with all provider capabilities present."""
+    return RotationCapabilities(
+        successor_creation=True,
+        overlap_support=True,
+        secret_authority=True,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+        audit_observability=True,
+        owner_confirmation=True,
+        rollback_verification=True,
+    )
+
+
+def _full_gates() -> RotationExecutionGates:
+    """Execution gates with all gates configured."""
+    return RotationExecutionGates(
+        approval_policy_configured=True,
+        canary_cutover_configured=True,
+        immutable_evidence_store=True,
+        emergency_recovery_plan_verified=True,
+    )
+
+
+def test_eligibility_low_tier_eligible():
+    """Low-tier credential with full capabilities is eligible without gates."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-minio-writer",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    assert eligibility.eligible is True
+    assert eligibility.provider_ready is True
+    assert eligibility.execution_ready is True  # not evaluated for low
+    assert eligibility.execution_blockers == ()
+    assert eligibility.provider_blockers == ()
+    assert eligibility.policy_version == "1"
+
+
+def test_eligibility_high_tier_eligible():
+    """High-tier credential with full capabilities is eligible without gates."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-postgres-runtime",
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    assert eligibility.eligible is True
+    assert eligibility.provider_ready is True
+    assert eligibility.execution_ready is True  # not evaluated for high
+    assert eligibility.execution_blockers == ()
+
+
+def test_eligibility_critical_with_gates_eligible():
+    """Critical credential with full caps and full gates is eligible."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-postgres-admin",
+        risk_tier=RISK_CRITICAL,
+        capabilities=_full_caps(),
+        gates=_full_gates(),
+        policy_version="2",
+    )
+    assert eligibility.eligible is True
+    assert eligibility.provider_ready is True
+    assert eligibility.execution_ready is True
+    assert eligibility.execution_blockers == ()
+    assert eligibility.policy_version == "2"
+
+
+def test_eligibility_critical_without_gates_not_eligible():
+    """Critical credential without execution gates is not eligible."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-postgres-admin",
+        risk_tier=RISK_CRITICAL,
+        capabilities=_full_caps(),
+        gates=None,
+        policy_version="1",
+    )
+    assert eligibility.eligible is False
+    assert eligibility.provider_ready is True
+    assert eligibility.execution_ready is False
+    assert "rotation_execution_gates_missing" in eligibility.execution_blockers
+
+
+def test_eligibility_critical_with_partial_gates_not_eligible():
+    """Critical credential with partial gates is not eligible."""
+    gates = RotationExecutionGates(
+        approval_policy_configured=True,
+        canary_cutover_configured=False,
+        immutable_evidence_store=True,
+        emergency_recovery_plan_verified=False,
+    )
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-postgres-admin",
+        risk_tier=RISK_CRITICAL,
+        capabilities=_full_caps(),
+        gates=gates,
+        policy_version="1",
+    )
+    assert eligibility.eligible is False
+    assert eligibility.execution_ready is False
+    assert "canary_cutover_configured" in eligibility.execution_blockers
+    assert "emergency_recovery_plan_verified" in eligibility.execution_blockers
+
+
+def test_eligibility_provider_blocked():
+    """Eligibility reports provider blockers when capabilities missing."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        overlap_support=False,
+        secret_authority=False,
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+    )
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-api-key",
+        risk_tier=RISK_MEDIUM,
+        capabilities=caps,
+        policy_version="1",
+    )
+    assert eligibility.eligible is False
+    assert eligibility.provider_ready is False
+    assert "secret_authority" in eligibility.provider_blockers
+    assert "overlap_support" in eligibility.provider_blockers
+
+
+def test_eligibility_all_blockers_combines():
+    """all_blockers combines provider and execution blockers."""
+    caps = RotationCapabilities(
+        successor_creation=True,
+        secret_authority=False,  # provider blocker
+        delivery=True,
+        consumer_reload=True,
+        positive_probe=True,
+        predecessor_revocation=True,
+    )
+    gates = RotationExecutionGates(
+        approval_policy_configured=False,
+        canary_cutover_configured=True,
+        immutable_evidence_store=True,
+        emergency_recovery_plan_verified=True,
+    )
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-critical",
+        risk_tier=RISK_CRITICAL,
+        capabilities=caps,
+        gates=gates,
+        policy_version="1",
+    )
+    combined = eligibility.all_blockers
+    assert "secret_authority" in combined  # from provider
+    assert "approval_policy_configured" in combined  # from execution
+
+
+def test_eligibility_has_timestamp_and_version():
+    """Eligibility record includes evaluation timestamp and policy version."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-minio",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        policy_version="3",
+    )
+    assert eligibility.evaluated_at  # non-empty ISO string
+    assert eligibility.policy_version == "3"
+
+
+def test_eligibility_low_tier_ignores_gates():
+    """Low-tier eligibility is not affected by execution gates."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="cts-minio-writer",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        gates=None,  # no gates provided
+        policy_version="1",
+    )
+    assert eligibility.eligible is True
+    assert eligibility.execution_ready is True
+    assert eligibility.execution_blockers == ()
+
+
+def test_eligibility_is_rotation_eligibility_type():
+    """evaluate_rotation_eligibility returns RotationEligibility instance."""
+    eligibility = evaluate_rotation_eligibility(
+        credential_set_id="test",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+    )
+    assert isinstance(eligibility, RotationEligibility)
