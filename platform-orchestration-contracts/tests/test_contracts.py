@@ -133,13 +133,19 @@ from platform_orchestration_contracts import (
     RISK_SIGNAL_NO_SECRET_REF,
     EXPOSURE_ACTIVE_IN_SOURCE,
     EXPOSURE_SECRET_DELIVERED,
+    EXPOSURE_SECRET_DELIVERED_SHARED,
     EXPOSURE_MANAGED_VIA_SECRET_REF,
     EXPOSURE_UNKNOWN,
+    EXPOSURE_CERTIFICATE_DELIVERED,
     ACTION_EMERGENCY_ROTATION,
     ACTION_ENROLLMENT_CANDIDATE,
     ACTION_CERTIFICATE_LIFECYCLE,
     to_workload_env_var,
     to_workload_metadata,
+    SecretScrubbingFilter,
+    install_secret_scrubbing_filter,
+    KubernetesPythonDiscoveryClient,
+    DiscoveryError,
     EnrollmentResult,
     SOURCE_KUBERNETES,
     SOURCE_GIT,
@@ -4562,3 +4568,692 @@ def test_exposure_class_secret_delivered_not_managed():
     assert EXPOSURE_SECRET_DELIVERED == "secret_delivered"
     # The deprecated alias should map to the same value
     assert EXPOSURE_MANAGED_VIA_SECRET_REF == EXPOSURE_SECRET_DELIVERED
+
+
+# --- Log scrubber tests ---
+
+
+def test_secret_scrubbing_filter_redacts_password():
+    """Log scrubber redacts password= patterns."""
+    import logging
+    filt = SecretScrubbingFilter()
+    record = logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg="Connecting with password=S3cr3tP@ss to database",
+        args=None, exc_info=None,
+    )
+    filt.filter(record)
+    assert "S3cr3tP@ss" not in record.getMessage()
+    assert "***REDACTED***" in record.getMessage()
+
+
+def test_secret_scrubbing_filter_redacts_postgres_dsn():
+    """Log scrubber redacts postgres:// DSN passwords."""
+    import logging
+    filt = SecretScrubbingFilter()
+    record = logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg="DSN: postgresql://user:supersecret@db.internal:5432/mydb",
+        args=None, exc_info=None,
+    )
+    filt.filter(record)
+    assert "supersecret" not in record.getMessage()
+    assert "***REDACTED***" in record.getMessage()
+
+
+def test_secret_scrubbing_filter_redacts_token():
+    """Log scrubber redacts token= patterns."""
+    import logging
+    filt = SecretScrubbingFilter()
+    # Construct synthetic token to avoid triggering secret scanners
+    synthetic_token = "abc" + "123" + "def" + "456" + "ghi" + "789"
+    record = logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg=f"Auth with token={synthetic_token}",
+        args=None, exc_info=None,
+    )
+    filt.filter(record)
+    assert synthetic_token not in record.getMessage()
+    assert "***REDACTED***" in record.getMessage()
+
+
+def test_secret_scrubbing_filter_redacts_pem_key():
+    """Log scrubber redacts PEM private key blocks."""
+    import logging
+    filt = SecretScrubbingFilter()
+    # Construct PEM block dynamically to avoid triggering secret scanners
+    pem_header = "-" * 5 + "BEGIN RSA PRIVATE KEY" + "-" * 5
+    pem_footer = "-" * 5 + "END RSA PRIVATE KEY" + "-" * 5
+    pem_body = "MII" + "keymaterial" + "here"
+    pem_block = f"{pem_header}\n{pem_body}\n{pem_footer}"
+    record = logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg=f"Found key: {pem_block}",
+        args=None, exc_info=None,
+    )
+    filt.filter(record)
+    assert pem_body not in record.getMessage()
+    assert "REDACTED PEM KEY BLOCK" in record.getMessage()
+
+
+def test_secret_scrubbing_filter_passes_clean_messages():
+    """Log scrubber passes clean messages unchanged."""
+    import logging
+    filt = SecretScrubbingFilter()
+    record = logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg="Listing Deployments in namespace cts",
+        args=None, exc_info=None,
+    )
+    filt.filter(record)
+    assert record.getMessage() == "Listing Deployments in namespace cts"
+
+
+def test_install_secret_scrubbing_filter_idempotent():
+    """Installing the filter twice doesn't create duplicates."""
+    import logging
+    logger = logging.getLogger("test-scrub-idempotent")
+    f1 = install_secret_scrubbing_filter("test-scrub-idempotent")
+    f2 = install_secret_scrubbing_filter("test-scrub-idempotent")
+    assert f1 is f2
+    # Clean up
+    logger.removeFilter(f1)
+
+
+# --- KubernetesPythonDiscoveryClient tests with mocked APIs ---
+
+
+class MockV1SecretKeySelector:
+    def __init__(self, name, key=None):
+        self.name = name
+        self.key = key
+
+
+class MockV1EnvVarSource:
+    def __init__(self, secret_key_ref=None):
+        self.secret_key_ref = secret_key_ref
+
+
+class MockV1EnvVar:
+    def __init__(self, name, value=None, value_from=None):
+        self.name = name
+        self.value = value
+        self.value_from = value_from
+
+
+class MockV1EnvFromSource:
+    def __init__(self, secret_ref=None):
+        self.secret_ref = secret_ref
+
+
+class MockV1SecretEnvSource:
+    def __init__(self, name, optional=False):
+        self.name = name
+        self.optional = optional
+
+
+class MockV1Container:
+    def __init__(self, name, env=None, env_from=None):
+        self.name = name
+        self.env = env or []
+        self.env_from = env_from or []
+
+
+class MockV1PodSpec:
+    def __init__(self, containers=None, init_containers=None, service_account_name=None, volumes=None):
+        self.containers = containers or []
+        self.init_containers = init_containers or []
+        self.service_account_name = service_account_name
+        self.volumes = volumes or []
+
+
+class MockV1PodTemplateSpec:
+    def __init__(self, spec=None):
+        self.spec = spec
+
+
+class MockV1DeploymentSpec:
+    def __init__(self, template=None):
+        self.template = template
+
+
+class MockV1ObjectMeta:
+    def __init__(self, name="unknown", resource_version=None, annotations=None):
+        self.name = name
+        self.resource_version = resource_version
+        self.annotations = annotations
+
+
+class MockV1Volume:
+    def __init__(self, name, secret=None):
+        self.name = name
+        self.secret = secret
+
+
+class MockV1SecretVolumeSource:
+    def __init__(self, secret_name):
+        self.secret_name = secret_name
+
+
+class MockV1Deployment:
+    def __init__(self, name, containers, resource_version=None, annotations=None,
+                 service_account_name=None, volumes=None, init_containers=None):
+        self.metadata = MockV1ObjectMeta(
+            name=name,
+            resource_version=resource_version,
+            annotations=annotations,
+        )
+        self.spec = MockV1DeploymentSpec(
+            template=MockV1PodTemplateSpec(
+                spec=MockV1PodSpec(
+                    containers=containers,
+                    init_containers=init_containers,
+                    service_account_name=service_account_name,
+                    volumes=volumes,
+                )
+            )
+        )
+
+
+class MockV1DeploymentList:
+    def __init__(self, items):
+        self.items = items
+
+
+class MockAppsV1Api:
+    """Mock AppsV1Api for testing."""
+
+    def __init__(self, deployments=None, statefulsets=None, daemonsets=None):
+        self._deployments = deployments or []
+        self._statefulsets = statefulsets or []
+        self._daemonsets = daemonsets or []
+
+    def list_namespaced_deployment(self, namespace):
+        return MockV1DeploymentList(self._deployments)
+
+    def list_namespaced_stateful_set(self, namespace):
+        return MockV1DeploymentList(self._statefulsets)
+
+    def list_namespaced_daemon_set(self, namespace):
+        return MockV1DeploymentList(self._daemonsets)
+
+
+class MockBatchV1Api:
+    """Mock BatchV1Api for testing."""
+
+    def __init__(self, jobs=None, cronjobs=None):
+        self._jobs = jobs or []
+        self._cronjobs = cronjobs or []
+
+    def list_namespaced_job(self, namespace):
+        return MockV1DeploymentList(self._jobs)
+
+    def list_namespaced_cron_job(self, namespace):
+        return MockV1DeploymentList(self._cronjobs)
+
+
+# Synthetic secret values for client tests — must NOT survive conversion
+_CLIENT_TEST_SECRET = "synthetic-client-secret-must-not-survive-XYZ999"
+_CLIENT_TEST_DSN = "postgresql://admin:supersecret@db.internal:5432/cts"
+
+
+def test_kubernetes_python_client_namespace_scoped():
+    """Client rejects requests for namespaces other than its configured scope."""
+    apps_api = MockAppsV1Api()
+    batch_api = MockBatchV1Api()
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=apps_api,
+        batch_api=batch_api,
+        load_config=False,
+    )
+    with pytest.raises(ValueError, match="namespace-scoped"):
+        client.list_workloads("other-ns")
+
+
+def test_kubernetes_python_client_returns_workload_metadata():
+    """Client returns WorkloadMetadata, not raw API objects."""
+    deployment = MockV1Deployment(
+        name="cts-backend",
+        containers=[
+            MockV1Container(
+                name="cts-backend",
+                env=[
+                    MockV1EnvVar(name="POSTGRES_DSN", value=_CLIENT_TEST_DSN),
+                    MockV1EnvVar(name="PORT", value="8001"),
+                ],
+            ),
+        ],
+        resource_version="12345",
+        annotations={"team": "cts-platform"},
+        service_account_name="cts-backend-sa",
+    )
+    apps_api = MockAppsV1Api(deployments=[deployment])
+    batch_api = MockBatchV1Api()
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=apps_api,
+        batch_api=batch_api,
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    assert len(workloads) == 1
+    w = workloads[0]
+    assert isinstance(w, WorkloadMetadata)
+    assert w.kind == "Deployment"
+    assert w.namespace == "cts"
+    assert w.name == "cts-backend"
+    assert w.container_name == "cts-backend"
+    assert w.resource_version == "12345"
+    assert w.service_account == "cts-backend-sa"
+    assert w.owner_annotations.get("team") == "cts-platform"
+
+
+def test_kubernetes_python_client_discards_inline_values():
+    """Client discards inline env var values at the boundary."""
+    deployment = MockV1Deployment(
+        name="cts-backend",
+        containers=[
+            MockV1Container(
+                name="cts-backend",
+                env=[
+                    MockV1EnvVar(name="POSTGRES_DSN", value=_CLIENT_TEST_DSN),
+                    MockV1EnvVar(name="AWS_SECRET_ACCESS_KEY", value=_CLIENT_TEST_SECRET),
+                ],
+            ),
+        ],
+        resource_version="12345",
+    )
+    apps_api = MockAppsV1Api(deployments=[deployment])
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=apps_api,
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    w = workloads[0]
+
+    # Check no secret values in WorkloadMetadata
+    from dataclasses import asdict
+    metadata_json = json.dumps(asdict(w))
+    assert _CLIENT_TEST_DSN not in metadata_json
+    assert _CLIENT_TEST_SECRET not in metadata_json
+    assert "supersecret" not in metadata_json
+    assert "XYZ999" not in metadata_json
+
+    # Check Boolean presence signals
+    pg_env = next(e for e in w.env_vars if e.name == "POSTGRES_DSN")
+    assert pg_env.inline_value_present is True
+    assert pg_env.secret_ref_name is None
+
+
+def test_kubernetes_python_client_extract_secret_key_ref():
+    """Client extracts secretKeyRef references correctly."""
+    deployment = MockV1Deployment(
+        name="cts-backend",
+        containers=[
+            MockV1Container(
+                name="cts-backend",
+                env=[
+                    MockV1EnvVar(
+                        name="DATABASE_URL",
+                        value_from=MockV1EnvVarSource(
+                            secret_key_ref=MockV1SecretKeySelector(name="cts-db-secret", key="uri")
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    )
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(deployments=[deployment]),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    w = workloads[0]
+    db_env = next(e for e in w.env_vars if e.name == "DATABASE_URL")
+    assert db_env.inline_value_present is False
+    assert db_env.secret_ref_name == "cts-db-secret"
+    assert db_env.secret_ref_key == "uri"
+
+
+def test_kubernetes_python_client_extract_env_from():
+    """Client extracts envFrom secret references."""
+    deployment = MockV1Deployment(
+        name="cts-watchdog",
+        containers=[
+            MockV1Container(
+                name="cts-watchdog",
+                env_from=[
+                    MockV1EnvFromSource(
+                        secret_ref=MockV1SecretEnvSource(name="cts-shared-secrets")
+                    ),
+                ],
+            ),
+        ],
+    )
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(deployments=[deployment]),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    w = workloads[0]
+    assert len(w.env_from) == 1
+    assert w.env_from[0].secret_ref_name == "cts-shared-secrets"
+
+
+def test_kubernetes_python_client_extract_volume_secrets():
+    """Client extracts volume-mounted Secret references."""
+    deployment = MockV1Deployment(
+        name="cts-data-processor",
+        containers=[MockV1Container(name="processor")],
+        volumes=[
+            MockV1Volume(
+                name="tls-certs",
+                secret=MockV1SecretVolumeSource(secret_name="cts-tls-secret"),
+            ),
+        ],
+    )
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(deployments=[deployment]),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    w = workloads[0]
+    assert len(w.volume_secrets) == 1
+    assert w.volume_secrets[0].volume_name == "tls-certs"
+    assert w.volume_secrets[0].secret_ref_name == "cts-tls-secret"
+
+
+def test_kubernetes_python_client_api_failure_raises_discovery_error():
+    """API failures raise DiscoveryError with opaque coordinates, no response body."""
+    class FailingAppsApi:
+        def list_namespaced_deployment(self, namespace):
+            raise Exception("Internal Server Error: details with sensitive content")
+
+        def list_namespaced_stateful_set(self, namespace):
+            return MockV1DeploymentList([])
+
+        def list_namespaced_daemon_set(self, namespace):
+            return MockV1DeploymentList([])
+
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=FailingAppsApi(),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    with pytest.raises(DiscoveryError, match="Failed to list Deployments"):
+        client.list_workloads("cts")
+
+
+def test_kubernetes_python_client_api_failure_no_response_body():
+    """DiscoveryError does not contain the raw exception's response body."""
+    class FailingAppsApi:
+        def list_namespaced_deployment(self, namespace):
+            raise Exception("Internal Server Error: sensitive response body with secrets")
+
+        def list_namespaced_stateful_set(self, namespace):
+            return MockV1DeploymentList([])
+
+        def list_namespaced_daemon_set(self, namespace):
+            return MockV1DeploymentList([])
+
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=FailingAppsApi(),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    try:
+        client.list_workloads("cts")
+        assert False, "Should have raised DiscoveryError"
+    except DiscoveryError as e:
+        msg = str(e)
+        assert "cts" in msg
+        assert "Deployment" in msg
+        # The raw exception's response body must NOT be in the error
+        assert "sensitive response body" not in msg
+        assert "secrets" not in msg
+
+
+def test_kubernetes_python_client_no_raw_exception_chaining():
+    """DiscoveryError does not chain the raw exception."""
+    class FailingAppsApi:
+        def list_namespaced_deployment(self, namespace):
+            raise Exception("raw exception with sensitive content")
+
+        def list_namespaced_stateful_set(self, namespace):
+            return MockV1DeploymentList([])
+
+        def list_namespaced_daemon_set(self, namespace):
+            return MockV1DeploymentList([])
+
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=FailingAppsApi(),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    try:
+        client.list_workloads("cts")
+    except DiscoveryError as e:
+        # __cause__ should be None (we used `from None`)
+        assert e.__cause__ is None
+        # __suppress_context__ should be True (set by `from None`)
+        # This means Python won't print the raw exception in tracebacks
+        assert e.__suppress_context__ is True
+
+
+def test_kubernetes_python_client_no_secret_read_method():
+    """Client has no method for reading Secret data."""
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+    # Verify no secret-reading methods exist
+    assert not hasattr(client, "read_namespaced_secret")
+    assert not hasattr(client, "read_secret")
+    assert not hasattr(client, "get_secret")
+    assert not hasattr(client, "list_secrets")
+
+
+def test_kubernetes_python_client_end_to_end_with_adapter():
+    """Full pipeline: mocked API → client → adapter → observations, no secrets survive."""
+    raw_secret = "end-to-end-client-secret-MUST-NOT-SURVIVE"
+
+    deployment = MockV1Deployment(
+        name="cts-backend",
+        containers=[
+            MockV1Container(
+                name="cts-backend",
+                env=[
+                    MockV1EnvVar(name="POSTGRES_DSN", value=raw_secret),
+                    MockV1EnvVar(name="AWS_SECRET_ACCESS_KEY", value=raw_secret),
+                    MockV1EnvVar(name="PORT", value="8001"),
+                    MockV1EnvVar(
+                        name="DATABASE_URL",
+                        value_from=MockV1EnvVarSource(
+                            secret_key_ref=MockV1SecretKeySelector(name="cts-db-secret", key="uri")
+                        ),
+                    ),
+                ],
+                env_from=[
+                    MockV1EnvFromSource(
+                        secret_ref=MockV1SecretEnvSource(name="cts-shared-secrets")
+                    ),
+                ],
+            ),
+        ],
+        resource_version="12345",
+        annotations={"team": "cts-platform", "service": "attunement-weaver"},
+        service_account_name="cts-backend-sa",
+    )
+
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(deployments=[deployment]),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    # Run the adapter with the real client
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+
+    assert len(observations) > 0
+
+    # Verify no secret values in any observation
+    for obs in observations:
+        obs_json = json.dumps(obs.to_dict())
+        assert raw_secret not in obs_json
+        assert "MUST-NOT-SURVIVE" not in obs_json
+
+    # Verify all observations pass safety check
+    assert_observations_safe(observations)
+
+    # Verify inline credentials are flagged
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.inline_value_present is True
+    assert pg_obs.exposure_class == EXPOSURE_ACTIVE_IN_SOURCE
+    assert pg_obs.default_action == ACTION_EMERGENCY_ROTATION
+
+    # Verify secretKeyRef credentials are classified correctly
+    db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
+    assert db_url_obs.inline_value_present is False
+    assert db_url_obs.exposure_class == EXPOSURE_SECRET_DELIVERED
+    assert db_url_obs.default_action == ACTION_ENROLLMENT_CANDIDATE
+
+    # Verify envFrom gets shared exposure class
+    envfrom_obs = [o for o in observations if "envfrom" in o.observation_id]
+    assert len(envfrom_obs) == 1
+    assert envfrom_obs[0].exposure_class == EXPOSURE_SECRET_DELIVERED_SHARED
+
+
+def test_kubernetes_python_client_multiple_workload_types():
+    """Client lists Deployments, StatefulSets, DaemonSets, Jobs, CronJobs."""
+    deployment = MockV1Deployment(name="cts-backend", containers=[MockV1Container(name="app")])
+    statefulset = MockV1Deployment(name="cts-data", containers=[MockV1Container(name="data")])
+    daemonset = MockV1Deployment(name="cts-agent", containers=[MockV1Container(name="agent")])
+
+    apps_api = MockAppsV1Api(
+        deployments=[deployment],
+        statefulsets=[statefulset],
+        daemonsets=[daemonset],
+    )
+    batch_api = MockBatchV1Api(jobs=[deployment], cronjobs=[statefulset])
+
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=apps_api,
+        batch_api=batch_api,
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    # 3 from apps (deploy, sts, ds) + 2 from batch (job, cron) = 5
+    assert len(workloads) == 5
+    kinds = {w.kind for w in workloads}
+    assert "Deployment" in kinds
+    assert "StatefulSet" in kinds
+    assert "DaemonSet" in kinds
+    assert "Job" in kinds
+    assert "CronJob" in kinds
+
+
+def test_kubernetes_python_client_empty_namespace():
+    """Client returns empty tuple for namespace with no workloads."""
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+    workloads = client.list_workloads("cts")
+    assert len(workloads) == 0
+
+
+def test_kubernetes_python_client_init_containers():
+    """Client processes init containers in addition to main containers."""
+    deployment = MockV1Deployment(
+        name="cts-backend",
+        containers=[
+            MockV1Container(name="main", env=[MockV1EnvVar(name="PORT", value="8001")]),
+        ],
+        init_containers=[
+            MockV1Container(
+                name="init-db",
+                env=[
+                    MockV1EnvVar(name="POSTGRES_DSN", value=_CLIENT_TEST_DSN),
+                ],
+            ),
+        ],
+    )
+    client = KubernetesPythonDiscoveryClient(
+        namespace="cts",
+        apps_api=MockAppsV1Api(deployments=[deployment]),
+        batch_api=MockBatchV1Api(),
+        load_config=False,
+    )
+
+    workloads = client.list_workloads("cts")
+    w = workloads[0]
+    # Should have env vars from both main and init containers
+    env_names = {e.name for e in w.env_vars}
+    assert "PORT" in env_names
+    assert "POSTGRES_DSN" in env_names
+
+    # Init container's inline value must be discarded
+    from dataclasses import asdict
+    metadata_json = json.dumps(asdict(w))
+    assert _CLIENT_TEST_DSN not in metadata_json
+    assert "supersecret" not in metadata_json
+
+
+# --- Exposure class refinement tests ---
+
+
+def test_envfrom_gets_shared_exposure_class():
+    """envFrom secret references get EXPOSURE_SECRET_DELIVERED_SHARED."""
+    client = SyntheticK8sClient((_make_cts_watchdog_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    envfrom_obs = [o for o in observations if "envfrom" in o.observation_id]
+    assert len(envfrom_obs) == 1
+    assert envfrom_obs[0].exposure_class == EXPOSURE_SECRET_DELIVERED_SHARED
+
+
+def test_volume_secret_gets_certificate_exposure_class():
+    """Volume-mounted secrets get EXPOSURE_CERTIFICATE_DELIVERED."""
+    client = SyntheticK8sClient((_make_cts_with_volume_secret(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    vol_obs = [o for o in observations if "volume" in o.observation_id]
+    assert len(vol_obs) == 1
+    assert vol_obs[0].exposure_class == EXPOSURE_CERTIFICATE_DELIVERED

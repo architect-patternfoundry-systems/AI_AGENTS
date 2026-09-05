@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -238,8 +238,10 @@ from .kubernetes_discovery_adapter import (
     RISK_SIGNAL_NO_SECRET_REF,
     EXPOSURE_ACTIVE_IN_SOURCE,
     EXPOSURE_SECRET_DELIVERED,
+    EXPOSURE_SECRET_DELIVERED_SHARED,
     EXPOSURE_MANAGED_VIA_SECRET_REF,
     EXPOSURE_EXTERNAL_SECRET_DELIVERED,
+    EXPOSURE_CERTIFICATE_DELIVERED,
     EXPOSURE_UNKNOWN,
     ACTION_EMERGENCY_ROTATION,
     ACTION_ENROLLMENT_CANDIDATE,
@@ -247,6 +249,10 @@ from .kubernetes_discovery_adapter import (
     ACTION_CERTIFICATE_LIFECYCLE,
     to_workload_env_var,
     to_workload_metadata,
+    SecretScrubbingFilter,
+    install_secret_scrubbing_filter,
+    KubernetesPythonDiscoveryClient,
+    DiscoveryError,
 )
 
 __all__ = [
@@ -466,8 +472,10 @@ __all__ = [
     "MalformedWorkloadError",
     "EXPOSURE_ACTIVE_IN_SOURCE",
     "EXPOSURE_SECRET_DELIVERED",
+    "EXPOSURE_SECRET_DELIVERED_SHARED",
     "EXPOSURE_MANAGED_VIA_SECRET_REF",
     "EXPOSURE_EXTERNAL_SECRET_DELIVERED",
+    "EXPOSURE_CERTIFICATE_DELIVERED",
     "EXPOSURE_UNKNOWN",
     "ACTION_EMERGENCY_ROTATION",
     "ACTION_ENROLLMENT_CANDIDATE",
@@ -475,4 +483,8 @@ __all__ = [
     "ACTION_CERTIFICATE_LIFECYCLE",
     "to_workload_env_var",
     "to_workload_metadata",
+    "SecretScrubbingFilter",
+    "install_secret_scrubbing_filter",
+    "KubernetesPythonDiscoveryClient",
+    "DiscoveryError",
 ]
