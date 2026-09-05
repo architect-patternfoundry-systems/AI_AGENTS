@@ -588,21 +588,351 @@ Once each app has stable workflows, compose through:
 
 ---
 
-## 13. Compliance
+## 13. Two-Axis Status Model
+
+### 13.1 Separation of concerns
+
+Temporal owns orchestration state; apps own domain state. Make this explicit with a two-axis model:
+
+| Concern | Authoritative source | Example |
+|---|---|---|
+| Orchestration state | Temporal | waiting for approval, retrying activity, workflow canceled |
+| Domain state | Application database | corpus batch record, transcript record, catalog asset |
+| Artifact state | Object storage + manifest/catalog | object checksum, content type, object version, playback readiness |
+| UI state | App-owned projection | submitted, running, completed with warnings |
+
+Do not allow a local app status update to silently imply a workflow transition, or vice versa.
+
+### 13.2 Projection reconciliation rules
+
+Every app projection must store:
+- `workflow_id`
+- `run_id`
+- `projection_version`
+- `last_temporal_event_id` (or equivalent cursor)
+- `projected_at`
+
+A projection is derived from Temporal but may be lagged. If app and workflow state disagree, expose "reconciling" rather than guessing. Terminal workflow results are written to the app's domain model through an idempotent activity or result-consumer path.
+
+---
+
+## 14. Command Semantics
+
+### 14.1 workflow_id vs idempotency_key
+
+```
+workflow_id identifies one business process.
+idempotency_key identifies one start command for that process.
+```
+
+For most cases they can be identical, but not always:
+
+- `casting:corpus-batch:batch_01JABC` is the workflow identity.
+- `start:casting:corpus-batch:batch_01JABC:v1` is the initial command identity.
+- A **force regenerate** creates a new immutable generation/batch identity, not the old workflow ID.
+- A manual retry is a signal or a new attempt according to an explicit workflow-level policy — not an arbitrary second start request.
+
+### 14.2 Start policy for existing workflow IDs
+
+| Existing workflow state | Start behavior |
+|---|---|
+| Running / awaiting approval | Return existing handle; do not start another run |
+| Completed successfully | Reject unless caller explicitly requests a new generation/version |
+| Failed and retryable | Signal retry, continue-as-new, or create documented attempt workflow |
+| Failed permanently | Require an explicit operator/user decision and a new generation identifier |
+| Unknown / Temporal unavailable | Persist an outbox command and return `submitted_pending_dispatch` |
+
+The last row is critical: a normal API request must not lose a workflow start because Temporal is temporarily unavailable.
+
+---
+
+## 15. Transactional Client Adapter (Outbox Pattern)
+
+The `OrchestrationClient` abstraction requires an **outbox pattern**. Without it, two failure modes occur:
+
+```
+1. App commits corpus_batch = submitted
+   → Temporal start fails
+   → UI says submitted, but no workflow exists
+
+2. Temporal workflow starts
+   → local DB transaction fails
+   → workflow runs without a visible app record
+```
+
+### 15.1 Required pattern
+
+For user-facing starts:
+
+1. Write the domain record and `workflow_start_command` outbox row in **one local DB transaction**.
+2. A dispatcher starts Temporal using the deterministic workflow ID.
+3. Persist Temporal workflow/run identifiers and start outcome idempotently.
+4. UI shows `submitted_pending_dispatch` until the handoff is confirmed.
+
+This is a **required reference pattern**, not an optional implementation detail.
+
+### 15.2 Outbox command lifecycle
+
+```
+pending → dispatched → confirmed
+                    └→ failed (needs operator attention)
+```
+
+The outbox table stores: `command_id`, `workflow_id`, `workflow_type`, `task_queue`, `envelope_json`, `status`, `created_at`, `dispatched_at`, `confirmed_at`, `temporal_run_id`, `failure_reason`, `dispatch_attempts`.
+
+---
+
+## 16. Contract Evolution
+
+### 16.1 Versioning rules
+
+- `workflow_type` is versioned, e.g. `media.corpus-batch.v1`.
+- Envelope schema version is independently versioned, e.g. `contract_version: "1.0"`.
+- New optional fields are backward compatible.
+- Removed, renamed, or semantic changes require a new major workflow type or explicit adapter.
+- Workflows must retain the code/data conversion ability to replay old versions.
+- Results and manifests must be immutable and versioned.
+
+This matters especially for Temporal because workflow code must remain deterministic during replay. Versioning is not just an API concern; it is a workflow-history safety concern.
+
+### 16.2 Compatibility matrix
+
+| Change | Compatible? | Action |
+|---|---|---|
+| Add optional field to envelope | Yes | Increment contract patch version |
+| Add new workflow type | Yes | New version suffix |
+| Remove field from envelope | No | New major contract version + adapter |
+| Change field semantics | No | New major contract version + adapter |
+| Change activity signature | No | New activity name or versioned input |
+| Change retry policy | Yes (new runs) | Old runs replay with old policy |
+
+---
+
+## 17. Error Taxonomy
+
+### 17.1 Standard error codes
+
+```
+VALIDATION_FAILED
+AUTHORIZATION_DENIED
+APPROVAL_REJECTED
+APPROVAL_EXPIRED
+RESOURCE_UNAVAILABLE
+LEASE_NOT_ADMITTED
+DEPENDENCY_UNAVAILABLE
+RETRY_EXHAUSTED
+ARTIFACT_VALIDATION_FAILED
+ARTIFACT_PUBLICATION_FAILED
+CATALOG_REGISTRATION_FAILED
+CANCELLED
+COMPENSATION_FAILED
+INTERNAL_ERROR
+```
+
+### 17.2 Error envelope
+
+Every error that travels across an app/activity boundary must include:
+
+```json
+{
+  "code": "RESOURCE_UNAVAILABLE",
+  "retryable": true,
+  "retry_after_seconds": 60,
+  "source": "gpu-nanny",
+  "message": "TTS GPU capacity unavailable",
+  "details_ref": "s3://.../failure-details.json",
+  "correlation_id": "corr_01J..."
+}
+```
+
+This gives every UI, workflow, and operator dashboard the same vocabulary. The `retryable` field drives workflow retry decisions; `source` enables blame attribution; `details_ref` keeps heavyweight diagnostic data out of workflow history.
+
+### 17.3 Default retryability
+
+| Code | Retryable |
+|---|---|
+| VALIDATION_FAILED | No |
+| AUTHORIZATION_DENIED | No |
+| APPROVAL_REJECTED | No |
+| APPROVAL_EXPIRED | No |
+| RESOURCE_UNAVAILABLE | Yes |
+| LEASE_NOT_ADMITTED | Yes |
+| DEPENDENCY_UNAVAILABLE | Yes |
+| RETRY_EXHAUSTED | No |
+| ARTIFACT_VALIDATION_FAILED | Yes |
+| ARTIFACT_PUBLICATION_FAILED | Yes |
+| CATALOG_REGISTRATION_FAILED | Yes |
+| CANCELLED | No |
+| COMPENSATION_FAILED | No |
+| INTERNAL_ERROR | Yes |
+
+Activities and workflows may override retryability based on context, but this is the baseline expectation.
+
+---
+
+## 18. Retry Authority — Single-Owner Rule
+
+### 18.1 The dual-scheduler problem
+
+CTS has a robust database-backed queue state machine with `retry_count`, `next_attempt_at`, atomic claiming, lease release, and worker ownership protections. If Temporal is introduced without a clear authority boundary, two schedulers will apply retries:
+
+```
+CTS database queue retries
+        +
+Temporal activity/workflow retry policy
+        =
+duplicate lease requests, duplicate backoff, conflicting terminal status
+```
+
+### 18.2 Authority by mode
+
+| Mode | Retry authority | CTS DB role |
+|---|---|---|
+| Legacy CTS queue | CTS database worker | Full scheduler and status projection |
+| Temporal pilot | Temporal workflow | Projection + domain records only |
+| Dual-running migration | Exactly one system per job, selected by immutable routing field | Non-owner must not dispatch |
+| Cross-app workflow | Parent Temporal workflow | Apps provide idempotent activities and local projections |
+
+The current `source_type != 'cts_temporal_pilot'` exclusion is the right direction. This single-owner rule is a **hard requirement**: the non-owner must never dispatch or retry a job it does not own.
+
+### 18.3 Migration safety
+
+During dual-running, each job carries an immutable routing field (`source_type`) that determines which system owns it. The CTS database worker must exclude Temporal pilot jobs from its dispatch loop. Temporal workflows must not touch legacy queue jobs. Terminal status is written by the owner only.
+
+---
+
+## 19. Governance Additions
+
+### 19.1 Approval expiry
+
+If a workflow waits longer than a defined duration, expire to `approval_expired` rather than waiting indefinitely. The expiry duration is set by the approval policy and carried in the governance block.
+
+### 19.2 Input binding
+
+Approval must bind to an immutable request-manifest checksum, workflow ID, policy name, and estimated scope. A later edit to locales, engine, voice, `force_regenerate`, or public-publish settings must invalidate approval and require a new signal.
+
+Approval signal payload:
+
+```json
+{
+  "workflow_id": "casting:corpus-batch:batch_01JABC",
+  "manifest_sha256": "…",
+  "approval_policy": "publish-public-audio",
+  "approved_by": "user_…",
+  "approved_at": "…",
+  "expires_at": "…"
+}
+```
+
+If `manifest_sha256` does not match the workflow's input manifest, the signal is rejected. If `expires_at` has passed, the workflow transitions to `approval_expired`.
+
+---
+
+## 20. Batch Completion Manifest
+
+### 20.1 Immutable completion manifest
+
+In addition to per-file `AudioArtifactManifest v1`, require a batch-level completion manifest:
+
+```json
+{
+  "manifest_version": "audio-artifact-manifest.v1",
+  "batch_id": "batch_01JABC",
+  "workflow_id": "casting:corpus-batch:batch_01JABC",
+  "workflow_run_id": "…",
+  "status": "completed_with_warnings",
+  "generated_at": "2026-09-05T20:00:00Z",
+  "artifacts": [
+    {
+      "artifact_id": "audio_01J...",
+      "locale": "en",
+      "voice_id": "voice_...",
+      "matrix_node": "mul-mantra",
+      "object_uri": "s3://media-artifacts/…/normalized.wav",
+      "sha256": "…",
+      "media_type": "audio/wav",
+      "sample_rate_hz": 24000,
+      "duration_ms": 12345,
+      "nexus_asset_id": "nexus_...",
+      "playback_ref": {
+        "catalog_id": "…",
+        "path": "/api/playback/assets/nexus_..."
+      }
+    }
+  ]
+}
+```
+
+### 20.2 Playback reference security
+
+`playback_ref` must be a stable catalog/API reference. Resolve that to a short-lived signed S3 URL only when a player is authorized to play it. This enables access control, revocation, cache policy, and storage migration without changing the manifest.
+
+---
+
+## 21. Acceptance Criteria
+
+Before calling ADR-036 "implemented," these cross-app acceptance criteria must be met:
+
+1. Casting Signal starts `CorpusBatchWorkflow v1` through `OrchestrationClient`; duplicate UI clicks produce one workflow.
+2. The workflow runs under the agreed workflow ID and task queues.
+3. Generated WAVs are written to immutable S3 keys and represented in `AudioArtifactManifest v1`.
+4. Nexus registers the manifest and exposes a stable catalog reference.
+5. The player receives an authorized, short-lived playback URL through the catalog API.
+6. Casting Signal projects state without parsing Temporal history in the browser.
+7. A forced worker restart during generation resumes without duplicate catalog publication.
+8. An approval waits durably, expires correctly, and binds to the input manifest checksum.
+9. An activity failure uses the standard error envelope and compensation/release behavior.
+10. Correlation ID joins the Casting Signal request, Temporal workflow, GPU lease, object manifest, Nexus entry, and player-access log.
+
+---
+
+## 22. Next Incremental PR
+
+The next PR should **not** be a full CTS refactor. It should establish the end-to-end vertical slice for Casting Signal:
+
+```
+Casting Signal
+  → create batch record + outbox command
+  → start a stubbed CorpusBatchWorkflow v1
+  → write a manifest to S3-compatible test storage
+  → write a local status projection
+  → return workflow status to the UI
+```
+
+Initially mock or stub AllTalk, GPU Nanny, and Nexus. Prove identity, idempotency, status projection, artifact contract, approval signals, and failure handling first. Then replace one adapter at a time with real TTS, storage, Nexus, and GPU implementations.
+
+This path gives a real common standard while preserving current CTS hardening work and avoiding a platform-wide rewrite.
+
+---
+
+## 23. Security Note
+
+A live database credential was present in shell commands in the supplied transcript. Treat it as exposed:
+- Rotate that password.
+- Remove it from command history and log artifacts where feasible.
+- Move the DSN into a Kubernetes Secret or external secret manager rather than embedding it in commands.
+
+---
+
+## 24. Compliance
 
 All applications performing durable, multi-step, cross-boundary work must:
 1. Implement the standard workflow input/result envelope.
 2. Use the workflow ID convention (`<domain>:<operation>:<business-id>`).
 3. Route activities through the appropriate task queue.
 4. Store artifacts in S3 with the standard manifest schema.
-5. Project workflow status into the local app database for UI consumption.
+5. Project workflow status into the local app database for UI consumption, storing `workflow_id`, `run_id`, `projection_version`, `last_temporal_event_id`, and `projected_at`.
 6. Carry correlation IDs in all logs and metrics.
+7. Use the outbox pattern for user-facing workflow starts.
+8. Use the standard error taxonomy for all cross-boundary failures.
+9. Enforce the single-owner retry authority rule during migration.
+10. Bind approvals to immutable manifest checksums with expiry.
 
 Applications may continue to use local background workers for short, single-service tasks that do not cross system boundaries and do not require durable state.
 
 ---
 
-## 14. References
+## 25. References
 
 - [Temporal Task Queues](https://docs.temporal.io/task-queue)
 - [Temporal Namespace Management](https://docs.temporal.io/best-practices/managing-namespace)

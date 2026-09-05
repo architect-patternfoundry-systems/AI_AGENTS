@@ -15,12 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
-try:
-    from .workflow_envelope import WorkflowEnvelope
-    from .workflow_result import WorkflowResult
-except ImportError:  # pragma: no cover
-    from workflow_envelope import WorkflowEnvelope
-    from workflow_result import WorkflowResult
+from .workflow_envelope import WorkflowEnvelope
+from .workflow_result import WorkflowResult
 
 
 # Standard task queues (ADR-036 section 4)

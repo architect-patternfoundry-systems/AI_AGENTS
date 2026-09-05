@@ -1,31 +1,35 @@
 """Tests for platform-orchestration-contracts."""
 
+import json
 import pytest
 
-from workflow_envelope import (
+from platform_orchestration_contracts import (
     WorkflowEnvelope,
     RequestedBy,
     GovernanceBlock,
     InputRef,
-)
-from workflow_result import (
     WorkflowResult,
     Summary,
     ArtifactRef,
     CatalogRef,
     Warning,
-)
-from workflow_ids import (
     build_workflow_id,
     build_child_workflow_id,
     parse_workflow_id,
-)
-from artifact_manifest import (
     ArtifactManifest,
     AudioFile,
     ProvenanceBlock,
-)
-from temporal_client import (
+    WorkflowError,
+    ERROR_CODES,
+    validation_failed,
+    resource_unavailable,
+    dependency_unavailable,
+    retry_exhausted,
+    internal_error,
+    WorkflowStartCommand,
+    OutboxCommandStatus,
+    StartResult,
+    START_POLICY_TABLE,
     StubOrchestrationClient,
     TASK_QUEUE_CASTING_WORKFLOWS,
 )
@@ -178,6 +182,134 @@ def test_manifest_to_dict():
     assert d["provenance"]["engine"] == "alltalk_tts"
     assert len(d["files"]) == 1
     assert d["files"][0]["locale"] == "en"
+
+
+# --- ErrorTaxonomy ---
+
+
+def test_error_valid_code():
+    err = WorkflowError(
+        code="RESOURCE_UNAVAILABLE",
+        source="gpu-nanny",
+        message="TTS GPU capacity unavailable",
+    )
+    assert err.code == "RESOURCE_UNAVAILABLE"
+    # RESOURCE_UNAVAILABLE is retryable by default
+    assert err.retryable is True
+
+
+def test_error_invalid_code():
+    with pytest.raises(ValueError, match="Unknown error code"):
+        WorkflowError(code="BOGUS", source="x", message="y")
+
+
+def test_error_non_retryable_default():
+    err = WorkflowError(
+        code="VALIDATION_FAILED",
+        source="casting-signal",
+        message="Invalid locale",
+    )
+    assert err.retryable is False
+
+
+def test_error_roundtrip():
+    err = WorkflowError(
+        code="DEPENDENCY_UNAVAILABLE",
+        source="alltalk-tts",
+        message="Connection refused",
+        retry_after_seconds=30,
+        correlation_id="corr_1",
+    )
+    d = err.to_dict()
+    assert d["retry_after_seconds"] == 30
+    restored = WorkflowError.from_dict(d)
+    assert restored.code == "DEPENDENCY_UNAVAILABLE"
+    assert restored.retryable is True
+
+
+def test_error_convenience_constructors():
+    assert validation_failed("app", "msg").code == "VALIDATION_FAILED"
+    assert resource_unavailable("gpu", "msg").retryable is True
+    assert dependency_unavailable("svc", "msg").retry_after_seconds == 30
+    assert retry_exhausted("worker", "msg").retryable is False
+    assert internal_error("app", "msg").retryable is True
+
+
+def test_all_error_codes_have_default_retryability():
+    """Every code in ERROR_CODES must have a default retryability entry."""
+    for code in ERROR_CODES:
+        assert code in _DEFAULT_RETRYABLE_CHECK, f"Missing default for {code}"
+
+
+_DEFAULT_RETRYABLE_CHECK = {
+    "VALIDATION_FAILED": False,
+    "AUTHORIZATION_DENIED": False,
+    "APPROVAL_REJECTED": False,
+    "APPROVAL_EXPIRED": False,
+    "RESOURCE_UNAVAILABLE": True,
+    "LEASE_NOT_ADMITTED": True,
+    "DEPENDENCY_UNAVAILABLE": True,
+    "RETRY_EXHAUSTED": False,
+    "ARTIFACT_VALIDATION_FAILED": True,
+    "ARTIFACT_PUBLICATION_FAILED": True,
+    "CATALOG_REGISTRATION_FAILED": True,
+    "CANCELLED": False,
+    "COMPENSATION_FAILED": False,
+    "INTERNAL_ERROR": True,
+}
+
+
+# --- Outbox ---
+
+
+def test_outbox_command_defaults():
+    cmd = WorkflowStartCommand(
+        command_id="cmd_01JTEST",
+        workflow_id="casting:corpus-batch:batch_01JTEST",
+        workflow_type="media.corpus-batch.v1",
+        task_queue="casting-workflows",
+        envelope_json="{}",
+    )
+    assert cmd.status == OutboxCommandStatus.PENDING
+    assert cmd.dispatch_attempts == 0
+    assert cmd.temporal_run_id is None
+
+
+def test_outbox_command_roundtrip():
+    cmd = WorkflowStartCommand(
+        command_id="cmd_01JTEST",
+        workflow_id="casting:corpus-batch:batch_01JTEST",
+        workflow_type="media.corpus-batch.v1",
+        task_queue="casting-workflows",
+        envelope_json='{"request_id": "req_1"}',
+        status=OutboxCommandStatus.CONFIRMED,
+        temporal_run_id="run_1",
+    )
+    d = cmd.to_dict()
+    assert d["status"] == "confirmed"
+    assert d["temporal_run_id"] == "run_1"
+
+
+def test_start_policy_table_covers_all_states():
+    expected = {
+        "running",
+        "awaiting_approval",
+        "completed",
+        "failed_retryable",
+        "failed_permanent",
+        "unknown",
+    }
+    assert set(START_POLICY_TABLE.keys()) == expected
+
+
+def test_start_result():
+    r = StartResult(
+        status="started",
+        workflow_id="casting:corpus-batch:batch_1",
+        run_id="run_1",
+    )
+    assert r.status == "started"
+    assert r.run_id == "run_1"
 
 
 # --- StubOrchestrationClient ---

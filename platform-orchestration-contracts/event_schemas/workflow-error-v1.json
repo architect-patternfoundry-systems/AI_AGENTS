@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://patternfoundry.dev/schemas/workflow-error-v1.json",
+  "title": "Workflow Error Envelope v1",
+  "description": "Standard error that travels across app/activity boundaries (ADR-036).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "source", "message"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "VALIDATION_FAILED",
+        "AUTHORIZATION_DENIED",
+        "APPROVAL_REJECTED",
+        "APPROVAL_EXPIRED",
+        "RESOURCE_UNAVAILABLE",
+        "LEASE_NOT_ADMITTED",
+        "DEPENDENCY_UNAVAILABLE",
+        "RETRY_EXHAUSTED",
+        "ARTIFACT_VALIDATION_FAILED",
+        "ARTIFACT_PUBLICATION_FAILED",
+        "CATALOG_REGISTRATION_FAILED",
+        "CANCELLED",
+        "COMPENSATION_FAILED",
+        "INTERNAL_ERROR"
+      ]
+    },
+    "retryable": { "type": "boolean", "default": false },
+    "retry_after_seconds": { "type": ["integer", "null"], "minimum": 0 },
+    "source": { "type": "string", "minLength": 1 },
+    "message": { "type": "string", "minLength": 1 },
+    "details_ref": { "type": ["string", "null"] },
+    "correlation_id": { "type": ["string", "null"] }
+  }
+}
