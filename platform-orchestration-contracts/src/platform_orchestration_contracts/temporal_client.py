@@ -26,6 +26,13 @@ TASK_QUEUE_CASTING_WORKFLOWS = "casting-workflows"
 TASK_QUEUE_TTS_GPU = "tts-gpu"
 TASK_QUEUE_NEXUS_PUBLICATION = "nexus-publication"
 TASK_QUEUE_MEDIA_IO = "media-io"
+# Security task queues (ADR-037) — more privileged than media orchestration;
+# must not run in the same worker process as CTS/TTS jobs.
+TASK_QUEUE_SECURITY_WORKFLOWS = "security-workflows"
+TASK_QUEUE_SECURITY_SECRET_PROVIDER = "security-secret-provider"
+TASK_QUEUE_SECURITY_KUBERNETES = "security-kubernetes"
+TASK_QUEUE_SECURITY_DATABASE = "security-database"
+TASK_QUEUE_SECURITY_OBJECT_STORAGE = "security-object-storage"
 
 # Default namespace for the patternfoundry-dev platform
 DEFAULT_NAMESPACE = "patternfoundry-dev"

@@ -35,6 +35,31 @@ from platform_orchestration_contracts import (
     OUTBOX_STATUS_CONFIRMED,
     StubOrchestrationClient,
     TASK_QUEUE_CASTING_WORKFLOWS,
+    TASK_QUEUE_CTS_WORKFLOWS,
+    TASK_QUEUE_MEDIA_GPU,
+    TASK_QUEUE_TTS_GPU,
+    TASK_QUEUE_NEXUS_PUBLICATION,
+    TASK_QUEUE_MEDIA_IO,
+    TASK_QUEUE_SECURITY_WORKFLOWS,
+    TASK_QUEUE_SECURITY_SECRET_PROVIDER,
+    TASK_QUEUE_SECURITY_KUBERNETES,
+    TASK_QUEUE_SECURITY_DATABASE,
+    TASK_QUEUE_SECURITY_OBJECT_STORAGE,
+    # credential rotation
+    SecretRef,
+    ConsumerSelector,
+    RotationInput,
+    RotationResult,
+    RotationVerification,
+    RotationPolicy,
+    RotationLock,
+    CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+    CREDENTIAL_CLASS_OBJECT_STORAGE_KEY,
+    STRATEGY_DUAL_LOGIN_ROLE,
+    STRATEGY_KEY_VERSION_ROTATION,
+    TRIGGER_SCHEDULED,
+    TRIGGER_EXPOSURE,
+    ROTATION_STEPS,
 )
 
 
@@ -420,3 +445,205 @@ async def test_stub_client_signal():
     await client.signal("cts:ingest:job_1", "approve", {"approved_by": "user_1"})
     status = await client.status("cts:ingest:job_1")
     assert status.workflow_id == "cts:ingest:job_1"
+
+
+# --- Credential Rotation (ADR-037) ---
+
+
+def test_rotation_input_roundtrip():
+    """RotationInput roundtrips through dict without exposing credential values."""
+    inp = RotationInput(
+        credential_set_id="cts-postgres-runtime",
+        credential_class=CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+        secret_ref=SecretRef(
+            provider="vault",
+            path="platform/cts/postgres/runtime",
+            current_version="v17",
+        ),
+        rotation_policy_id="service-db-standard-v1",
+        consumer_selector=ConsumerSelector(
+            namespace="cts",
+            workloads=("cts-backend", "cts-watchdog"),
+        ),
+        strategy=STRATEGY_DUAL_LOGIN_ROLE,
+        trigger=TRIGGER_SCHEDULED,
+        correlation_id="corr_01JTEST",
+    )
+    d = inp.to_dict()
+    # No credential values in serialized form
+    assert "password" not in str(d).lower()
+    assert "secret_key" not in str(d).lower()
+    assert d["credential_set_id"] == "cts-postgres-runtime"
+    assert d["secret_ref"]["provider"] == "vault"
+    assert d["secret_ref"]["current_version"] == "v17"
+    assert d["consumer_selector"]["workloads"] == ["cts-backend", "cts-watchdog"]
+    assert d["contract_version"] == "1.0"
+
+    restored = RotationInput.from_dict(d)
+    assert restored.credential_set_id == inp.credential_set_id
+    assert restored.secret_ref.provider == "vault"
+    assert restored.secret_ref.current_version == "v17"
+    assert restored.consumer_selector.workloads == ("cts-backend", "cts-watchdog")
+    assert restored.strategy == STRATEGY_DUAL_LOGIN_ROLE
+
+
+def test_rotation_input_no_secret_values_in_serialization():
+    """Ensure no credential values leak through to_dict serialization."""
+    inp = RotationInput(
+        credential_set_id="cts-minio-writer",
+        credential_class=CREDENTIAL_CLASS_OBJECT_STORAGE_KEY,
+        secret_ref=SecretRef(
+            provider="external-secrets",
+            path="platform/cts/minio/writer",
+            current_version="v3",
+        ),
+        rotation_policy_id="minio-scoped-v1",
+        consumer_selector=ConsumerSelector(namespace="cts", workloads=("cts-backend",)),
+        strategy=STRATEGY_KEY_VERSION_ROTATION,
+        trigger=TRIGGER_EXPOSURE,
+    )
+    serialized = str(inp.to_dict())
+    # The serialized form should not contain common secret value patterns
+    for forbidden in ("password=", "secret_key=", "access_key=", "aws_secret"):
+        assert forbidden not in serialized.lower()
+
+
+def test_rotation_result_completed():
+    """A completed rotation result references versions, not values."""
+    result = RotationResult(
+        credential_set_id="cts-postgres-runtime",
+        status="completed",
+        previous_version="v17",
+        active_version="v18",
+        previous_identity="cts_runtime_a",
+        active_identity="cts_runtime_b",
+        verification=RotationVerification(
+            workload_ready=True,
+            database_connectivity=True,
+            read_write_probe=True,
+            old_credential_revoked=True,
+        ),
+        correlation_id="corr_01JTEST",
+    )
+    d = result.to_dict()
+    assert d["status"] == "completed"
+    assert d["previous_version"] == "v17"
+    assert d["active_version"] == "v18"
+    assert d["previous_identity"] == "cts_runtime_a"
+    assert d["active_identity"] == "cts_runtime_b"
+    assert d["verification"]["workload_ready"] is True
+    assert d["verification"]["old_credential_revoked"] is True
+    # No credential values
+    assert "password" not in str(d).lower()
+
+
+def test_rotation_verification_all_passed():
+    """all_passed returns True when all run checks pass."""
+    v = RotationVerification(
+        workload_ready=True,
+        database_connectivity=True,
+        read_write_probe=True,
+        old_credential_revoked=True,
+    )
+    assert v.all_passed is True
+
+
+def test_rotation_verification_partial_failure():
+    """all_passed returns False when a run check fails."""
+    v = RotationVerification(
+        workload_ready=True,
+        database_connectivity=True,
+        read_write_probe=False,
+        old_credential_revoked=True,
+    )
+    assert v.all_passed is False
+
+
+def test_rotation_verification_object_storage():
+    """all_passed includes object_storage_access when it was run."""
+    v = RotationVerification(
+        workload_ready=True,
+        object_storage_access=True,
+        old_credential_revoked=True,
+    )
+    assert v.all_passed is True
+
+    v_fail = RotationVerification(
+        workload_ready=True,
+        object_storage_access=False,
+        old_credential_revoked=True,
+    )
+    assert v_fail.all_passed is False
+
+
+def test_rotation_result_failed():
+    """A failed rotation result includes error code from taxonomy."""
+    result = RotationResult(
+        credential_set_id="cts-postgres-runtime",
+        status="failed",
+        error_code="dependency_unavailable",
+        error_message="PostgreSQL role creation failed: permission denied for cts_runtime_b",
+    )
+    d = result.to_dict()
+    assert d["status"] == "failed"
+    assert d["error_code"] == "dependency_unavailable"
+    # Error message should not contain credential values
+    assert "password" not in d["error_message"].lower()
+
+
+def test_rotation_policy_defaults():
+    """RotationPolicy has sensible defaults for scheduled rotation."""
+    policy = RotationPolicy(
+        credential_set="cts-postgres-runtime",
+        credential_type=CREDENTIAL_CLASS_POSTGRESQL_LOGIN,
+        owner="cts-platform",
+    )
+    assert policy.rotation_mode == STRATEGY_DUAL_LOGIN_ROLE
+    assert policy.cadence_days == 30
+    assert policy.grace_period_minutes == 30
+    assert policy.require_approval is False
+    assert TRIGGER_EXPOSURE in policy.emergency_triggers
+    assert policy.rollback_allowed_before_revocation is True
+
+
+def test_rotation_lock():
+    """RotationLock captures the critical-section state."""
+    lock = RotationLock(
+        credential_set_id="cts-postgres-runtime",
+        rotation_generation=18,
+        state="rotating",
+        lock_owner_workflow_id="security:credential-rotation:cts-postgres-runtime:2026-09",
+        lock_expires_at="2026-09-05T12:45:00Z",
+    )
+    assert lock.state == "rotating"
+    assert lock.rotation_generation == 18
+    assert "credential-rotation" in lock.lock_owner_workflow_id
+
+
+def test_rotation_steps_complete():
+    """ROTATION_STEPS contains all 14 workflow steps in order."""
+    assert len(ROTATION_STEPS) == 14
+    assert ROTATION_STEPS[0] == "load_rotation_policy"
+    assert ROTATION_STEPS[3] == "create_successor_credential"
+    assert ROTATION_STEPS[10] == "revoke_predecessor_credential"
+    assert ROTATION_STEPS[12] == "write_rotation_evidence"
+    assert ROTATION_STEPS[13] == "notify_security_and_owners"
+
+
+def test_security_task_queues():
+    """Security task queues are defined and distinct from media queues."""
+    assert TASK_QUEUE_SECURITY_WORKFLOWS == "security-workflows"
+    assert TASK_QUEUE_SECURITY_DATABASE == "security-database"
+    assert TASK_QUEUE_SECURITY_OBJECT_STORAGE == "security-object-storage"
+    # Security queues must not collide with media queues
+    media_queues = {
+        TASK_QUEUE_CTS_WORKFLOWS, TASK_QUEUE_MEDIA_GPU,
+        TASK_QUEUE_CASTING_WORKFLOWS, TASK_QUEUE_TTS_GPU,
+        TASK_QUEUE_NEXUS_PUBLICATION, TASK_QUEUE_MEDIA_IO,
+    }
+    security_queues = {
+        TASK_QUEUE_SECURITY_WORKFLOWS, TASK_QUEUE_SECURITY_SECRET_PROVIDER,
+        TASK_QUEUE_SECURITY_KUBERNETES, TASK_QUEUE_SECURITY_DATABASE,
+        TASK_QUEUE_SECURITY_OBJECT_STORAGE,
+    }
+    assert media_queues.isdisjoint(security_queues)
