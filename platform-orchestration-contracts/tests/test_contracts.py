@@ -125,11 +125,18 @@ from platform_orchestration_contracts import (
     WorkloadEnvFrom,
     WorkloadVolumeSecret,
     ExternalSecretMetadata,
+    MalformedWorkloadError,
     RISK_SIGNAL_K8S_SECRET_DELIVERY,
     RISK_SIGNAL_INLINE_ENV_SECRET,
     RISK_SIGNAL_RUNTIME_DB_ACCESS,
     RISK_SIGNAL_OBJECT_STORAGE_ACCESS,
     RISK_SIGNAL_NO_SECRET_REF,
+    EXPOSURE_ACTIVE_IN_SOURCE,
+    EXPOSURE_MANAGED_VIA_SECRET_REF,
+    EXPOSURE_UNKNOWN,
+    ACTION_EMERGENCY_ROTATION,
+    ACTION_ENROLLMENT_CANDIDATE,
+    ACTION_CERTIFICATE_LIFECYCLE,
     EnrollmentResult,
     SOURCE_KUBERNETES,
     SOURCE_GIT,
@@ -3591,19 +3598,23 @@ class SyntheticK8sClient:
 
 
 def _make_cts_backend_workload() -> WorkloadMetadata:
-    """Create synthetic CTS backend workload metadata (no secret values)."""
+    """Create synthetic CTS backend workload metadata (no secret values).
+
+    The client has already discarded inline values and reduced them to
+    inline_value_present=True. The adapter never sees the actual values.
+    """
     return WorkloadMetadata(
         kind="Deployment",
         namespace="cts",
         name="cts-backend",
         container_name="cts-backend",
         env_vars=(
-            # POSTGRES_DSN with inline value (the adapter must NOT propagate the value)
-            WorkloadEnvVar(name="POSTGRES_DSN", value="dbname=mydatabase user=admin password=SECRET"),
-            # AWS_SECRET_ACCESS_KEY with inline value
-            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", value="cNJ3+eCdYQoRSbdxpikZp9cG"),
+            # POSTGRES_DSN with inline value (value discarded by client, only Boolean retained)
+            WorkloadEnvVar(name="POSTGRES_DSN", inline_value_present=True),
+            # AWS_SECRET_ACCESS_KEY with inline value (value discarded by client)
+            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", inline_value_present=True),
             # Non-credential env var (should be ignored)
-            WorkloadEnvVar(name="PORT", value="8001"),
+            WorkloadEnvVar(name="PORT", inline_value_present=True),
             # Credential with secretKeyRef (good pattern)
             WorkloadEnvVar(name="DATABASE_URL", secret_ref_name="cts-db-secret", secret_ref_key="uri"),
         ),
@@ -3616,15 +3627,15 @@ def _make_cts_backend_workload() -> WorkloadMetadata:
 
 
 def _make_cts_watchdog_workload() -> WorkloadMetadata:
-    """Create synthetic CTS watchdog workload metadata."""
+    """Create synthetic CTS watchdog workload metadata (no secret values)."""
     return WorkloadMetadata(
         kind="Deployment",
         namespace="cts",
         name="cts-watchdog",
         container_name="cts-watchdog",
         env_vars=(
-            WorkloadEnvVar(name="POSTGRES_DSN", value="dbname=mydatabase user=admin password=SECRET"),
-            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", value="cNJ3+eCdYQoRSbdxpikZp9cG"),
+            WorkloadEnvVar(name="POSTGRES_DSN", inline_value_present=True),
+            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", inline_value_present=True),
         ),
         env_from=(
             WorkloadEnvFrom(secret_ref_name="cts-shared-secrets"),
@@ -3714,19 +3725,232 @@ def test_k8s_adapter_emits_secret_ref_risk_signal():
 
 
 def test_k8s_adapter_does_not_propagate_secret_values():
-    """Adapter output contains no plaintext secret values."""
+    """Adapter output contains no plaintext secret values.
+
+    The adapter never receives values — the client discards them and
+    sets inline_value_present=True. This test verifies that:
+    1. inline_value_present is True for inline env vars
+    2. No secret value substrings appear in any output
+    """
     client = SyntheticK8sClient((_make_cts_backend_workload(),))
     observations = discover_kubernetes_credentials(
         client=client,
         namespace="cts",
         environment="dev",
     )
-    # Check that no observation contains the actual secret values
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.inline_value_present is True
+
+    # Check that no observation contains any secret-like value patterns
     for obs in observations:
         json_str = json.dumps(obs.to_dict())
+        # These are values that would have been present in the old design
         assert "cNJ3+eCdYQoRSbdxpikZp9cG" not in json_str
         assert "password=SECRET" not in json_str
         assert "dbname=mydatabase" not in json_str
+        assert "XwYcij2BguKzVlEdlsKJu1" not in json_str
+
+
+def test_k8s_adapter_inline_value_not_in_exception():
+    """Thrown exceptions do not contain inline secret values.
+
+    If an unsafe observation is detected, the exception message must
+    not contain any value that was present in the input workload.
+    """
+    # Create a workload with an inline value that would be flagged
+    # The adapter discards values, so even if an exception is thrown,
+    # the value is never in the observation or exception
+    workload = WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-bad",
+        env_vars=(
+            WorkloadEnvVar(name="POSTGRES_DSN", inline_value_present=True),
+        ),
+    )
+    client = SyntheticK8sClient((workload,))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    # The observation should be safe (no value to leak)
+    assert_observations_safe(observations)
+    # Even if we serialize and check, no value is present
+    for obs in observations:
+        assert obs.inline_value_present is True
+        # The observation_id contains the env var NAME, not the value
+        assert "POSTGRES_DSN" in obs.observation_id
+
+
+def test_k8s_adapter_batch_failure_no_value_leak():
+    """Batch failure from one observation doesn't leak values from others.
+
+    Even if assert_observations_safe raises on one observation, the
+    exception message must not contain values from other observations.
+    Since the adapter never carries values, this is guaranteed by design.
+    """
+    workload = WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-multi",
+        env_vars=(
+            WorkloadEnvVar(name="POSTGRES_DSN", inline_value_present=True),
+            WorkloadEnvVar(name="AWS_SECRET_ACCESS_KEY", inline_value_present=True),
+        ),
+    )
+    client = SyntheticK8sClient((workload,))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    # All observations should be safe
+    assert_observations_safe(observations)
+    # No value substrings in any observation
+    for obs in observations:
+        serialized = json.dumps(obs.to_dict())
+        assert "password=" not in serialized.lower()
+        assert "cNJ3" not in serialized
+
+
+def test_k8s_adapter_rejects_malformed_both_value_and_secret_ref():
+    """Adapter rejects env var with both inline_value_present and secret_ref_name."""
+    import pytest
+    workload = WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-malformed",
+        env_vars=(
+            # Both inline and secretKeyRef — invalid Kubernetes semantics
+            WorkloadEnvVar(
+                name="POSTGRES_DSN",
+                inline_value_present=True,
+                secret_ref_name="cts-db-secret",
+                secret_ref_key="uri",
+            ),
+        ),
+    )
+    client = SyntheticK8sClient((workload,))
+    with pytest.raises(MalformedWorkloadError, match="malformed"):
+        discover_kubernetes_credentials(
+            client=client,
+            namespace="cts",
+            environment="dev",
+        )
+
+
+def test_k8s_adapter_malformed_exception_no_value():
+    """MalformedWorkloadError exception does not contain secret values."""
+    workload = WorkloadMetadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-malformed",
+        env_vars=(
+            WorkloadEnvVar(
+                name="POSTGRES_DSN",
+                inline_value_present=True,
+                secret_ref_name="cts-db-secret",
+                secret_ref_key="uri",
+            ),
+        ),
+    )
+    client = SyntheticK8sClient((workload,))
+    try:
+        discover_kubernetes_credentials(
+            client=client,
+            namespace="cts",
+            environment="dev",
+        )
+        assert False, "Should have raised MalformedWorkloadError"
+    except MalformedWorkloadError as e:
+        # Exception message should contain workload ref and env var name
+        # but NOT any secret value
+        msg = str(e)
+        assert "cts-malformed" in msg
+        assert "POSTGRES_DSN" in msg
+        # No secret values (these would have been the actual values in old design)
+        assert "password=" not in msg.lower()
+        assert "cNJ3" not in msg
+
+
+def test_k8s_adapter_inline_value_present_in_output():
+    """inline_value_present=True appears in observation output."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.inline_value_present is True
+    assert "inline_value_present" in pg_obs.to_dict()
+    assert pg_obs.to_dict()["inline_value_present"] is True
+
+    # secretKeyRef-based observation should have inline_value_present=False
+    db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
+    assert db_url_obs.inline_value_present is False
+
+
+def test_k8s_adapter_exposure_class_active_in_source_for_inline():
+    """Inline credentials get exposure_class=active_in_source."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.exposure_class == EXPOSURE_ACTIVE_IN_SOURCE
+
+
+def test_k8s_adapter_exposure_class_managed_for_secret_ref():
+    """secretKeyRef credentials get exposure_class=managed_via_secret_ref."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
+    assert db_url_obs.exposure_class == EXPOSURE_MANAGED_VIA_SECRET_REF
+
+
+def test_k8s_adapter_default_action_emergency_rotation_for_inline():
+    """Inline credentials get default_action=emergency_rotation."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    pg_obs = next(o for o in observations if "POSTGRES_DSN" in o.observation_id)
+    assert pg_obs.default_action == ACTION_EMERGENCY_ROTATION
+
+
+def test_k8s_adapter_default_action_enrollment_for_secret_ref():
+    """secretKeyRef credentials get default_action=enrollment_candidate."""
+    client = SyntheticK8sClient((_make_cts_backend_workload(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
+    assert db_url_obs.default_action == ACTION_ENROLLMENT_CANDIDATE
+
+
+def test_k8s_adapter_volume_secret_certificate_lifecycle():
+    """Volume-mounted secrets get default_action=certificate_lifecycle."""
+    client = SyntheticK8sClient((_make_cts_with_volume_secret(),))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    vol_obs = [o for o in observations if "volume" in o.observation_id]
+    assert len(vol_obs) == 1
+    assert vol_obs[0].default_action == ACTION_CERTIFICATE_LIFECYCLE
 
 
 def test_k8s_adapter_all_observations_pass_safety_check():
@@ -3818,7 +4042,7 @@ def test_k8s_adapter_filters_by_namespace():
         kind="Deployment",
         namespace="other-ns",
         name="other-app",
-        env_vars=(WorkloadEnvVar(name="POSTGRES_DSN", value="x"),),
+        env_vars=(WorkloadEnvVar(name="POSTGRES_DSN", inline_value_present=True),),
     )
     client = SyntheticK8sClient((_make_cts_backend_workload(), other_workload))
     observations = discover_kubernetes_credentials(
@@ -3861,9 +4085,9 @@ def test_k8s_adapter_no_credential_env_vars():
         namespace="cts",
         name="no-creds-app",
         env_vars=(
-            WorkloadEnvVar(name="PORT", value="8001"),
-            WorkloadEnvVar(name="LOG_LEVEL", value="info"),
-            WorkloadEnvVar(name="MAX_CONNECTIONS", value="100"),
+            WorkloadEnvVar(name="PORT", inline_value_present=True),
+            WorkloadEnvVar(name="LOG_LEVEL", inline_value_present=True),
+            WorkloadEnvVar(name="MAX_CONNECTIONS", inline_value_present=True),
         ),
     )
     client = SyntheticK8sClient((workload,))

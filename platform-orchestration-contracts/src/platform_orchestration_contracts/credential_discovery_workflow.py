@@ -125,6 +125,12 @@ class CredentialObservation:
     evidence_ref: str = ""  # e.g. "k8s:cts/cts-backend@resource_version:12345"
     plaintext_retained: bool = False  # must always be False for Phase 1
 
+    # Inline value detection (Boolean only — never the value itself)
+    inline_value_present: bool = False  # True if inline value was detected and discarded
+
+    # Recommended default action for this observation
+    default_action: Optional[str] = None  # e.g. "emergency_rotation", "enrollment_candidate"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "observation_id": self.observation_id,
@@ -148,6 +154,8 @@ class CredentialObservation:
             "exposure_class": self.exposure_class,
             "evidence_ref": self.evidence_ref,
             "plaintext_retained": self.plaintext_retained,
+            "inline_value_present": self.inline_value_present,
+            "default_action": self.default_action,
         }
 
 

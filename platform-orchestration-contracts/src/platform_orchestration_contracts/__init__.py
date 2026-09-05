@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -228,6 +228,7 @@ from .kubernetes_discovery_adapter import (
     WorkloadEnvFrom,
     WorkloadVolumeSecret,
     ExternalSecretMetadata,
+    MalformedWorkloadError,
     RISK_SIGNAL_K8S_SECRET_DELIVERY,
     RISK_SIGNAL_INLINE_ENV_SECRET,
     RISK_SIGNAL_RUNTIME_DB_ACCESS,
@@ -235,6 +236,14 @@ from .kubernetes_discovery_adapter import (
     RISK_SIGNAL_EXTERNAL_SECRET_REF,
     RISK_SIGNAL_SHARED_SECRET_ACROSS_NAMESPACES,
     RISK_SIGNAL_NO_SECRET_REF,
+    EXPOSURE_ACTIVE_IN_SOURCE,
+    EXPOSURE_MANAGED_VIA_SECRET_REF,
+    EXPOSURE_MANAGED_VIA_EXTERNAL_SECRET,
+    EXPOSURE_UNKNOWN,
+    ACTION_EMERGENCY_ROTATION,
+    ACTION_ENROLLMENT_CANDIDATE,
+    ACTION_INVENTORY_ONLY,
+    ACTION_CERTIFICATE_LIFECYCLE,
 )
 
 __all__ = [
@@ -451,4 +460,13 @@ __all__ = [
     "RISK_SIGNAL_EXTERNAL_SECRET_REF",
     "RISK_SIGNAL_SHARED_SECRET_ACROSS_NAMESPACES",
     "RISK_SIGNAL_NO_SECRET_REF",
+    "MalformedWorkloadError",
+    "EXPOSURE_ACTIVE_IN_SOURCE",
+    "EXPOSURE_MANAGED_VIA_SECRET_REF",
+    "EXPOSURE_MANAGED_VIA_EXTERNAL_SECRET",
+    "EXPOSURE_UNKNOWN",
+    "ACTION_EMERGENCY_ROTATION",
+    "ACTION_ENROLLMENT_CANDIDATE",
+    "ACTION_INVENTORY_ONLY",
+    "ACTION_CERTIFICATE_LIFECYCLE",
 ]
