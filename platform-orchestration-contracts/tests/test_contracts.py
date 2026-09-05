@@ -30,6 +30,9 @@ from platform_orchestration_contracts import (
     OutboxCommandStatus,
     StartResult,
     START_POLICY_TABLE,
+    OUTBOX_TABLE_DDL,
+    OUTBOX_STATUS_PENDING,
+    OUTBOX_STATUS_CONFIRMED,
     StubOrchestrationClient,
     TASK_QUEUE_CASTING_WORKFLOWS,
 )
@@ -59,10 +62,47 @@ def test_envelope_roundtrip():
     d = env.to_dict()
     assert d["workflow_type"] == "media.corpus-batch.v1"
     assert d["governance"]["approval_required"] is True
+    assert d["contract_version"] == "1.0"
     restored = WorkflowEnvelope.from_dict(d)
     assert restored.workflow_id == env.workflow_id
     assert restored.governance.approval_required is True
     assert restored.input_ref.checksum == "sha256:abc123"
+    assert restored.contract_version == "1.0"
+
+
+def test_envelope_contract_version_default():
+    """contract_version defaults to 1.0 when not specified."""
+    env = WorkflowEnvelope(
+        request_id="req_1",
+        workflow_id="cts:ingest:job_1",
+        workflow_type="media.ingestion.v1",
+        source_app="cts",
+        tenant_id="patternfoundry",
+        idempotency_key="cts:ingest:job_1",
+        requested_by=RequestedBy(subject_id="user_1"),
+        input_ref=InputRef(kind="inline-json", uri="inline", checksum="sha256:x"),
+    )
+    assert env.contract_version == "1.0"
+
+
+def test_envelope_contract_version_custom():
+    """contract_version can be overridden for forward compatibility testing."""
+    env = WorkflowEnvelope(
+        request_id="req_1",
+        workflow_id="cts:ingest:job_1",
+        workflow_type="media.ingestion.v1",
+        source_app="cts",
+        tenant_id="patternfoundry",
+        idempotency_key="cts:ingest:job_1",
+        requested_by=RequestedBy(subject_id="user_1"),
+        input_ref=InputRef(kind="inline-json", uri="inline", checksum="sha256:x"),
+        contract_version="2.0",
+    )
+    assert env.contract_version == "2.0"
+    d = env.to_dict()
+    assert d["contract_version"] == "2.0"
+    restored = WorkflowEnvelope.from_dict(d)
+    assert restored.contract_version == "2.0"
 
 
 # --- WorkflowResult ---
@@ -310,6 +350,26 @@ def test_start_result():
     )
     assert r.status == "started"
     assert r.run_id == "run_1"
+
+
+def test_outbox_table_ddl():
+    """Outbox DDL contains the required columns and indexes."""
+    assert "CREATE TABLE" in OUTBOX_TABLE_DDL
+    assert "workflow_outbox" in OUTBOX_TABLE_DDL
+    assert "idempotency_key" in OUTBOX_TABLE_DDL
+    assert "UNIQUE" in OUTBOX_TABLE_DDL
+    assert "payload_sha256" in OUTBOX_TABLE_DDL
+    assert "next_attempt_at" in OUTBOX_TABLE_DDL
+    assert "status" in OUTBOX_TABLE_DDL
+    # Index for dispatcher to find pending rows efficiently
+    assert "idx_outbox_status_next_attempt" in OUTBOX_TABLE_DDL
+    # Index for looking up by workflow_id
+    assert "idx_outbox_workflow_id" in OUTBOX_TABLE_DDL
+
+
+def test_outbox_status_constants():
+    assert OUTBOX_STATUS_PENDING == "pending"
+    assert OUTBOX_STATUS_CONFIRMED == "confirmed"
 
 
 # --- StubOrchestrationClient ---

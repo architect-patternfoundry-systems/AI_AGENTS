@@ -912,6 +912,30 @@ A live database credential was present in shell commands in the supplied transcr
 - Remove it from command history and log artifacts where feasible.
 - Move the DSN into a Kubernetes Secret or external secret manager rather than embedding it in commands.
 
+### 23.1 Secret manifest policy
+
+`secretKeyRef` in a workload manifest is correct, but do **not** commit actual Kubernetes `Secret` objects containing plaintext `stringData` to Git unless using an encryption system such as SOPS, Sealed Secrets, or External Secrets with a protected backend.
+
+| Environment | Recommended secret source |
+|---|---|
+| Homelab development | Secret created locally/out-of-band; manifest references it with `secretKeyRef` |
+| GitOps with encrypted secrets | SOPS-encrypted Secret committed to Git, decrypted only in-cluster |
+| Central secret manager available | External Secrets Operator or equivalent |
+| CI deployment | Protected CI secret injected into deployment tooling; never printed |
+
+The configuration committed to Git should contain only secret names and key names:
+
+```yaml
+env:
+  - name: POSTGRES_DSN
+    valueFrom:
+      secretKeyRef:
+        name: cts-db-secret
+        key: uri
+```
+
+That preserves declarative deployment while keeping values out of Git. Remediation documents must never contain actual secret values — describe credentials by identifier, time window, and rotation status instead.
+
 ---
 
 ## 24. Compliance

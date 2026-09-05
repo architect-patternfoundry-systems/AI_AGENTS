@@ -102,3 +102,49 @@ class StartResult:
     run_id: Optional[str] = None
     command_id: Optional[str] = None
     reason: Optional[str] = None
+
+
+# --- Outbox table DDL ---
+#
+# Each application creates this table in its own database. The dispatcher
+# is the ONLY component that starts workflows. It reads pending rows,
+# starts Temporal using the deterministic workflow ID, marks dispatch
+# success atomically, and safely retries temporary Temporal failures.
+#
+# This makes `submitted_pending_dispatch` a real state rather than an
+# optimistic UI label.
+
+OUTBOX_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS workflow_outbox (
+    id              UUID PRIMARY KEY,
+    aggregate_type  TEXT NOT NULL,
+    aggregate_id    TEXT NOT NULL,
+    command_type    TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    workflow_id     TEXT NOT NULL,
+    workflow_type   TEXT NOT NULL,
+    payload_ref     TEXT NOT NULL,
+    payload_sha256  TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    temporal_run_id TEXT,
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    dispatched_at   TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_status_next_attempt
+    ON workflow_outbox (status, next_attempt_at)
+    WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_outbox_workflow_id
+    ON workflow_outbox (workflow_id);
+"""
+
+# Status values for the outbox table
+OUTBOX_STATUS_PENDING = "pending"
+OUTBOX_STATUS_DISPATCHED = "dispatched"
+OUTBOX_STATUS_CONFIRMED = "confirmed"
+OUTBOX_STATUS_FAILED = "failed"

@@ -16,6 +16,7 @@
     "input_ref"
   ],
   "properties": {
+    "contract_version": { "type": "string", "default": "1.0", "description": "Serialization/schema compatibility version, distinct from workflow_type and package version" },
     "request_id": { "type": "string", "minLength": 1 },
     "workflow_id": {
       "type": "string",

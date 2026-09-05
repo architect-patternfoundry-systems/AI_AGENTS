@@ -46,6 +46,11 @@ from .outbox import (
     OutboxCommandStatus,
     StartResult,
     START_POLICY_TABLE,
+    OUTBOX_TABLE_DDL,
+    OUTBOX_STATUS_PENDING,
+    OUTBOX_STATUS_DISPATCHED,
+    OUTBOX_STATUS_CONFIRMED,
+    OUTBOX_STATUS_FAILED,
 )
 from .temporal_client import (
     OrchestrationClient,
@@ -98,6 +103,11 @@ __all__ = [
     "OutboxCommandStatus",
     "StartResult",
     "START_POLICY_TABLE",
+    "OUTBOX_TABLE_DDL",
+    "OUTBOX_STATUS_PENDING",
+    "OUTBOX_STATUS_DISPATCHED",
+    "OUTBOX_STATUS_CONFIRMED",
+    "OUTBOX_STATUS_FAILED",
     # temporal_client
     "OrchestrationClient",
     "TemporalOrchestrationClient",

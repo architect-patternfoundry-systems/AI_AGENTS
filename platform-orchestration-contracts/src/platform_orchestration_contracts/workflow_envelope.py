@@ -48,6 +48,11 @@ class WorkflowEnvelope:
 
     Immutable. Carry this through every activity and child workflow so that
     correlation, causation, and governance state are always available.
+
+    Three distinct version identifiers govern different concerns:
+    - ``contract_version``: serialization/schema compatibility (this envelope).
+    - ``workflow_type``: business-process behavior (e.g. ``media.corpus-batch.v1``).
+    - Package version: client library release (set in pyproject.toml).
     """
 
     request_id: str
@@ -58,6 +63,7 @@ class WorkflowEnvelope:
     idempotency_key: str
     requested_by: RequestedBy
     input_ref: InputRef
+    contract_version: str = "1.0"
     governance: GovernanceBlock = field(default_factory=GovernanceBlock)
     project_id: Optional[str] = None
     correlation_id: Optional[str] = None
@@ -69,6 +75,7 @@ class WorkflowEnvelope:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "contract_version": self.contract_version,
             "request_id": self.request_id,
             "workflow_id": self.workflow_id,
             "workflow_type": self.workflow_type,
@@ -104,6 +111,7 @@ class WorkflowEnvelope:
         gov = data.get("governance", {})
         ref = data["input_ref"]
         return cls(
+            contract_version=data.get("contract_version", "1.0"),
             request_id=data["request_id"],
             workflow_id=data["workflow_id"],
             workflow_type=data["workflow_type"],
