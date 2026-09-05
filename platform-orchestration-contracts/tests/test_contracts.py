@@ -132,11 +132,14 @@ from platform_orchestration_contracts import (
     RISK_SIGNAL_OBJECT_STORAGE_ACCESS,
     RISK_SIGNAL_NO_SECRET_REF,
     EXPOSURE_ACTIVE_IN_SOURCE,
+    EXPOSURE_SECRET_DELIVERED,
     EXPOSURE_MANAGED_VIA_SECRET_REF,
     EXPOSURE_UNKNOWN,
     ACTION_EMERGENCY_ROTATION,
     ACTION_ENROLLMENT_CANDIDATE,
     ACTION_CERTIFICATE_LIFECYCLE,
+    to_workload_env_var,
+    to_workload_metadata,
     EnrollmentResult,
     SOURCE_KUBERNETES,
     SOURCE_GIT,
@@ -3913,7 +3916,7 @@ def test_k8s_adapter_exposure_class_managed_for_secret_ref():
         environment="dev",
     )
     db_url_obs = next(o for o in observations if "DATABASE_URL" in o.observation_id)
-    assert db_url_obs.exposure_class == EXPOSURE_MANAGED_VIA_SECRET_REF
+    assert db_url_obs.exposure_class == EXPOSURE_SECRET_DELIVERED
 
 
 def test_k8s_adapter_default_action_emergency_rotation_for_inline():
@@ -4169,3 +4172,393 @@ def test_k8s_adapter_environment_label():
     )
     for obs in observations:
         assert obs.environment == "prod"
+
+
+# --- Raw API boundary conversion tests ---
+
+
+class FakeV1EnvVar:
+    """Mimics Kubernetes Python client V1EnvVar for boundary testing."""
+
+    def __init__(self, name, value=None, value_from=None):
+        self.name = name
+        self.value = value
+        self.value_from = value_from
+
+
+class FakeV1SecretKeySelector:
+    """Mimics V1SecretKeySelector."""
+
+    def __init__(self, name, key=None):
+        self.name = name
+        self.key = key
+
+
+class FakeV1EnvVarSource:
+    """Mimics V1EnvVarSource."""
+
+    def __init__(self, secret_key_ref=None):
+        self.secret_key_ref = secret_key_ref
+
+
+class FakeV1EnvFromSource:
+    """Mimics V1EnvFromSource."""
+
+    def __init__(self, secret_ref=None):
+        self.secret_ref = secret_ref
+
+
+class FakeV1SecretEnvSource:
+    """Mimics V1SecretEnvSource."""
+
+    def __init__(self, name, optional=False):
+        self.name = name
+        self.optional = optional
+
+
+class FakeV1Container:
+    """Mimics V1Container for boundary testing."""
+
+    def __init__(self, name, env=None, env_from=None):
+        self.name = name
+        self.env = env or []
+        self.env_from = env_from or []
+
+
+# Synthetic secret values for boundary testing — these must NOT survive conversion
+_SYNTHETIC_INLINE_SECRET = "synthetic-secret-value-that-must-not-survive-ABC123"
+_SYNTHETIC_DSN = "dbname=test user=admin password=S3cr3tP@ss host=db.internal port=5432"
+_SYNTHETIC_MULTILINE = "line1\nline2\npassword=hidden\nline4"
+
+
+def test_to_workload_env_var_discards_inline_value():
+    """Boundary conversion discards inline value, keeps only Boolean presence."""
+    api_env = FakeV1EnvVar(name="POSTGRES_DSN", value=_SYNTHETIC_INLINE_SECRET)
+    safe_env = to_workload_env_var(api_env)
+
+    assert safe_env.name == "POSTGRES_DSN"
+    assert safe_env.inline_value_present is True
+    assert safe_env.secret_ref_name is None
+    assert not hasattr(safe_env, "value")
+
+
+def test_to_workload_env_var_value_not_in_repr():
+    """Raw value does not appear in WorkloadEnvVar repr."""
+    api_env = FakeV1EnvVar(name="POSTGRES_DSN", value=_SYNTHETIC_INLINE_SECRET)
+    safe_env = to_workload_env_var(api_env)
+
+    repr_str = repr(safe_env)
+    assert _SYNTHETIC_INLINE_SECRET not in repr_str
+    assert "S3cr3tP@ss" not in repr_str
+
+
+def test_to_workload_env_var_value_not_in_json():
+    """Raw value does not appear in WorkloadEnvVar JSON serialization."""
+    from dataclasses import asdict
+    api_env = FakeV1EnvVar(name="POSTGRES_DSN", value=_SYNTHETIC_INLINE_SECRET)
+    safe_env = to_workload_env_var(api_env)
+
+    json_str = json.dumps(asdict(safe_env))
+    assert _SYNTHETIC_INLINE_SECRET not in json_str
+    assert "S3cr3tP@ss" not in json_str
+
+
+def test_to_workload_env_var_secret_key_ref():
+    """Boundary conversion extracts secretKeyRef correctly."""
+    api_env = FakeV1EnvVar(
+        name="DATABASE_URL",
+        value=None,
+        value_from=FakeV1EnvVarSource(
+            secret_key_ref=FakeV1SecretKeySelector(name="cts-db-secret", key="uri")
+        ),
+    )
+    safe_env = to_workload_env_var(api_env)
+
+    assert safe_env.name == "DATABASE_URL"
+    assert safe_env.inline_value_present is False
+    assert safe_env.secret_ref_name == "cts-db-secret"
+    assert safe_env.secret_ref_key == "uri"
+
+
+def test_to_workload_env_var_rejects_both_value_and_value_from():
+    """Boundary conversion rejects env var with both value and valueFrom."""
+    api_env = FakeV1EnvVar(
+        name="POSTGRES_DSN",
+        value=_SYNTHETIC_INLINE_SECRET,
+        value_from=FakeV1EnvVarSource(
+            secret_key_ref=FakeV1SecretKeySelector(name="cts-db-secret", key="uri")
+        ),
+    )
+    with pytest.raises(ValueError, match="malformed"):
+        to_workload_env_var(api_env)
+
+
+def test_to_workload_env_var_malformed_exception_no_value():
+    """Malformed env var exception does not contain the secret value."""
+    api_env = FakeV1EnvVar(
+        name="POSTGRES_DSN",
+        value=_SYNTHETIC_INLINE_SECRET,
+        value_from=FakeV1EnvVarSource(
+            secret_key_ref=FakeV1SecretKeySelector(name="cts-db-secret", key="uri")
+        ),
+    )
+    try:
+        to_workload_env_var(api_env)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert "POSTGRES_DSN" in msg
+        assert _SYNTHETIC_INLINE_SECRET not in msg
+        assert "S3cr3tP@ss" not in msg
+
+
+def test_to_workload_env_var_multiline_value_discarded():
+    """Multiline/quoted inline value is discarded correctly."""
+    api_env = FakeV1EnvVar(name="CUSTOM_CONFIG", value=_SYNTHETIC_MULTILINE)
+    safe_env = to_workload_env_var(api_env)
+
+    assert safe_env.inline_value_present is True
+    assert _SYNTHETIC_MULTILINE not in repr(safe_env)
+    from dataclasses import asdict
+    assert _SYNTHETIC_MULTILINE not in json.dumps(asdict(safe_env))
+
+
+def test_to_workload_env_var_no_value_no_ref():
+    """Env var with neither value nor valueFrom produces unresolved WorkloadEnvVar."""
+    api_env = FakeV1EnvVar(name="POSTGRES_DSN", value=None, value_from=None)
+    safe_env = to_workload_env_var(api_env)
+
+    assert safe_env.name == "POSTGRES_DSN"
+    assert safe_env.inline_value_present is False
+    assert safe_env.secret_ref_name is None
+
+
+def test_to_workload_metadata_discards_all_inline_values():
+    """to_workload_metadata discards all inline values from all containers."""
+    api_containers = (
+        FakeV1Container(
+            name="cts-backend",
+            env=[
+                FakeV1EnvVar(name="POSTGRES_DSN", value=_SYNTHETIC_DSN),
+                FakeV1EnvVar(name="AWS_SECRET_ACCESS_KEY", value=_SYNTHETIC_INLINE_SECRET),
+                FakeV1EnvVar(name="PORT", value="8001"),
+                FakeV1EnvVar(
+                    name="DATABASE_URL",
+                    value_from=FakeV1EnvVarSource(
+                        secret_key_ref=FakeV1SecretKeySelector(name="cts-db-secret", key="uri")
+                    ),
+                ),
+            ],
+            env_from=[
+                FakeV1EnvFromSource(
+                    secret_ref=FakeV1SecretEnvSource(name="cts-shared-secrets")
+                ),
+            ],
+        ),
+    )
+
+    metadata = to_workload_metadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-backend",
+        api_containers=api_containers,
+        resource_version="12345",
+        owner_annotations={"team": "cts-platform"},
+    )
+
+    # Check that no secret values survived
+    from dataclasses import asdict
+    metadata_json = json.dumps(asdict(metadata))
+    assert _SYNTHETIC_DSN not in metadata_json
+    assert _SYNTHETIC_INLINE_SECRET not in metadata_json
+    assert "S3cr3tP@ss" not in metadata_json
+    assert "cNJ3" not in metadata_json
+
+    # Check that the Boolean presence signals are correct
+    pg_env = next(e for e in metadata.env_vars if e.name == "POSTGRES_DSN")
+    assert pg_env.inline_value_present is True
+    assert pg_env.secret_ref_name is None
+
+    aws_env = next(e for e in metadata.env_vars if e.name == "AWS_SECRET_ACCESS_KEY")
+    assert aws_env.inline_value_present is True
+
+    db_url_env = next(e for e in metadata.env_vars if e.name == "DATABASE_URL")
+    assert db_url_env.inline_value_present is False
+    assert db_url_env.secret_ref_name == "cts-db-secret"
+
+    # envFrom should be extracted
+    assert len(metadata.env_from) == 1
+    assert metadata.env_from[0].secret_ref_name == "cts-shared-secrets"
+
+
+def test_to_workload_metadata_repr_no_secrets():
+    """to_workload_metadata output repr contains no secret values."""
+    api_containers = (
+        FakeV1Container(
+            name="cts-backend",
+            env=[FakeV1EnvVar(name="POSTGRES_DSN", value=_SYNTHETIC_DSN)],
+        ),
+    )
+    metadata = to_workload_metadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-backend",
+        api_containers=api_containers,
+    )
+    metadata_repr = repr(metadata)
+    assert _SYNTHETIC_DSN not in metadata_repr
+    assert "S3cr3tP@ss" not in metadata_repr
+
+
+# --- End-to-end pipeline: raw API → observation → posture report ---
+
+def test_end_to_end_raw_api_to_posture_report_no_secret_survives():
+    """Synthetic secret does not survive the full pipeline.
+
+    Pipeline: raw API env var → WorkloadEnvVar → CredentialObservation
+    → CredentialSetRecord → PostureReport JSON/Markdown.
+
+    The synthetic secret value must be absent at every persisted or
+    emitted boundary.
+    """
+    raw_secret = "synthetic-e2e-secret-must-not-survive-XYZ789"
+
+    # Step 1: Raw API object with inline secret
+    api_env = FakeV1EnvVar(name="POSTGRES_DSN", value=raw_secret)
+    api_container = FakeV1Container(name="cts-backend", env=[api_env])
+
+    # Step 2: Convert to safe metadata (value discarded)
+    metadata = to_workload_metadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-backend",
+        api_containers=(api_container,),
+        resource_version="12345",
+        owner_annotations={"team": "cts-platform"},
+    )
+
+    # Step 3: Run adapter
+    client = SyntheticK8sClient((metadata,))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+    assert len(observations) > 0
+
+    # Step 4: Check observations don't contain the secret
+    for obs in observations:
+        obs_json = json.dumps(obs.to_dict())
+        assert raw_secret not in obs_json
+        assert "XYZ789" not in obs_json
+
+    # Step 5: Build a CredentialSetRecord from the observation
+    record = CredentialSetRecord(
+        credential_set_id="cts-postgres-e2e",
+        display_name="CTS PostgreSQL E2E Test",
+        credential_class="postgresql_login",
+        environment="dev",
+        lifecycle_state=LIFECYCLE_DISCOVERED,
+        owner=OwnerRef(team="cts-platform"),
+        authority=AuthorityRef(provider="kubernetes_secret", namespace="cts", secret_name="cts-backend"),
+        consumers=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+        risk=RiskAssessment(tier=RISK_HIGH),
+        capabilities=_full_caps(),
+    )
+
+    # Step 6: Evaluate posture
+    report = evaluate_posture(
+        run_id="e2e-run-001",
+        records=(record,),
+        policy_version="1",
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_NOT_CONFIGURED,
+            COVERAGE_SOURCE_MINIO: COVERAGE_NOT_CONFIGURED,
+            COVERAGE_SOURCE_GIT_FINDINGS: COVERAGE_NOT_CONFIGURED,
+        },
+    )
+
+    # Step 7: Check posture report JSON doesn't contain the secret
+    report_json = report.to_json()
+    assert raw_secret not in report_json
+    assert "XYZ789" not in report_json
+
+    # Step 8: Check posture report Markdown doesn't contain the secret
+    report_md = report.to_markdown()
+    assert raw_secret not in report_md
+    assert "XYZ789" not in report_md
+
+    # Step 9: Check entries_sha256 is present (evidence integrity)
+    assert report.entries_sha256.startswith("sha256:")
+
+    # Step 10: Check coverage is reported honestly
+    assert report.coverage[COVERAGE_SOURCE_POSTGRES] == COVERAGE_NOT_CONFIGURED
+    assert report.has_coverage_gaps is True
+
+
+def test_end_to_end_inline_secret_not_in_exception():
+    """If an exception is thrown during pipeline, the secret is not in the message."""
+    raw_secret = "synthetic-exception-secret-must-not-survive"
+
+    # Create a malformed env var (both value and valueFrom)
+    api_env = FakeV1EnvVar(
+        name="POSTGRES_DSN",
+        value=raw_secret,
+        value_from=FakeV1EnvVarSource(
+            secret_key_ref=FakeV1SecretKeySelector(name="cts-db-secret", key="uri")
+        ),
+    )
+
+    # The boundary conversion should raise ValueError without the secret
+    try:
+        to_workload_env_var(api_env)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        msg = str(e)
+        assert raw_secret not in msg
+        assert "must-not-survive" not in msg
+        assert "POSTGRES_DSN" in msg  # env var name is OK
+
+
+def test_end_to_end_multiple_secrets_none_survive():
+    """Multiple inline secrets in one workload are all discarded."""
+    secrets = [
+        "secret-one-AAA111",
+        "secret-two-BBB222",
+        "secret-three-CCC333",
+    ]
+
+    api_envs = [FakeV1EnvVar(name=f"VAR_{i}", value=s) for i, s in enumerate(secrets)]
+    # Add credential-like names so the adapter processes them
+    api_envs.append(FakeV1EnvVar(name="POSTGRES_DSN", value=secrets[0]))
+    api_envs.append(FakeV1EnvVar(name="AWS_SECRET_ACCESS_KEY", value=secrets[1]))
+
+    api_container = FakeV1Container(name="cts-multi", env=api_envs)
+    metadata = to_workload_metadata(
+        kind="Deployment",
+        namespace="cts",
+        name="cts-multi",
+        api_containers=(api_container,),
+    )
+
+    client = SyntheticK8sClient((metadata,))
+    observations = discover_kubernetes_credentials(
+        client=client,
+        namespace="cts",
+        environment="dev",
+    )
+
+    for obs in observations:
+        obs_json = json.dumps(obs.to_dict())
+        for secret in secrets:
+            assert secret not in obs_json
+            assert secret not in repr(obs)
+
+
+def test_exposure_class_secret_delivered_not_managed():
+    """EXPOSURE_SECRET_DELIVERED is the correct term, not 'managed'."""
+    # The value should be "secret_delivered" not "managed_via_secret_ref"
+    assert EXPOSURE_SECRET_DELIVERED == "secret_delivered"
+    # The deprecated alias should map to the same value
+    assert EXPOSURE_MANAGED_VIA_SECRET_REF == EXPOSURE_SECRET_DELIVERED

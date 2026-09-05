@@ -91,9 +91,12 @@ RISK_SIGNAL_NO_SECRET_REF = "credential-env-var-without-secret-reference"
 # --- Exposure classes for inline credential detection ---
 
 EXPOSURE_ACTIVE_IN_SOURCE = "active_in_source"
-EXPOSURE_MANAGED_VIA_SECRET_REF = "managed_via_secret_ref"
-EXPOSURE_MANAGED_VIA_EXTERNAL_SECRET = "managed_via_external_secret"
+EXPOSURE_SECRET_DELIVERED = "secret_delivered"  # secretKeyRef — not necessarily managed/rotated
+EXPOSURE_EXTERNAL_SECRET_DELIVERED = "external_secret_delivered"
 EXPOSURE_UNKNOWN = "unknown"
+
+# Deprecated alias for backward compatibility — prefer EXPOSURE_SECRET_DELIVERED
+EXPOSURE_MANAGED_VIA_SECRET_REF = "secret_delivered"
 
 # --- Default action mapping ---
 
@@ -352,7 +355,7 @@ def _determine_exposure_class(
     if inline_value_present and not has_secret_ref:
         return EXPOSURE_ACTIVE_IN_SOURCE
     if has_secret_ref:
-        return EXPOSURE_MANAGED_VIA_SECRET_REF
+        return EXPOSURE_SECRET_DELIVERED
     return EXPOSURE_UNKNOWN
 
 
@@ -507,7 +510,7 @@ def discover_kubernetes_credentials(
                 consumer_refs=(consumer_ref,),
                 owner_hint=owner_hint,
                 risk_signals=(RISK_SIGNAL_K8S_SECRET_DELIVERY,),
-                exposure_class=EXPOSURE_MANAGED_VIA_SECRET_REF,
+                exposure_class=EXPOSURE_SECRET_DELIVERED,
                 evidence_ref=evidence_ref,
                 plaintext_retained=False,
                 inline_value_present=False,
@@ -533,7 +536,7 @@ def discover_kubernetes_credentials(
                 consumer_refs=(consumer_ref,),
                 owner_hint=owner_hint,
                 risk_signals=(RISK_SIGNAL_K8S_SECRET_DELIVERY,),
-                exposure_class=EXPOSURE_MANAGED_VIA_SECRET_REF,
+                exposure_class=EXPOSURE_SECRET_DELIVERED,
                 evidence_ref=evidence_ref,
                 plaintext_retained=False,
                 inline_value_present=False,
@@ -543,3 +546,140 @@ def discover_kubernetes_credentials(
             observations.append(obs)
 
     return tuple(observations)
+
+
+# --- Raw API boundary conversion functions ---
+#
+# These functions convert raw Kubernetes API objects (from the Kubernetes
+# Python client library) into the adapter's safe immutable metadata
+# dataclasses. They are the CRITICAL BOUNDARY where inline secret values
+# are discarded.
+#
+# SECURITY RULES for boundary conversion:
+# 1. Never assign api_env.value to any variable, field, log, or exception.
+# 2. Never serialize the raw API object (no repr, to_dict, json.dumps).
+# 3. Log only opaque resource coordinates (namespace, kind, name, env_var_name).
+# 4. Return only safe immutable dataclasses (WorkloadEnvVar, WorkloadMetadata).
+# 5. If the raw object is malformed, raise with opaque identifiers only.
+
+
+def to_workload_env_var(api_env_var: Any) -> WorkloadEnvVar:
+    """Convert a raw Kubernetes API env var to a safe WorkloadEnvVar.
+
+    This is the CRITICAL BOUNDARY where inline secret values are discarded.
+    The raw api_env_var.value is checked for presence only, then discarded.
+    The actual value must never be assigned to a local variable, log record,
+    exception, fingerprint, or returned object.
+
+    Args:
+        api_env_var: A raw Kubernetes API env var object with attributes:
+            - name: str
+            - value: Optional[str] — discarded immediately
+            - value_from: Optional[object] with optional secret_key_ref
+
+    Returns:
+        WorkloadEnvVar with only safe metadata (no secret values).
+
+    Raises:
+        ValueError: If the env var has both value and valueFrom (malformed).
+    """
+    name = api_env_var.name
+    has_inline_value = api_env_var.value is not None
+
+    secret_ref_name = None
+    secret_ref_key = None
+
+    value_from = getattr(api_env_var, "value_from", None)
+    if value_from is not None:
+        secret_key_ref = getattr(value_from, "secret_key_ref", None)
+        if secret_key_ref is not None:
+            secret_ref_name = getattr(secret_key_ref, "name", None)
+            secret_ref_key = getattr(secret_key_ref, "key", None)
+
+    # Kubernetes API semantics: value and valueFrom are mutually exclusive.
+    # If both are present, the object is malformed.
+    if has_inline_value and secret_ref_name is not None:
+        raise ValueError(
+            f"Env var {name!r} has both inline value and secretKeyRef; "
+            f"this is malformed (Kubernetes API requires mutually exclusive)"
+        )
+
+    return WorkloadEnvVar(
+        name=name,
+        inline_value_present=has_inline_value,
+        secret_ref_name=secret_ref_name,
+        secret_ref_key=secret_ref_key,
+    )
+
+
+def to_workload_metadata(
+    *,
+    kind: str,
+    namespace: str,
+    name: str,
+    api_containers: tuple[Any, ...],
+    resource_version: Optional[str] = None,
+    owner_annotations: Optional[dict[str, str]] = None,
+    service_account: Optional[str] = None,
+) -> WorkloadMetadata:
+    """Convert raw Kubernetes API container specs to safe WorkloadMetadata.
+
+    This function iterates over raw API container objects and extracts
+    only safe metadata. Inline env var values are discarded at the
+    boundary via to_workload_env_var(). Raw container objects are never
+    stored, logged, or serialized.
+
+    Args:
+        kind: Workload kind ("Deployment", "StatefulSet", etc.)
+        namespace: Kubernetes namespace
+        name: Workload name
+        api_containers: Tuple of raw API container objects, each with:
+            - name: str
+            - env: list of raw env var objects
+            - env_from: list of raw envFrom objects
+            - volume_mounts: list of raw volume mount objects (optional)
+        resource_version: Kubernetes resource version
+        owner_annotations: Dict of annotation key → value
+        service_account: ServiceAccount name
+
+    Returns:
+        WorkloadMetadata with only safe metadata (no secret values).
+    """
+    all_env_vars: list[WorkloadEnvVar] = []
+    all_env_from: list[WorkloadEnvFrom] = []
+    container_name: Optional[str] = None
+
+    for container in api_containers:
+        if container_name is None:
+            container_name = getattr(container, "name", None)
+
+        # Convert env vars — values discarded at boundary
+        raw_env = getattr(container, "env", None) or []
+        for raw_env_var in raw_env:
+            safe_env_var = to_workload_env_var(raw_env_var)
+            all_env_vars.append(safe_env_var)
+
+        # Convert envFrom — only secret references, no values
+        raw_env_from = getattr(container, "env_from", None) or []
+        for raw_ef in raw_env_from:
+            secret_ref = getattr(raw_ef, "secret_ref", None)
+            if secret_ref is not None:
+                ref_name = getattr(secret_ref, "name", None)
+                if ref_name:
+                    all_env_from.append(WorkloadEnvFrom(
+                        secret_ref_name=ref_name,
+                        optional=getattr(secret_ref, "optional", False) or False,
+                    ))
+
+    return WorkloadMetadata(
+        kind=kind,
+        namespace=namespace,
+        name=name,
+        container_name=container_name,
+        env_vars=tuple(all_env_vars),
+        env_from=tuple(all_env_from),
+        volume_secrets=(),  # volume secrets extracted separately if needed
+        service_account=service_account,
+        owner_annotations=owner_annotations or {},
+        resource_version=resource_version,
+    )
