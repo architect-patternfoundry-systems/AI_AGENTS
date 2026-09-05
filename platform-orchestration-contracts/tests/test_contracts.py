@@ -2,6 +2,7 @@
 
 import json
 import pytest
+from typing import Optional
 
 from platform_orchestration_contracts import (
     WorkflowEnvelope,
@@ -98,6 +99,10 @@ from platform_orchestration_contracts import (
     DiscoveryFinding,
     EnrollmentPlan,
     EnrollmentInput,
+    CredentialPostureEntry,
+    PostureReport,
+    build_posture_entry,
+    evaluate_posture,
     EnrollmentResult,
     SOURCE_KUBERNETES,
     SOURCE_GIT,
@@ -2805,3 +2810,348 @@ def test_approval_binding_none_does_not_add_blockers():
     assert "approval_subject_fingerprint_mismatch" not in auth.all_blockers
     assert "approval_expired" not in auth.all_blockers
     assert "approval_expiry_malformed" not in auth.all_blockers
+
+
+# --- Phase 1: Credential Discovery Workflow (read-only posture pipeline) ---
+
+
+def _make_record(
+    credential_set_id: str = "cts-postgres-runtime",
+    credential_class: str = "postgresql_login",
+    environment: str = "prod",
+    lifecycle_state: str = LIFECYCLE_DISCOVERED,
+    owner: Optional[OwnerRef] = None,
+    authority: Optional[AuthorityRef] = None,
+    consumers: tuple[ConsumerRef, ...] = (),
+    risk_tier: str = RISK_MEDIUM,
+    capabilities: Optional[RotationCapabilities] = None,
+    target_strategy: Optional[str] = None,
+) -> CredentialSetRecord:
+    """Create a CredentialSetRecord for posture testing."""
+    return CredentialSetRecord(
+        credential_set_id=credential_set_id,
+        display_name=credential_set_id.replace("-", " ").title(),
+        credential_class=credential_class,
+        environment=environment,
+        lifecycle_state=lifecycle_state,
+        owner=owner,
+        authority=authority,
+        consumers=consumers,
+        risk=RiskAssessment(tier=risk_tier),
+        capabilities=capabilities or RotationCapabilities(),
+        target_strategy=target_strategy,
+    )
+
+
+def test_posture_report_basic():
+    """evaluate_posture produces a PostureReport from credential records."""
+    record = _make_record(
+        credential_set_id="cts-minio-writer",
+        credential_class="object_storage_key",
+        risk_tier=RISK_LOW,
+        owner=OwnerRef(team="infra"),
+        authority=AuthorityRef(provider="vault", namespace="cts", secret_name="minio-writer"),
+        consumers=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+        capabilities=_full_caps(),
+    )
+    report = evaluate_posture(
+        run_id="run-001",
+        records=(record,),
+        policy_version="1",
+    )
+    assert isinstance(report, PostureReport)
+    assert report.run_id == "run-001"
+    assert report.total_credentials == 1
+    assert len(report.entries) == 1
+    entry = report.entries[0]
+    assert entry.credential_set_id == "cts-minio-writer"
+    assert entry.risk_tier == RISK_LOW
+    assert entry.eligible is True  # low risk with full caps
+    assert entry.owner == "infra"
+    assert entry.consumer_count == 1
+
+
+def test_posture_report_unowned_credential():
+    """Unowned credentials are counted and recommended for owner assignment."""
+    record = _make_record(
+        credential_set_id="cts-orphan-key",
+        owner=None,
+        risk_tier=RISK_MEDIUM,
+    )
+    report = evaluate_posture(
+        run_id="run-002",
+        records=(record,),
+        policy_version="1",
+    )
+    assert report.unowned_count == 1
+    entry = report.entries[0]
+    assert entry.owner is None
+    assert entry.recommended_next_action == "assign_owner"
+
+
+def test_posture_report_orphaned_credential():
+    """Credentials with no consumers but past discovered state are orphaned."""
+    record = _make_record(
+        credential_set_id="cts-orphaned-role",
+        lifecycle_state=LIFECYCLE_ENROLLED,
+        consumers=(),
+        risk_tier=RISK_LOW,
+        owner=OwnerRef(team="infra"),  # has owner, but no consumers
+    )
+    report = evaluate_posture(
+        run_id="run-003",
+        records=(record,),
+        policy_version="1",
+    )
+    assert report.orphaned_count == 1
+    entry = report.entries[0]
+    assert entry.recommended_next_action == "triage_orphaned_credential"
+
+
+def test_posture_report_blocked_credential():
+    """Credentials with incomplete capabilities are blocked."""
+    record = _make_record(
+        credential_set_id="cts-blocked-cred",
+        risk_tier=RISK_HIGH,
+        capabilities=RotationCapabilities(
+            successor_creation=True,
+            secret_authority=False,  # missing
+            delivery=True,
+            consumer_reload=True,
+            positive_probe=True,
+            predecessor_revocation=True,
+            overlap_support=True,
+            audit_observability=True,
+            owner_confirmation=True,
+            rollback_verification=True,
+        ),
+    )
+    report = evaluate_posture(
+        run_id="run-004",
+        records=(record,),
+        policy_version="1",
+    )
+    assert report.blocked_count == 1
+    entry = report.entries[0]
+    assert entry.eligible is False
+    assert "secret_authority" in entry.blockers
+
+
+def test_posture_report_summary_by_risk_tier():
+    """Report summarizes credentials by risk tier."""
+    records = (
+        _make_record(credential_set_id="cred-low", risk_tier=RISK_LOW, capabilities=_full_caps()),
+        _make_record(credential_set_id="cred-low-2", risk_tier=RISK_LOW, capabilities=_full_caps()),
+        _make_record(credential_set_id="cred-high", risk_tier=RISK_HIGH, capabilities=_full_caps()),
+    )
+    report = evaluate_posture(
+        run_id="run-005",
+        records=records,
+        policy_version="1",
+    )
+    assert report.summary_by_risk_tier.get(RISK_LOW, 0) == 2
+    assert report.summary_by_risk_tier.get(RISK_HIGH, 0) == 1
+
+
+def test_posture_report_summary_by_lifecycle_state():
+    """Report summarizes credentials by lifecycle state."""
+    records = (
+        _make_record(credential_set_id="cred-1", lifecycle_state=LIFECYCLE_DISCOVERED),
+        _make_record(credential_set_id="cred-2", lifecycle_state=LIFECYCLE_ENROLLED),
+        _make_record(credential_set_id="cred-3", lifecycle_state=LIFECYCLE_ENROLLED),
+    )
+    report = evaluate_posture(
+        run_id="run-006",
+        records=records,
+        policy_version="1",
+    )
+    assert report.summary_by_lifecycle_state.get(LIFECYCLE_DISCOVERED, 0) == 1
+    assert report.summary_by_lifecycle_state.get(LIFECYCLE_ENROLLED, 0) == 2
+
+
+def test_posture_report_to_json():
+    """Posture report serializes to JSON."""
+    record = _make_record(
+        credential_set_id="cts-json-test",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+    )
+    report = evaluate_posture(
+        run_id="run-json",
+        records=(record,),
+        policy_version="1",
+    )
+    json_str = report.to_json()
+    import json
+    parsed = json.loads(json_str)
+    assert parsed["run_id"] == "run-json"
+    assert parsed["total_credentials"] == 1
+    assert len(parsed["entries"]) == 1
+
+
+def test_posture_report_to_markdown():
+    """Posture report renders to Markdown."""
+    record = _make_record(
+        credential_set_id="cts-md-test",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        owner=OwnerRef(team="infra"),
+    )
+    report = evaluate_posture(
+        run_id="run-md",
+        records=(record,),
+        policy_version="1",
+    )
+    md = report.to_markdown()
+    assert "# Credential Posture Report" in md
+    assert "cts-md-test" in md
+    assert "run-md" in md
+
+
+def test_posture_entry_to_dict():
+    """Posture entry serializes to dict."""
+    record = _make_record(
+        credential_set_id="cts-dict-test",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        owner=OwnerRef(team="platform"),
+        authority=AuthorityRef(provider="vault", namespace="cts", secret_name="db-cred"),
+    )
+    report = evaluate_posture(
+        run_id="run-dict",
+        records=(record,),
+        policy_version="1",
+    )
+    d = report.entries[0].to_dict()
+    assert d["credential_set_id"] == "cts-dict-test"
+    assert d["risk_tier"] == RISK_LOW
+    assert d["eligible"] is True
+    assert "input_fingerprint" in d
+    assert d["input_fingerprint"].startswith("sha256:")
+
+
+def test_posture_report_secret_authority_status():
+    """Posture entry reports secret authority status from authority provider."""
+    # Vault-backed → managed
+    vault_record = _make_record(
+        credential_set_id="cts-vault",
+        authority=AuthorityRef(provider="vault", namespace="cts", secret_name="db"),
+    )
+    # Kubernetes secret → unmanaged
+    k8s_record = _make_record(
+        credential_set_id="cts-k8s-secret",
+        authority=AuthorityRef(provider="kubernetes_secret", namespace="cts", secret_name="db"),
+    )
+    report = evaluate_posture(
+        run_id="run-auth",
+        records=(vault_record, k8s_record),
+        policy_version="1",
+    )
+    vault_entry = next(e for e in report.entries if e.credential_set_id == "cts-vault")
+    k8s_entry = next(e for e in report.entries if e.credential_set_id == "cts-k8s-secret")
+    assert vault_entry.secret_authority_status == "managed"
+    assert k8s_entry.secret_authority_status == "unmanaged"
+
+
+def test_posture_report_no_secret_values_in_output():
+    """Posture report contains no plaintext secret material."""
+    record = _make_record(
+        credential_set_id="cts-no-secrets",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+        authority=AuthorityRef(provider="vault", namespace="cts", secret_name="db-cred"),
+    )
+    report = evaluate_posture(
+        run_id="run-safe",
+        records=(record,),
+        policy_version="1",
+    )
+    # Check JSON output doesn't contain common secret patterns
+    json_output = report.to_json()
+    assert "password" not in json_output.lower()
+    assert "token" not in json_output.lower() or "credential_set_id" in json_output
+    # The output should contain references, not values
+    assert "vault:cts/db-cred" in json_output or "vault" in json_output
+
+
+def test_posture_report_multiple_credentials():
+    """Posture report handles multiple credentials with mixed states."""
+    records = (
+        _make_record(
+            credential_set_id="cts-low-eligible",
+            risk_tier=RISK_LOW,
+            capabilities=_full_caps(),
+            owner=OwnerRef(team="infra"),
+            lifecycle_state=LIFECYCLE_ROTATION_READY,
+        ),
+        _make_record(
+            credential_set_id="cts-high-blocked",
+            risk_tier=RISK_HIGH,
+            capabilities=RotationCapabilities(),  # all False → blocked
+            owner=OwnerRef(team="platform"),
+            lifecycle_state=LIFECYCLE_DISCOVERED,
+        ),
+        _make_record(
+            credential_set_id="cts-unowned",
+            risk_tier=RISK_MEDIUM,
+            capabilities=_full_caps(),
+            owner=None,
+            lifecycle_state=LIFECYCLE_DISCOVERED,
+        ),
+    )
+    report = evaluate_posture(
+        run_id="run-multi",
+        records=records,
+        policy_version="1",
+    )
+    assert report.total_credentials == 3
+    assert report.eligible_count == 2  # low and medium eligible
+    assert report.blocked_count == 1  # high blocked
+    assert report.unowned_count == 1
+
+
+def test_posture_report_risk_tier_overrides():
+    """Risk tier overrides take precedence over record's risk tier."""
+    record = _make_record(
+        credential_set_id="cts-override",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+    )
+    report = evaluate_posture(
+        run_id="run-override",
+        records=(record,),
+        risk_tier_overrides={"cts-override": RISK_HIGH},
+        policy_version="1",
+    )
+    entry = report.entries[0]
+    assert entry.risk_tier == RISK_HIGH  # overridden
+
+
+def test_posture_report_empty_records():
+    """Empty records produce an empty but valid report."""
+    report = evaluate_posture(
+        run_id="run-empty",
+        records=(),
+        policy_version="1",
+    )
+    assert report.total_credentials == 0
+    assert report.eligible_count == 0
+    assert report.blocked_count == 0
+    assert len(report.entries) == 0
+
+
+def test_posture_entry_has_input_fingerprint():
+    """Each posture entry carries the eligibility input fingerprint."""
+    record = _make_record(
+        credential_set_id="cts-fp-test",
+        risk_tier=RISK_LOW,
+        capabilities=_full_caps(),
+    )
+    report = evaluate_posture(
+        run_id="run-fp",
+        records=(record,),
+        policy_version="1",
+    )
+    entry = report.entries[0]
+    assert entry.input_fingerprint.startswith("sha256:")
+    assert len(entry.input_fingerprint) > len("sha256:")

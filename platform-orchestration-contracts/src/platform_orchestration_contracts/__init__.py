@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -191,6 +191,14 @@ from .credential_inventory import (
     InventoryRetentionPolicy,
 )
 
+# credential_discovery_workflow (Phase 1)
+from .credential_discovery_workflow import (
+    CredentialPostureEntry,
+    PostureReport,
+    build_posture_entry,
+    evaluate_posture,
+)
+
 __all__ = [
     "__version__",
     # workflow_envelope
@@ -368,4 +376,9 @@ __all__ = [
     "CredentialCorrelation",
     "CredentialException",
     "InventoryRetentionPolicy",
+    # credential_discovery_workflow (Phase 1)
+    "CredentialPostureEntry",
+    "PostureReport",
+    "build_posture_entry",
+    "evaluate_posture",
 ]
