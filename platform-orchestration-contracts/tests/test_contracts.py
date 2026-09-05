@@ -88,9 +88,11 @@ from platform_orchestration_contracts import (
     RiskAssessment,
     RotationCapabilities,
     RotationExecutionGates,
+    RotationSubject,
     RotationEligibility,
     evaluate_rotation_eligibility,
     RotationBlocked,
+    WorkflowExecutionAuthorization,
     CredentialSetRecord,
     DiscoveryFinding,
     EnrollmentPlan,
@@ -1673,10 +1675,26 @@ def _full_gates() -> RotationExecutionGates:
     )
 
 
+
+
+def _make_subject(credential_set_id: str = 'cts-cred') -> RotationSubject:
+    """Create a default RotationSubject for testing."""
+    return RotationSubject(
+        credential_set_id=credential_set_id,
+        provider_ref='postgresql:infra-data-postgres',
+        provider_identity_ref='role:cts_runtime_a',
+        secret_authority_ref='vault:secret/cts/db#v3',
+        consumer_set_ref='deployment:cts/cts-backend',
+        consumer_set_version='resource_version:12345',
+        rotation_strategy='dual_login_role',
+        reload_strategy='rolling_restart',
+    )
+
+
 def test_eligibility_low_tier_eligible():
     """Low-tier credential with full capabilities is eligible without gates."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-minio-writer",
+        subject=_make_subject("cts-minio-writer"),
         risk_tier=RISK_LOW,
         capabilities=_full_caps(),
         policy_version="1",
@@ -1692,7 +1710,7 @@ def test_eligibility_low_tier_eligible():
 def test_eligibility_high_tier_eligible():
     """High-tier credential with full capabilities is eligible without gates."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-postgres-runtime",
+        subject=_make_subject("cts-postgres-runtime"),
         risk_tier=RISK_HIGH,
         capabilities=_full_caps(),
         policy_version="1",
@@ -1706,7 +1724,7 @@ def test_eligibility_high_tier_eligible():
 def test_eligibility_critical_with_gates_eligible():
     """Critical credential with full caps and full gates is eligible."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-postgres-admin",
+        subject=_make_subject("cts-postgres-admin"),
         risk_tier=RISK_CRITICAL,
         capabilities=_full_caps(),
         gates=_full_gates(),
@@ -1722,7 +1740,7 @@ def test_eligibility_critical_with_gates_eligible():
 def test_eligibility_critical_without_gates_not_eligible():
     """Critical credential without execution gates is not eligible."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-postgres-admin",
+        subject=_make_subject("cts-postgres-admin"),
         risk_tier=RISK_CRITICAL,
         capabilities=_full_caps(),
         gates=None,
@@ -1743,7 +1761,7 @@ def test_eligibility_critical_with_partial_gates_not_eligible():
         emergency_recovery_plan_verified=False,
     )
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-postgres-admin",
+        subject=_make_subject("cts-postgres-admin"),
         risk_tier=RISK_CRITICAL,
         capabilities=_full_caps(),
         gates=gates,
@@ -1767,7 +1785,7 @@ def test_eligibility_provider_blocked():
         predecessor_revocation=True,
     )
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-api-key",
+        subject=_make_subject("cts-api-key"),
         risk_tier=RISK_MEDIUM,
         capabilities=caps,
         policy_version="1",
@@ -1795,7 +1813,7 @@ def test_eligibility_all_blockers_combines():
         emergency_recovery_plan_verified=True,
     )
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-critical",
+        subject=_make_subject("cts-critical"),
         risk_tier=RISK_CRITICAL,
         capabilities=caps,
         gates=gates,
@@ -1809,7 +1827,7 @@ def test_eligibility_all_blockers_combines():
 def test_eligibility_has_timestamp_and_version():
     """Eligibility record includes evaluation timestamp and policy version."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-minio",
+        subject=_make_subject("cts-minio"),
         risk_tier=RISK_LOW,
         capabilities=_full_caps(),
         policy_version="3",
@@ -1821,7 +1839,7 @@ def test_eligibility_has_timestamp_and_version():
 def test_eligibility_low_tier_ignores_gates():
     """Low-tier eligibility is not affected by execution gates."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-minio-writer",
+        subject=_make_subject("cts-minio-writer"),
         risk_tier=RISK_LOW,
         capabilities=_full_caps(),
         gates=None,  # no gates provided
@@ -1835,7 +1853,7 @@ def test_eligibility_low_tier_ignores_gates():
 def test_eligibility_is_rotation_eligibility_type():
     """evaluate_rotation_eligibility returns RotationEligibility instance."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="test",
+        subject=_make_subject("test"),
         risk_tier=RISK_LOW,
         capabilities=_full_caps(),
     )
@@ -1848,7 +1866,7 @@ def test_eligibility_is_rotation_eligibility_type():
 def test_eligibility_has_input_fingerprint():
     """Eligibility record includes an input fingerprint for immutable binding."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-minio-writer",
+        subject=_make_subject("cts-minio-writer"),
         risk_tier=RISK_LOW,
         capabilities=_full_caps(),
         policy_version="1",
@@ -1861,13 +1879,13 @@ def test_eligibility_fingerprint_changes_with_inputs():
     """Different inputs produce different fingerprints."""
     caps = _full_caps()
     e1 = evaluate_rotation_eligibility(
-        credential_set_id="cts-minio",
+        subject=_make_subject("cts-minio"),
         risk_tier=RISK_LOW,
         capabilities=caps,
         policy_version="1",
     )
     e2 = evaluate_rotation_eligibility(
-        credential_set_id="cts-postgres",
+        subject=_make_subject("cts-postgres"),
         risk_tier=RISK_LOW,
         capabilities=caps,
         policy_version="1",
@@ -1879,13 +1897,13 @@ def test_eligibility_fingerprint_changes_with_risk_tier():
     """Same credential at different risk tiers produces different fingerprints."""
     caps = _full_caps()
     e1 = evaluate_rotation_eligibility(
-        credential_set_id="cts-cred",
+        subject=_make_subject("cts-cred"),
         risk_tier=RISK_LOW,
         capabilities=caps,
         policy_version="1",
     )
     e2 = evaluate_rotation_eligibility(
-        credential_set_id="cts-cred",
+        subject=_make_subject("cts-cred"),
         risk_tier=RISK_HIGH,
         capabilities=caps,
         policy_version="1",
@@ -1897,13 +1915,13 @@ def test_eligibility_fingerprint_changes_with_policy_version():
     """Different policy versions produce different fingerprints."""
     caps = _full_caps()
     e1 = evaluate_rotation_eligibility(
-        credential_set_id="cts-cred",
+        subject=_make_subject("cts-cred"),
         risk_tier=RISK_LOW,
         capabilities=caps,
         policy_version="1",
     )
     e2 = evaluate_rotation_eligibility(
-        credential_set_id="cts-cred",
+        subject=_make_subject("cts-cred"),
         risk_tier=RISK_LOW,
         capabilities=caps,
         policy_version="2",
@@ -1915,14 +1933,14 @@ def test_eligibility_fingerprint_changes_with_gates():
     """Critical eligibility with different gates produces different fingerprints."""
     caps = _full_caps()
     e1 = evaluate_rotation_eligibility(
-        credential_set_id="cts-admin",
+        subject=_make_subject("cts-admin"),
         risk_tier=RISK_CRITICAL,
         capabilities=caps,
         gates=_full_gates(),
         policy_version="1",
     )
     e2 = evaluate_rotation_eligibility(
-        credential_set_id="cts-admin",
+        subject=_make_subject("cts-admin"),
         risk_tier=RISK_CRITICAL,
         capabilities=caps,
         gates=RotationExecutionGates(
@@ -1940,13 +1958,13 @@ def test_eligibility_fingerprint_deterministic():
     """Same inputs produce the same fingerprint."""
     caps = _full_caps()
     e1 = evaluate_rotation_eligibility(
-        credential_set_id="cts-cred",
+        subject=_make_subject("cts-cred"),
         risk_tier=RISK_MEDIUM,
         capabilities=caps,
         policy_version="1",
     )
     e2 = evaluate_rotation_eligibility(
-        credential_set_id="cts-cred",
+        subject=_make_subject("cts-cred"),
         risk_tier=RISK_MEDIUM,
         capabilities=caps,
         policy_version="1",
@@ -1959,7 +1977,7 @@ def test_eligibility_invalid_risk_tier_raises():
     import pytest
     with pytest.raises(ValueError, match="risk_tier"):
         evaluate_rotation_eligibility(
-            credential_set_id="cts-cred",
+            subject=_make_subject("cts-cred"),
             risk_tier="unknown",
             capabilities=_full_caps(),
         )
@@ -1968,9 +1986,19 @@ def test_eligibility_invalid_risk_tier_raises():
 def test_eligibility_invalid_credential_set_id_raises():
     """Invalid credential_set_id grammar raises ValueError."""
     import pytest
+    bad_subject = RotationSubject(
+        credential_set_id="UPPERCASE-BAD",
+        provider_ref="p",
+        provider_identity_ref="i",
+        secret_authority_ref="s",
+        consumer_set_ref="c",
+        consumer_set_version="v1",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
     with pytest.raises(ValueError, match="credential_set_id"):
         evaluate_rotation_eligibility(
-            credential_set_id="UPPERCASE-BAD",
+            subject=bad_subject,
             risk_tier=RISK_LOW,
             capabilities=_full_caps(),
         )
@@ -1979,9 +2007,19 @@ def test_eligibility_invalid_credential_set_id_raises():
 def test_eligibility_empty_credential_set_id_raises():
     """Empty credential_set_id raises ValueError."""
     import pytest
+    bad_subject = RotationSubject(
+        credential_set_id="",
+        provider_ref="p",
+        provider_identity_ref="i",
+        secret_authority_ref="s",
+        consumer_set_ref="c",
+        consumer_set_version="v1",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
     with pytest.raises(ValueError, match="credential_set_id"):
         evaluate_rotation_eligibility(
-            credential_set_id="",
+            subject=bad_subject,
             risk_tier=RISK_LOW,
             capabilities=_full_caps(),
         )
@@ -1992,7 +2030,7 @@ def test_eligibility_empty_policy_version_raises():
     import pytest
     with pytest.raises(ValueError, match="policy_version"):
         evaluate_rotation_eligibility(
-            credential_set_id="cts-cred",
+            subject=_make_subject("cts-cred"),
             risk_tier=RISK_LOW,
             capabilities=_full_caps(),
             policy_version="",
@@ -2038,7 +2076,7 @@ def test_rotation_blocked_exception():
 def test_rotation_blocked_from_eligibility():
     """RotationBlocked can be raised from an ineligible eligibility decision."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-admin",
+        subject=_make_subject("cts-admin"),
         risk_tier=RISK_CRITICAL,
         capabilities=_full_caps(),
         gates=None,  # no gates → not eligible
@@ -2057,7 +2095,7 @@ def test_rotation_blocked_from_eligibility():
 def test_high_tier_execution_gates_intentionally_not_evaluated():
     """High-tier eligibility does not check execution gates (documented policy)."""
     eligibility = evaluate_rotation_eligibility(
-        credential_set_id="cts-postgres-runtime",
+        subject=_make_subject("cts-postgres-runtime"),
         risk_tier=RISK_HIGH,
         capabilities=_full_caps(),
         gates=None,  # no gates provided, but high-tier doesn't need them
@@ -2067,3 +2105,213 @@ def test_high_tier_execution_gates_intentionally_not_evaluated():
     assert eligibility.execution_ready is True
     assert eligibility.execution_blockers == ()
     assert eligibility.eligible is True
+
+
+# --- RotationSubject fingerprint coverage ---
+
+
+def test_fingerprint_changes_with_provider_ref():
+    """Changed provider reference produces a different fingerprint."""
+    caps = _full_caps()
+    s1 = _make_subject("cts-cred")
+    s2 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:instance-b",  # changed
+        provider_identity_ref="role:cts_runtime_a",
+        secret_authority_ref="vault:secret/cts/db#v3",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:12345",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
+    e1 = evaluate_rotation_eligibility(subject=s1, risk_tier=RISK_LOW, capabilities=caps)
+    e2 = evaluate_rotation_eligibility(subject=s2, risk_tier=RISK_LOW, capabilities=caps)
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_fingerprint_changes_with_secret_authority_ref():
+    """Changed secret-authority path produces a different fingerprint."""
+    caps = _full_caps()
+    s1 = _make_subject("cts-cred")
+    s2 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:infra-data-postgres",
+        provider_identity_ref="role:cts_runtime_a",
+        secret_authority_ref="vault:secret/cts/db#v9",  # changed
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:12345",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
+    e1 = evaluate_rotation_eligibility(subject=s1, risk_tier=RISK_LOW, capabilities=caps)
+    e2 = evaluate_rotation_eligibility(subject=s2, risk_tier=RISK_LOW, capabilities=caps)
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_fingerprint_changes_with_consumer_set_version():
+    """Changed consumer-set version produces a different fingerprint."""
+    caps = _full_caps()
+    s1 = _make_subject("cts-cred")
+    s2 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:infra-data-postgres",
+        provider_identity_ref="role:cts_runtime_a",
+        secret_authority_ref="vault:secret/cts/db#v3",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:99999",  # changed
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+    )
+    e1 = evaluate_rotation_eligibility(subject=s1, risk_tier=RISK_LOW, capabilities=caps)
+    e2 = evaluate_rotation_eligibility(subject=s2, risk_tier=RISK_LOW, capabilities=caps)
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_fingerprint_changes_with_rotation_strategy():
+    """Changed rotation strategy produces a different fingerprint."""
+    caps = _full_caps()
+    s1 = _make_subject("cts-cred")
+    s2 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:infra-data-postgres",
+        provider_identity_ref="role:cts_runtime_a",
+        secret_authority_ref="vault:secret/cts/db#v3",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:12345",
+        rotation_strategy="dynamic_credential",  # changed
+        reload_strategy="rolling_restart",
+    )
+    e1 = evaluate_rotation_eligibility(subject=s1, risk_tier=RISK_LOW, capabilities=caps)
+    e2 = evaluate_rotation_eligibility(subject=s2, risk_tier=RISK_LOW, capabilities=caps)
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_fingerprint_changes_with_approval_policy_ref():
+    """Changed approval policy reference produces a different fingerprint."""
+    caps = _full_caps()
+    s1 = _make_subject("cts-cred")
+    s2 = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:infra-data-postgres",
+        provider_identity_ref="role:cts_runtime_a",
+        secret_authority_ref="vault:secret/cts/db#v3",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="resource_version:12345",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+        approval_policy_ref="policy:high-risk-v2",  # changed from None
+    )
+    e1 = evaluate_rotation_eligibility(subject=s1, risk_tier=RISK_LOW, capabilities=caps)
+    e2 = evaluate_rotation_eligibility(subject=s2, risk_tier=RISK_LOW, capabilities=caps)
+    assert e1.input_fingerprint != e2.input_fingerprint
+
+
+def test_rotation_subject_to_dict():
+    """RotationSubject.to_dict() includes all fields."""
+    subject = RotationSubject(
+        credential_set_id="cts-cred",
+        provider_ref="postgresql:pg",
+        provider_identity_ref="role:cts_runtime",
+        secret_authority_ref="vault:secret/cts/db",
+        consumer_set_ref="deployment:cts/cts-backend",
+        consumer_set_version="v1",
+        rotation_strategy="dual_login_role",
+        reload_strategy="rolling_restart",
+        approval_policy_ref="policy:high-risk",
+        evidence_store_ref="s3://security-evidence/...",
+    )
+    d = subject.to_dict()
+    assert d["credential_set_id"] == "cts-cred"
+    assert d["provider_ref"] == "postgresql:pg"
+    assert d["secret_authority_ref"] == "vault:secret/cts/db"
+    assert d["rotation_strategy"] == "dual_login_role"
+    assert d["approval_policy_ref"] == "policy:high-risk"
+    assert d["evidence_store_ref"] == "s3://security-evidence/..."
+
+
+# --- WorkflowExecutionAuthorization ---
+
+
+def test_workflow_execution_authorization_all_checks_pass():
+    """All execution checks passing means authorized."""
+    auth = WorkflowExecutionAuthorization(
+        credential_set_id="cts-postgres-runtime",
+        risk_tier=RISK_HIGH,
+        authorized=True,
+        blockers=(),
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        policy_version="1",
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+    )
+    assert auth.authorized is True
+    assert auth.all_blockers == ()
+
+
+def test_workflow_execution_authorization_missing_checks():
+    """Missing execution checks produce blockers."""
+    auth = WorkflowExecutionAuthorization(
+        credential_set_id="cts-postgres-runtime",
+        risk_tier=RISK_HIGH,
+        authorized=False,
+        blockers=(),
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        policy_version="1",
+        immutable_evidence_sink_available=False,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=False,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+    )
+    blockers = auth.all_blockers
+    assert "immutable_evidence_sink_unavailable" in blockers
+    assert "approval_requirement_unresolved" in blockers
+    assert "rollback_plan_not_validated" not in blockers
+
+
+def test_workflow_execution_authorization_incident_freeze():
+    """Active incident freeze blocks execution."""
+    auth = WorkflowExecutionAuthorization(
+        credential_set_id="cts-postgres-runtime",
+        risk_tier=RISK_HIGH,
+        authorized=False,
+        blockers=(),
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        policy_version="1",
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=True,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=False,
+    )
+    assert "active_incident_freeze" in auth.all_blockers
+
+
+def test_high_tier_requires_both_eligibility_and_authorization():
+    """High-tier rotation needs both provider eligibility AND execution authorization."""
+    eligibility = evaluate_rotation_eligibility(
+        subject=_make_subject("cts-postgres-runtime"),
+        risk_tier=RISK_HIGH,
+        capabilities=_full_caps(),
+        policy_version="1",
+    )
+    auth = WorkflowExecutionAuthorization(
+        credential_set_id="cts-postgres-runtime",
+        risk_tier=RISK_HIGH,
+        authorized=False,
+        blockers=(),
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        policy_version="1",
+        immutable_evidence_sink_available=True,
+        rollback_plan_validated=True,
+        approval_requirement_resolved=False,
+        cutover_scope_matches_approved_plan=True,
+        no_active_incident_freeze=True,
+    )
+    can_rotate = eligibility.eligible and auth.authorized
+    assert eligibility.eligible is True
+    assert auth.authorized is False
+    assert can_rotate is False

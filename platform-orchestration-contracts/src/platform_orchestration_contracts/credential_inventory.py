@@ -395,6 +395,47 @@ class RotationExecutionGates:
 
 
 @dataclass(frozen=True)
+class RotationSubject:
+    """The evaluated subject of a rotation eligibility decision.
+
+    Captures the material configuration that the fingerprint must bind
+    to: provider identity, secret-authority path, consumer set, rotation
+    strategy, reload strategy, and approval/evidence references. If any
+    of these change, the eligibility decision is stale and must be
+    reevaluated.
+
+    All references are opaque — no secret values, raw DSNs, or
+    unredacted URLs. Use provider-native identifiers, paths, and
+    version IDs only.
+    """
+
+    credential_set_id: str
+    provider_ref: str  # e.g. "postgresql:infra-data-postgres"
+    provider_identity_ref: str  # e.g. "role:cts_runtime_a"
+    secret_authority_ref: str  # e.g. "vault:secret/cts/db#v3"
+    consumer_set_ref: str  # e.g. "deployment:cts/cts-backend"
+    consumer_set_version: str  # e.g. "resource_version:12345"
+    rotation_strategy: str  # e.g. "dual_login_role"
+    reload_strategy: str  # e.g. "rolling_restart"
+    approval_policy_ref: Optional[str] = None  # e.g. "policy:high-risk-rotation"
+    evidence_store_ref: Optional[str] = None  # e.g. "s3://security-evidence/..."
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "credential_set_id": self.credential_set_id,
+            "provider_ref": self.provider_ref,
+            "provider_identity_ref": self.provider_identity_ref,
+            "secret_authority_ref": self.secret_authority_ref,
+            "consumer_set_ref": self.consumer_set_ref,
+            "consumer_set_version": self.consumer_set_version,
+            "rotation_strategy": self.rotation_strategy,
+            "reload_strategy": self.reload_strategy,
+            "approval_policy_ref": self.approval_policy_ref,
+            "evidence_store_ref": self.evidence_store_ref,
+        }
+
+
+@dataclass(frozen=True)
 class RotationEligibility:
     """Canonical rotation eligibility decision for a credential set.
 
@@ -467,6 +508,68 @@ class RotationBlocked(Exception):
         )
 
 
+@dataclass(frozen=True)
+class WorkflowExecutionAuthorization:
+    """Workflow-level execution authorization for high-tier rotations.
+
+    This is distinct from RotationEligibility (provider capability
+    readiness). For high-tier credentials, eligibility.eligible means
+    provider-ready, but the workflow must also obtain execution
+    authorization before any mutation activity.
+
+    The workflow must call both:
+        provider_eligibility = evaluate_rotation_eligibility(...)
+        execution_authorization = evaluate_workflow_execution_policy(...)
+
+    And require both before mutation:
+        if not provider_eligibility.eligible:
+            raise RotationBlocked(...)
+        if not execution_authorization.authorized:
+            raise RotationBlocked(...)
+
+    For critical-tier credentials, execution gates are already evaluated
+    by evaluate_rotation_eligibility(). This authorization is an
+    additional workflow-level check for high and critical tiers.
+    """
+
+    credential_set_id: str
+    risk_tier: str
+    authorized: bool
+    blockers: tuple[str, ...]
+    evaluated_at: str  # ISO timestamp
+    policy_version: str
+
+    # Execution checks that the workflow policy must evaluate
+    immutable_evidence_sink_available: bool = False
+    rollback_plan_validated: bool = False
+    approval_requirement_resolved: bool = False
+    cutover_scope_matches_approved_plan: bool = False
+    no_active_incident_freeze: bool = False
+
+    @property
+    def all_blockers(self) -> tuple[str, ...]:
+        """List of missing execution checks."""
+        missing: list[str] = list(self.blockers)
+        if not self.immutable_evidence_sink_available:
+            missing.append("immutable_evidence_sink_unavailable")
+        if not self.rollback_plan_validated:
+            missing.append("rollback_plan_not_validated")
+        if not self.approval_requirement_resolved:
+            missing.append("approval_requirement_unresolved")
+        if not self.cutover_scope_matches_approved_plan:
+            missing.append("cutover_scope_mismatch")
+        if not self.no_active_incident_freeze:
+            missing.append("active_incident_freeze")
+        # Deduplicate
+        seen: set[str] = set()
+        result: list[str] = []
+        for b in missing:
+            if b not in seen:
+                seen.add(b)
+                result.append(b)
+        return tuple(result)
+
+
 # Valid risk tiers for input validation
 _VALID_RISK_TIERS = frozenset(ALL_RISK_TIERS)
 
@@ -483,13 +586,18 @@ def _utc_now_iso() -> str:
 
 def _compute_input_fingerprint(
     *,
-    credential_set_id: str,
+    subject: RotationSubject,
     risk_tier: str,
     capabilities: RotationCapabilities,
     gates: Optional[RotationExecutionGates],
     policy_version: str,
 ) -> str:
     """Compute a SHA-256 fingerprint binding the decision to its inputs.
+
+    The fingerprint covers the full RotationSubject (provider identity,
+    secret-authority path, consumer set, rotation strategy, reload
+    strategy, approval/evidence refs) plus risk tier, capabilities,
+    gates, and policy version.
 
     The workflow should reevaluate eligibility if this fingerprint no
     longer matches because material conditions changed.
@@ -498,7 +606,7 @@ def _compute_input_fingerprint(
     import json
 
     payload = {
-        "credential_set_id": credential_set_id,
+        "subject": subject.to_dict(),
         "risk_tier": risk_tier,
         "capabilities": capabilities.to_dict(),
         "gates": {
@@ -539,7 +647,7 @@ def _validate_eligibility_inputs(
 
 def evaluate_rotation_eligibility(
     *,
-    credential_set_id: str,
+    subject: RotationSubject,
     risk_tier: str,
     capabilities: RotationCapabilities,
     gates: Optional[RotationExecutionGates] = None,
@@ -551,14 +659,24 @@ def evaluate_rotation_eligibility(
     (enrollment workflow, rotation workflow, CRD status, dashboards)
     should call this rather than implementing their own readiness check.
 
+    The subject parameter binds the decision to the exact provider
+    identity, secret-authority path, consumer set, rotation strategy,
+    and reload strategy under evaluation. If any of these change, the
+    input_fingerprint will differ, signaling that the decision is stale.
+
     Policy on execution gates by tier:
 
     | Tier | Provider capability requirements | Execution gate requirements |
     |---|---|---|
     | Low | Base 6 capabilities | None beyond standard workflow execution |
     | Medium | Base + overlap | None beyond standard workflow execution |
-    | High | Base + overlap + audit/owner/rollback | Not evaluated by this function. High-tier execution controls (immutable evidence, rollback verification, policy-defined approval) are enforced by the workflow policy at start time. This is intentional: high-tier eligibility means provider-ready, while execution gating is a workflow-level concern. |
-    | Critical | Same as High | Full critical gates required: approval policy, canary cutover, immutable evidence, emergency recovery. gates=None is treated as not eligible. |
+    | High | Base + overlap + audit/owner/rollback | Not evaluated by this function. High-tier execution controls (immutable evidence, rollback verification, policy-defined approval) are enforced by the workflow policy at start time via WorkflowExecutionAuthorization. This is intentional: high-tier eligibility means provider-ready, while execution gating is a workflow-level concern. |
+    | Critical | Same as High | Full critical gates required: approval policy, canary cutover, immutable evidence, emergency recovery. gates=None is treated as not eligible. WorkflowExecutionAuthorization is also required. |
+
+    For high and critical tiers, the workflow must obtain BOTH:
+        provider_eligibility = evaluate_rotation_eligibility(...)
+        execution_authorization = evaluate_workflow_execution_policy(...)
+    And require both before any mutation activity.
 
     Note: approval_policy_configured=True means the system knows when
     and how approval is required — it does NOT mean an approval has been
@@ -566,11 +684,12 @@ def evaluate_rotation_eligibility(
     track the actual approval signal.
 
     Raises:
-        ValueError: If risk_tier is not a recognized tier, credential_set_id
-            does not match the identifier grammar, or policy_version is empty.
+        ValueError: If risk_tier is not a recognized tier, subject
+            credential_set_id does not match the identifier grammar,
+            or policy_version is empty.
     """
     _validate_eligibility_inputs(
-        credential_set_id=credential_set_id,
+        credential_set_id=subject.credential_set_id,
         risk_tier=risk_tier,
         policy_version=policy_version,
     )
@@ -589,12 +708,12 @@ def evaluate_rotation_eligibility(
         # High-tier and below: execution gates are intentionally not
         # evaluated here. High-tier execution controls (immutable evidence,
         # rollback verification, approval) are enforced by the workflow
-        # policy at start time, not by this generic evaluator.
+        # policy at start time via WorkflowExecutionAuthorization.
         execution_ready = True
         execution_blockers = ()
 
     fingerprint = _compute_input_fingerprint(
-        credential_set_id=credential_set_id,
+        subject=subject,
         risk_tier=risk_tier,
         capabilities=capabilities,
         gates=gates,
@@ -602,7 +721,7 @@ def evaluate_rotation_eligibility(
     )
 
     return RotationEligibility(
-        credential_set_id=credential_set_id,
+        credential_set_id=subject.credential_set_id,
         risk_tier=risk_tier,
         provider_ready=provider_ready,
         execution_ready=execution_ready,
