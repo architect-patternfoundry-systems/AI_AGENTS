@@ -188,6 +188,11 @@ class CredentialPostureEntry:
     enrollment_deadline: Optional[str]
     recommended_next_action: str
     input_fingerprint: str  # from RotationEligibility
+    # Correlation metadata — marks records as unconfirmed candidates
+    # until a correlation service merges them with high-confidence evidence.
+    correlation_status: str = "unconfirmed"  # "unconfirmed", "confirmed", "merged"
+    correlation_basis: tuple[str, ...] = ()  # e.g. ("workload_reference",)
+    requires_owner_confirmation: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -209,6 +214,9 @@ class CredentialPostureEntry:
             "enrollment_deadline": self.enrollment_deadline,
             "recommended_next_action": self.recommended_next_action,
             "input_fingerprint": self.input_fingerprint,
+            "correlation_status": self.correlation_status,
+            "correlation_basis": list(self.correlation_basis),
+            "requires_owner_confirmation": self.requires_owner_confirmation,
         }
 
 
@@ -364,6 +372,20 @@ class PostureReport:
                 f"| {entry.risk_tier} | {eligible_str} "
                 f"| {blockers_str} | {entry.recommended_next_action} |"
             )
+
+        # Correlation notice
+        unconfirmed = sum(1 for e in self.entries if e.correlation_status == "unconfirmed")
+        if unconfirmed > 0:
+            lines.extend([
+                f"",
+                f"## Correlation notice",
+                f"",
+                f"{unconfirmed} credential(s) have **unconfirmed** correlation status. "
+                f"These are candidate records derived from workload references and "
+                f"have not been merged into canonical credential identities. "
+                f"Do not treat candidate IDs as managed credential identifiers.",
+            ])
+
         return "\n".join(lines)
 
 
@@ -418,6 +440,9 @@ def build_posture_entry(
     eligibility: RotationEligibility,
     exposure_status: str = "unknown",
     last_observed_use: Optional[str] = None,
+    correlation_status: str = "unconfirmed",
+    correlation_basis: tuple[str, ...] = ("workload_reference",),
+    requires_owner_confirmation: bool = True,
 ) -> CredentialPostureEntry:
     """Build a posture entry from an inventory record and eligibility decision.
 
@@ -472,6 +497,9 @@ def build_posture_entry(
         enrollment_deadline=record.enrollment_deadline,
         recommended_next_action=recommended,
         input_fingerprint=eligibility.input_fingerprint,
+        correlation_status=correlation_status,
+        correlation_basis=correlation_basis,
+        requires_owner_confirmation=requires_owner_confirmation,
     )
 
 

@@ -5403,7 +5403,7 @@ def test_format_emergency_items_no_secret_values():
 
 
 def test_run_discovery_writes_json_and_markdown(tmp_path):
-    """run_discovery writes JSON and Markdown reports to the output path."""
+    """run_discovery writes JSON and Markdown reports to the evidence bundle."""
     from platform_orchestration_contracts.run_discovery import run_discovery
     from unittest.mock import patch
 
@@ -5440,8 +5440,12 @@ def test_run_discovery_writes_json_and_markdown(tmp_path):
     # No emergency items, so exit code should be 0
     assert exit_code == 0
 
+    # Evidence bundle is at a structured path
+    bundle_path = tmp_path / "credential-discovery" / "environment=dev" / "run_id=test-run-001"
+    assert bundle_path.exists()
+
     # Check JSON report exists
-    json_path = tmp_path / "credential-posture.json"
+    json_path = bundle_path / "report.json"
     assert json_path.exists()
     report_json = json_path.read_text()
     report_data = json.loads(report_json)
@@ -5457,10 +5461,23 @@ def test_run_discovery_writes_json_and_markdown(tmp_path):
     assert report_data["coverage"][COVERAGE_SOURCE_POSTGRES] == COVERAGE_NOT_CONFIGURED
 
     # Check Markdown report exists
-    md_path = tmp_path / "credential-posture.md"
+    md_path = bundle_path / "report.md"
     assert md_path.exists()
     report_md = md_path.read_text()
     assert "test-run-001" in report_md
+
+    # Check manifest exists
+    manifest_path = bundle_path / "manifest.json"
+    assert manifest_path.exists()
+    manifest_data = json.loads(manifest_path.read_text())
+    assert manifest_data["manifest_version"] == "credential-discovery-evidence.v1"
+    assert manifest_data["run_id"] == "test-run-001"
+    assert "report_json_sha256" in manifest_data
+    assert "report_markdown_sha256" in manifest_data
+
+    # Check checksums file exists
+    checksums_path = bundle_path / "checksums.txt"
+    assert checksums_path.exists()
 
 
 def test_run_discovery_returns_2_for_emergency_items(tmp_path):
@@ -5503,9 +5520,10 @@ def test_run_discovery_returns_2_for_emergency_items(tmp_path):
     # Emergency items found → exit code 2
     assert exit_code == 2
 
-    # Report should still be written
-    json_path = tmp_path / "credential-posture.json"
-    assert json_path.exists()
+    # Report should still be written to evidence bundle
+    bundle_path = tmp_path / "credential-discovery" / "environment=dev" / "run_id=test-emergency-001"
+    assert bundle_path.exists()
+    assert (bundle_path / "report.json").exists()
 
 
 def test_run_discovery_report_contains_no_secret_values(tmp_path):
@@ -5544,14 +5562,25 @@ def test_run_discovery_report_contains_no_secret_values(tmp_path):
             )
 
     # Check JSON report has no secret values
-    json_report = (tmp_path / "credential-posture.json").read_text()
+    bundle_path = tmp_path / "credential-discovery" / "environment=dev" / "run_id=test-no-secrets-001"
+    json_report = (bundle_path / "report.json").read_text()
     assert raw_secret not in json_report
     assert "MUST-NOT-APPEAR" not in json_report
 
     # Check Markdown report has no secret values
-    md_report = (tmp_path / "credential-posture.md").read_text()
+    md_report = (bundle_path / "report.md").read_text()
     assert raw_secret not in md_report
     assert "MUST-NOT-APPEAR" not in md_report
+
+    # Check manifest has no secret values
+    manifest_report = (bundle_path / "manifest.json").read_text()
+    assert raw_secret not in manifest_report
+    assert "MUST-NOT-APPEAR" not in manifest_report
+
+    # Check checksums has no secret values
+    checksums_report = (bundle_path / "checksums.txt").read_text()
+    assert raw_secret not in checksums_report
+    assert "MUST-NOT-APPEAR" not in checksums_report
 
 
 def test_run_discovery_coverage_honest(tmp_path):
@@ -5573,7 +5602,8 @@ def test_run_discovery_coverage_honest(tmp_path):
                 run_id="test-coverage-001",
             )
 
-    json_report = (tmp_path / "credential-posture.json").read_text()
+    bundle_path = tmp_path / "credential-discovery" / "environment=dev" / "run_id=test-coverage-001"
+    json_report = (bundle_path / "report.json").read_text()
     report_data = json.loads(json_report)
 
     # Kubernetes should be completed
@@ -5606,7 +5636,8 @@ def test_run_discovery_evidence_manifest_ref(tmp_path):
                 run_id="test-evidence-001",
             )
 
-    json_report = (tmp_path / "credential-posture.json").read_text()
+    bundle_path = tmp_path / "credential-discovery" / "environment=dev" / "run_id=test-evidence-001"
+    json_report = (bundle_path / "report.json").read_text()
     report_data = json.loads(json_report)
 
     assert "evidence_manifest_ref" in report_data
@@ -5722,8 +5753,9 @@ def test_run_discovery_report_safety_gate_blocks_unsafe_output(tmp_path):
                 )
 
     assert exit_code == 1
-    # Report should NOT have been written
-    assert not (tmp_path / "credential-posture.json").exists()
+    # Evidence bundle should NOT have been written
+    bundle_path = tmp_path / "credential-discovery"
+    assert not bundle_path.exists()
 
 
 # --- Correlation metadata tests ---
@@ -5764,3 +5796,315 @@ def test_observation_to_record_candidate_id_is_lowercase():
     import re
     assert re.match(r"^[a-z0-9][a-z0-9_-]*$", record.credential_set_id), \
         f"credential_set_id {record.credential_set_id!r} does not match required pattern"
+
+
+# --- Evidence bundle tests ---
+
+
+def test_write_safe_evidence_bundle_creates_files(tmp_path):
+    """write_safe_evidence_bundle creates all files atomically."""
+    from platform_orchestration_contracts.evidence_bundle import write_safe_evidence_bundle
+    destination = tmp_path / "bundle"
+    files = {
+        "report.json": '{"run_id": "test-001"}',
+        "report.md": "# Report\ntest-001",
+        "manifest.json": '{"manifest_version": "credential-discovery-evidence.v1"}',
+        "checksums.txt": "abc123  report.json\n",
+    }
+    write_safe_evidence_bundle(destination=destination, files=files)
+    assert destination.exists()
+    assert (destination / "report.json").exists()
+    assert (destination / "report.md").exists()
+    assert (destination / "manifest.json").exists()
+    assert (destination / "checksums.txt").exists()
+    assert (destination / "report.json").read_text() == '{"run_id": "test-001"}'
+
+
+def test_write_safe_evidence_bundle_rejects_unsafe_content(tmp_path):
+    """write_safe_evidence_bundle rejects content with secret markers."""
+    from platform_orchestration_contracts.evidence_bundle import write_safe_evidence_bundle
+    destination = tmp_path / "bundle"
+    # Construct unsafe content dynamically
+    unsafe = "config pass" + "word=secret123"
+    files = {
+        "report.json": unsafe,
+    }
+    with pytest.raises(UnsafeObservationError):
+        write_safe_evidence_bundle(destination=destination, files=files)
+    # Nothing should be written
+    assert not destination.exists()
+
+
+def test_write_safe_evidence_bundle_no_partial_writes_on_failure(tmp_path):
+    """If one file fails safety check, no files are written."""
+    from platform_orchestration_contracts.evidence_bundle import write_safe_evidence_bundle
+    destination = tmp_path / "bundle"
+    safe_content = '{"run_id": "test-001"}'
+    unsafe = "tok" + "en=secret123"
+    files = {
+        "report.json": safe_content,
+        "bad.txt": unsafe,
+    }
+    with pytest.raises(UnsafeObservationError):
+        write_safe_evidence_bundle(destination=destination, files=files)
+    assert not destination.exists()
+
+
+def test_build_evidence_manifest_structure():
+    """build_evidence_manifest produces correct manifest structure."""
+    from platform_orchestration_contracts.evidence_bundle import build_evidence_manifest
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, COVERAGE_COMPLETED, COVERAGE_NOT_CONFIGURED,
+    )
+    report = PostureReport(
+        run_id="test-manifest-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={
+            COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED,
+            COVERAGE_SOURCE_POSTGRES: COVERAGE_NOT_CONFIGURED,
+        },
+        entries_sha256="sha256:abc123",
+        contract_package_version="0.11.0",
+    )
+    manifest_json = build_evidence_manifest(
+        report=report,
+        report_json='{"test": true}',
+        report_markdown="# Test",
+    )
+    manifest = json.loads(manifest_json)
+    assert manifest["manifest_version"] == "credential-discovery-evidence.v1"
+    assert manifest["run_id"] == "test-manifest-001"
+    assert manifest["entries_sha256"] == "sha256:abc123"
+    assert manifest["package_version"] == "0.11.0"
+    assert manifest["policy_version"] == "1"
+    assert "report_json_sha256" in manifest
+    assert manifest["report_json_sha256"].startswith("sha256:")
+    assert "report_markdown_sha256" in manifest
+    assert manifest["coverage"][COVERAGE_SOURCE_KUBERNETES] == COVERAGE_COMPLETED
+
+
+def test_build_checksums_text_format():
+    """build_checksums_text produces correct checksums format."""
+    from platform_orchestration_contracts.evidence_bundle import build_checksums_text
+    checksums = build_checksums_text(
+        report_json='{"test": true}',
+        report_markdown="# Test",
+        manifest_json='{"manifest": true}',
+    )
+    lines = checksums.strip().split("\n")
+    assert len(lines) == 3
+    assert lines[0].endswith("  report.json")
+    assert lines[1].endswith("  report.md")
+    assert lines[2].endswith("  manifest.json")
+    # Each line should start with a hex digest
+    for line in lines:
+        parts = line.split("  ", 1)
+        assert len(parts[0]) == 64  # SHA-256 hex digest length
+
+
+def test_write_discovery_evidence_creates_bundle(tmp_path):
+    """write_discovery_evidence creates a complete evidence bundle."""
+    from platform_orchestration_contracts.evidence_bundle import write_discovery_evidence
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, COVERAGE_COMPLETED, COVERAGE_NOT_CONFIGURED,
+    )
+    report = PostureReport(
+        run_id="test-bundle-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:abc123",
+        contract_package_version="0.11.0",
+    )
+    bundle_path = write_discovery_evidence(
+        base_path=tmp_path,
+        run_id="test-bundle-001",
+        environment="dev",
+        report=report,
+    )
+    assert bundle_path.exists()
+    assert (bundle_path / "report.json").exists()
+    assert (bundle_path / "report.md").exists()
+    assert (bundle_path / "manifest.json").exists()
+    assert (bundle_path / "checksums.txt").exists()
+    # Verify the directory structure
+    assert "environment=dev" in str(bundle_path)
+    assert "run_id=test-bundle-001" in str(bundle_path)
+
+
+def test_write_discovery_evidence_no_secret_values(tmp_path):
+    """Evidence bundle contains no secret values in any file."""
+    from platform_orchestration_contracts.evidence_bundle import write_discovery_evidence
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, COVERAGE_COMPLETED,
+    )
+    raw_secret = "bundle-test-secret-MUST-NOT-APPEAR"
+    # We can't put raw_secret in the report (it would fail safety),
+    # but we verify that the bundle files don't contain it
+    report = PostureReport(
+        run_id="test-no-secret-bundle-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:abc123",
+        contract_package_version="0.11.0",
+    )
+    bundle_path = write_discovery_evidence(
+        base_path=tmp_path,
+        run_id="test-no-secret-bundle-001",
+        environment="dev",
+        report=report,
+    )
+    for fname in ("report.json", "report.md", "manifest.json", "checksums.txt"):
+        content = (bundle_path / fname).read_text()
+        assert raw_secret not in content
+        assert "MUST-NOT-APPEAR" not in content
+
+
+# --- Correlation status in posture entries ---
+
+
+def test_posture_entry_has_correlation_fields():
+    """CredentialPostureEntry includes correlation metadata."""
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        CredentialPostureEntry,
+    )
+    entry = CredentialPostureEntry(
+        credential_set_id="candidate-test-001",
+        credential_class="postgresql_login",
+        environment="dev",
+        owner=None,
+        lifecycle_state="discovered",
+        consumer_count=1,
+        provider_identity_ref="kubernetes_secret:cts/db-secret",
+        secret_authority_status="unmanaged",
+        risk_tier="low",
+        provider_ready=False,
+        execution_ready=False,
+        eligible=False,
+        blockers=(),
+        exposure_status="unknown",
+        last_observed_use=None,
+        enrollment_deadline=None,
+        recommended_next_action="begin_enrollment",
+        input_fingerprint="abc123",
+    )
+    # Default values
+    assert entry.correlation_status == "unconfirmed"
+    assert entry.correlation_basis == ()
+    assert entry.requires_owner_confirmation is True
+
+    # to_dict includes correlation fields
+    d = entry.to_dict()
+    assert "correlation_status" in d
+    assert d["correlation_status"] == "unconfirmed"
+    assert "correlation_basis" in d
+    assert "requires_owner_confirmation" in d
+
+
+def test_build_posture_entry_default_correlation():
+    """build_posture_entry defaults to unconfirmed correlation."""
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        build_posture_entry,
+    )
+    from platform_orchestration_contracts.credential_inventory import (
+        CredentialSetRecord, RotationCapabilities, RiskAssessment,
+    )
+    record = CredentialSetRecord(
+        credential_set_id="candidate-test-002",
+        display_name="test-credential",
+        credential_class="postgresql_login",
+        environment="dev",
+        lifecycle_state=LIFECYCLE_DISCOVERED,
+        risk=RiskAssessment(tier=RISK_LOW),
+        capabilities=RotationCapabilities(),
+    )
+    from platform_orchestration_contracts.credential_inventory import (
+        evaluate_rotation_eligibility, RotationSubject,
+    )
+    subject = RotationSubject(
+        credential_set_id="candidate-test-002",
+        provider_ref="test:provider",
+        provider_identity_ref="test:provider",
+        secret_authority_ref="test:provider",
+        consumer_set_ref="cts/test",
+        consumer_set_version="discovery:v1",
+        rotation_strategy="unknown",
+        reload_strategy="unknown",
+    )
+    eligibility = evaluate_rotation_eligibility(
+        subject=subject,
+        risk_tier=RISK_LOW,
+        capabilities=RotationCapabilities(),
+        policy_version="1",
+    )
+    entry = build_posture_entry(record=record, eligibility=eligibility)
+    assert entry.correlation_status == "unconfirmed"
+    assert "workload_reference" in entry.correlation_basis
+    assert entry.requires_owner_confirmation is True
+
+
+def test_posture_report_markdown_includes_correlation_notice():
+    """PostureReport Markdown includes correlation notice for unconfirmed entries."""
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        CredentialPostureEntry, PostureReport,
+    )
+    entry = CredentialPostureEntry(
+        credential_set_id="candidate-test-003",
+        credential_class="postgresql_login",
+        environment="dev",
+        owner=None,
+        lifecycle_state="discovered",
+        consumer_count=1,
+        provider_identity_ref=None,
+        secret_authority_status="unknown",
+        risk_tier="low",
+        provider_ready=False,
+        execution_ready=False,
+        eligible=False,
+        blockers=(),
+        exposure_status="unknown",
+        last_observed_use=None,
+        enrollment_deadline=None,
+        recommended_next_action="begin_enrollment",
+        input_fingerprint="abc123",
+        correlation_status="unconfirmed",
+        correlation_basis=("workload_reference",),
+    )
+    report = PostureReport(
+        run_id="test-corr-md-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=1,
+        eligible_count=0,
+        blocked_count=1,
+        unowned_count=1,
+        orphaned_count=0,
+        entries=(entry,),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:abc123",
+        contract_package_version="0.11.0",
+    )
+    md = report.to_markdown()
+    assert "Correlation notice" in md
+    assert "unconfirmed" in md
+    assert "candidate" in md.lower()

@@ -77,6 +77,7 @@ from .observation_safety import (
     assert_observations_safe,
     assert_safe_report_text,
 )
+from .evidence_bundle import write_discovery_evidence, build_evidence_manifest
 
 logger = logging.getLogger("platform_orchestration_contracts.run_discovery")
 
@@ -352,23 +353,33 @@ def run_discovery(
         )
         return 1
 
-    # Write reports
+    # Write evidence bundle
     if output_path:
         output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        output_file.write_text(report_json, encoding="utf-8")
-        logger.info(
-            "JSON report written",
-            extra={"path": str(output_file), "bytes": len(report_json)},
-        )
+        if output_file.suffix == ".json":
+            # Treat as base directory for evidence bundle
+            base_path = output_file.parent
+        else:
+            base_path = output_file
 
-        # Also write Markdown report alongside
-        md_path = output_file.with_suffix(".md")
-        md_path.write_text(report_md, encoding="utf-8")
-        logger.info(
-            "Markdown report written",
-            extra={"path": str(md_path)},
-        )
+        try:
+            bundle_path = write_discovery_evidence(
+                base_path=base_path,
+                run_id=run_id,
+                environment=environment,
+                report=report,
+            )
+            logger.info(
+                "Evidence bundle written",
+                extra={"path": str(bundle_path)},
+            )
+            print(f"Evidence bundle: {bundle_path}", file=sys.stderr)
+        except UnsafeObservationError as e:
+            logger.error(
+                "Unsafe evidence content detected — aborting before write",
+                extra={"observation_id": e.observation_id, "marker": getattr(e, "marker", "")},
+            )
+            return 1
     else:
         print(report_json)
 
