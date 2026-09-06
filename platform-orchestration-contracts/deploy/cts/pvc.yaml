@@ -1,0 +1,34 @@
+# PersistentVolumeClaim for durable credential discovery evidence storage.
+#
+# emptyDir is erased when the Pod is deleted, and the Job has a 1-hour TTL.
+# This PVC ensures posture reports survive Job cleanup so operators can
+# retrieve evidence after the fact.
+#
+# For steady-state, replace this with a write-only S3/MinIO prefix:
+#   s3://security-evidence/credential-discovery/
+#     environment=dev/
+#       date=YYYY-MM-DD/
+#         run_id=discovery-.../
+#           report.json
+#           report.md
+#           evidence-manifest.json
+#
+# The Job should receive only a scoped writer identity for that prefix,
+# not a general MinIO root or broad app credential.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: credential-discovery-evidence
+  namespace: cts
+  labels:
+    app.kubernetes.io/name: credential-discovery
+    app.kubernetes.io/component: evidence-storage
+    app.kubernetes.io/part-of: platform-orchestration-contracts
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 256Mi
+  # storageClassName: <your-storage-class>  # set if not using default

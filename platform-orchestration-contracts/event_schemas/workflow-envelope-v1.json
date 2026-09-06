@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://patternfoundry.dev/schemas/workflow-envelope-v1.json",
+  "title": "Workflow Input Envelope v1",
+  "description": "Standard envelope for every Temporal workflow start (ADR-036).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "workflow_id",
+    "workflow_type",
+    "source_app",
+    "tenant_id",
+    "idempotency_key",
+    "requested_by",
+    "input_ref"
+  ],
+  "properties": {
+    "contract_version": { "type": "string", "default": "1.0", "description": "Serialization/schema compatibility version, distinct from workflow_type and package version" },
+    "request_id": { "type": "string", "minLength": 1 },
+    "workflow_id": {
+      "type": "string",
+      "pattern": "^[a-z]+:[a-z0-9-]+:[A-Za-z0-9][A-Za-z0-9_.\\-]*(:[A-Za-z0-9][A-Za-z0-9_.\\-]*:[A-Za-z0-9][A-Za-z0-9_.\\-]*)*$"
+    },
+    "workflow_type": { "type": "string", "minLength": 1 },
+    "source_app": { "type": "string", "minLength": 1 },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": ["string", "null"] },
+    "correlation_id": { "type": ["string", "null"] },
+    "causation_id": { "type": ["string", "null"] },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "requested_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_id"],
+      "properties": {
+        "subject_id": { "type": "string", "minLength": 1 },
+        "actor_type": {
+          "type": "string",
+          "enum": ["user", "service", "agent"],
+          "default": "user"
+        }
+      }
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["interactive", "batch", "background"],
+      "default": "batch"
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "approval_required": { "type": "boolean", "default": false },
+        "approval_policy": { "type": ["string", "null"] },
+        "dry_run": { "type": "boolean", "default": false },
+        "force_regenerate": { "type": "boolean", "default": false },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "input_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "uri", "checksum"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["s3-json-manifest", "s3-archive", "inline-json"]
+        },
+        "uri": { "type": "string", "minLength": 1 },
+        "checksum": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

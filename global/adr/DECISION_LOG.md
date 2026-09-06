@@ -23,6 +23,15 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-027 | Standardize ToneRoot Logging | Accepted | 2026-08-01 | Platform Team | Observability |
 | ADR-028 | Service Delivery and Break-Glass Recovery Framework | Accepted (Certified) | 2026-08-16 | Platform Team | Infrastructure |
 | ADR-029 | Continuous DR Runbook Graph and Automated Recertification | Accepted | 2026-08-17 | Platform Team | Operations |
+| ADR-030 | Model Caches Use Static Local PVs on cortex | Accepted (Implemented) | 2026-08-19 | Platform Team | Infrastructure |
+| ADR-031 | Change Impact Analysis & Stakeholder Governance | Accepted | 2026-08-20 | Platform Team | Governance |
+| ADR-032 | Federated Governance & Multi-Plane Evidence Architecture | Accepted | 2026-08-22 | Platform Team | Governance |
+| ADR-033 | ML Model Storage Patterns | Accepted | 2026-08-25 | Platform Team | Infrastructure |
+| ADR-034 | ML Model Storage Vulnerability FMEA | Accepted | 2026-08-26 | Platform Team | Security |
+| ADR-035 | CTS Temporal Pilot — Ollama Lease Wiring | Accepted (Implementation Gated) | 2026-09-04 | Platform Team | Architecture |
+| ADR-036 | Temporal Integration Standard — Cross-App Durable Orchestration | Accepted | 2026-09-05 | Platform Team | Architecture |
+| ADR-037 | Credential Rotation Lifecycle Workflow | Proposed | 2026-09-05 | Platform Team | Security |
+| ADR-038 | Credential Discovery, Inventory, and Enrollment Standard | Proposed | 2026-09-05 | Platform Team | Security |
 
 ## Categories
 
@@ -50,7 +59,7 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 
 ## Document Control
 
-**Version:** 1.2  
-**Last Updated:** August 17, 2026  
-**Next Review:** Monthly  
+**Version:** 1.3
+**Last Updated:** September 5, 2026
+**Next Review:** Monthly
 **Maintained By:** AI_AGENTS Governance Team

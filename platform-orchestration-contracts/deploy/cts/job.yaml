@@ -1,0 +1,120 @@
+# One-shot credential discovery Job for the CTS namespace.
+#
+# This Job runs a single discovery scan and writes the redacted posture
+# report to a durable evidence volume (PVC). It is NOT a recurring
+# schedule — validate the first run against the acceptance checklist
+# before scheduling daily execution.
+#
+# SECURITY PROPERTIES:
+# - Namespace-scoped to cts via serviceAccountName
+# - No Secret data reads (RBAC Role omits core/secrets)
+# - No Kubernetes mutations (read-only verbs only)
+# - No database, MinIO, or provider credentials
+# - readOnlyRootFilesystem and runAsNonRoot
+# - All capabilities dropped
+# - backoffLimit: 0 (no retries — investigate failures manually)
+# - ttlSecondsAfterFinished: 3600 (clean up Job object, not PVC)
+# - Evidence stored on PVC (survives Job cleanup)
+#
+# EXIT CODES:
+#   0 — scan completed, no emergency findings
+#   1 — scan failed (API error, validation error)
+#   2 — scan completed but found active_in_source exposures
+#       (treat as success-with-urgent-findings, not scanner failure)
+#
+# IMAGE: Replace <pinned-image-digest> with the actual image digest.
+# Pin by digest (not tag) for the first security-sensitive run.
+#
+# PREREQUISITES:
+#   Use the repeatable scan script for the full preflight + execution sequence:
+#     ./deploy/cts/run-one-shot-scan.sh --all --image <pinned-digest>
+#
+#   Or apply manually:
+#   kubectl apply -f deploy/cts/rbac.yaml
+#   kubectl apply -f deploy/cts/pvc.yaml
+#   # Verify negative permission:
+#   kubectl auth can-i get secrets \
+#     --as=system:serviceaccount:cts:credential-discovery-kubernetes -n cts
+#   # Must return: no
+#   # Verify positive permission:
+#   kubectl auth can-i list deployments \
+#     --as=system:serviceaccount:cts:credential-discovery-kubernetes -n cts
+#   # Must return: yes
+#
+# ACCEPTANCE CHECKLIST (verify before scheduling daily):
+# 1. Service account cannot read Kubernetes Secrets
+# 2. Client scans only namespace cts
+# 3. cts-backend and cts-watchdog credential references are identified
+# 4. Inline values become inline_value_present=true, never in output
+# 5. secretKeyRef / envFrom / Secret-volume references classified correctly
+# 6. PostgreSQL, MinIO, and Git-finding coverage are not_configured
+# 7. JSON and Markdown reports carry run_id, report_version, package_version,
+#    coverage, limitations, entries_sha256, evidence_manifest_ref
+# 8. Logs contain no DSN, password, token, private-key, or raw API object
+# 9. Job makes no cluster mutations
+# 10. Any active_in_source observation is opened as emergency remediation
+# 11. Reports survive on PVC after Job TTL cleanup
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: credential-discovery-cts-once
+  namespace: cts
+  labels:
+    app.kubernetes.io/name: credential-discovery
+    app.kubernetes.io/component: kubernetes-adapter
+    app.kubernetes.io/part-of: platform-orchestration-contracts
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: credential-discovery
+        app.kubernetes.io/component: kubernetes-adapter
+    spec:
+      serviceAccountName: credential-discovery-kubernetes
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: discovery
+          # Replace with actual pinned image digest:
+          # image: registry-bridge.tailc2cafc.ts.net/credential-discovery@sha256:<digest>
+          image: <pinned-image-digest>
+          imagePullPolicy: IfNotPresent
+          args:
+            - python
+            - -m
+            - platform_orchestration_contracts.run_discovery
+            - --namespace=cts
+            - --sources=kubernetes
+            - --output=/evidence/credential-posture.json
+            - --environment=dev
+            - --log-level=WARNING
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: evidence
+              mountPath: /evidence
+              readOnly: false
+      volumes:
+        - name: evidence
+          persistentVolumeClaim:
+            claimName: credential-discovery-evidence
