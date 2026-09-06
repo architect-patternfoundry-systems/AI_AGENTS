@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "platform-orchestration-contracts"
-version = "0.11.2"
+version = "0.11.3"
 description = "Versioned schemas and adapters for cross-app Temporal workflow integration (ADR-036)"
 readme = "README.md"
 requires-python = ">=3.10"

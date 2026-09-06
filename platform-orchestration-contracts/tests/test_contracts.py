@@ -6621,3 +6621,253 @@ def test_one_shot_scan_script_help_works():
     )
     # --help should produce non-empty stderr and exit non-zero (usage)
     assert "USAGE" in result.stderr or "USAGE" in result.stdout
+
+
+def test_one_shot_scan_script_has_error_trap():
+    """The one-shot scan script has an ERR trap for safe error reporting."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    content = script_path.read_text()
+    assert "trap on_error ERR" in content
+    assert "CURRENT_STEP" in content
+    # Must NOT use set -x (tracing leaks commands)
+    assert "set -x" not in content
+
+
+def test_one_shot_scan_script_has_strict_options():
+    """The one-shot scan script uses strict bash options."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    content = script_path.read_text()
+    assert "set -Eeuo pipefail" in content
+    assert "IFS=" in content
+
+
+def test_one_shot_scan_script_has_configurable_coverage():
+    """The one-shot scan script supports --expect-source for coverage."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    content = script_path.read_text()
+    assert "--expect-source" in content
+    assert "EXPECT_COVERAGE" in content
+
+
+def test_one_shot_scan_script_has_registry_allowlist():
+    """The one-shot scan script supports --registry-allowlist."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    content = script_path.read_text()
+    assert "--registry-allowlist" in content
+    assert "REGISTRY_ALLOWLIST" in content
+
+
+def test_one_shot_scan_script_rejects_latest_tag():
+    """The one-shot scan script rejects :latest image tags."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    content = script_path.read_text()
+    assert ":latest" in content
+    # The check should be present
+    assert "must not use :latest" in content
+
+
+def test_one_shot_scan_script_protects_evidence_dir():
+    """The one-shot scan script sets restrictive permissions on evidence dir."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    content = script_path.read_text()
+    assert "chmod 0700" in content
+    assert "chmod -R go-rwx" in content
+    assert ".security-evidence" in content
+
+
+def test_compare_discovery_runs_script_syntax_valid():
+    """The compare-discovery-runs script passes bash syntax validation."""
+    import subprocess
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "compare-discovery-runs.sh"
+    result = subprocess.run(
+        ["bash", "-n", str(script_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"Bash syntax error: {result.stderr}"
+
+
+def test_compare_discovery_runs_script_is_executable():
+    """The compare-discovery-runs script has executable permissions."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "compare-discovery-runs.sh"
+    assert script_path.exists()
+    assert os.access(script_path, os.X_OK), "Script is not executable"
+
+
+def test_compare_discovery_runs_script_help_works():
+    """The compare-discovery-runs script --help produces usage output."""
+    import subprocess
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "compare-discovery-runs.sh"
+    result = subprocess.run(
+        ["bash", str(script_path), "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert "USAGE" in result.stderr or "USAGE" in result.stdout
+
+
+def test_compare_discovery_runs_produces_delta(tmp_path):
+    """compare-discovery-runs.sh produces a delta report from two bundles."""
+    import subprocess
+    from platform_orchestration_contracts.evidence_bundle import write_discovery_evidence
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, CredentialPostureEntry, COVERAGE_COMPLETED,
+    )
+
+    # Create a "before" bundle with active_in_source findings
+    before_entry = CredentialPostureEntry(
+        credential_set_id="candidate-test-before",
+        credential_class="postgresql_login",
+        environment="dev",
+        owner=None,
+        lifecycle_state="bootstrap_required",
+        consumer_count=1,
+        provider_identity_ref=None,
+        secret_authority_status="unknown",
+        risk_tier="high",
+        provider_ready=False,
+        execution_ready=False,
+        eligible=False,
+        blockers=(),
+        exposure_status="active_in_source",
+        last_observed_use=None,
+        enrollment_deadline=None,
+        recommended_next_action="emergency_rotation",
+        input_fingerprint="abc",
+    )
+    before_report = PostureReport(
+        run_id="compare-before-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=1,
+        eligible_count=0,
+        blocked_count=1,
+        unowned_count=1,
+        orphaned_count=0,
+        entries=(before_entry,),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:before",
+        contract_package_version=__version__,
+    )
+    before_dir = write_discovery_evidence(
+        base_path=tmp_path / "before",
+        run_id="compare-before-001",
+        environment="dev",
+        report=before_report,
+        exit_code=2,
+    )
+
+    # Create an "after" bundle with no findings (remediated)
+    after_report = PostureReport(
+        run_id="compare-after-001",
+        evaluated_at="2026-09-05T13:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:after",
+        contract_package_version=__version__,
+    )
+    after_dir = write_discovery_evidence(
+        base_path=tmp_path / "after",
+        run_id="compare-after-001",
+        environment="dev",
+        report=after_report,
+        exit_code=0,
+    )
+
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "compare-discovery-runs.sh"
+    result = subprocess.run(
+        ["bash", str(script_path), "--before", str(before_dir), "--after", str(after_dir)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"Script failed: {result.stderr}"
+    stderr = result.stderr
+
+    # Should show the delta
+    assert "DISCOVERY RUN COMPARISON" in stderr
+    assert "compare-before-001" in stderr
+    assert "compare-after-001" in stderr
+
+    # Should show remediation verified
+    assert "REMEDIATION VERIFIED" in stderr
+    assert "active_inline" in stderr.lower() or "active_inline_credentials" in stderr.lower()
+
+    # Should show scan status improvement
+    assert "SCAN STATUS IMPROVED" in stderr
+    assert "completed_with_findings" in stderr
+    assert "completed" in stderr
+
+
+def test_compare_discovery_runs_json_output(tmp_path):
+    """compare-discovery-runs.sh --json produces valid JSON."""
+    import subprocess
+    from platform_orchestration_contracts.evidence_bundle import write_discovery_evidence
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, COVERAGE_COMPLETED,
+    )
+
+    before_report = PostureReport(
+        run_id="compare-json-before",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:before",
+        contract_package_version=__version__,
+    )
+    before_dir = write_discovery_evidence(
+        base_path=tmp_path / "before",
+        run_id="compare-json-before",
+        environment="dev",
+        report=before_report,
+        exit_code=0,
+    )
+
+    after_report = PostureReport(
+        run_id="compare-json-after",
+        evaluated_at="2026-09-05T13:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:after",
+        contract_package_version=__version__,
+    )
+    after_dir = write_discovery_evidence(
+        base_path=tmp_path / "after",
+        run_id="compare-json-after",
+        environment="dev",
+        report=after_report,
+        exit_code=0,
+    )
+
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "compare-discovery-runs.sh"
+    result = subprocess.run(
+        ["bash", str(script_path), "--before", str(before_dir), "--after", str(after_dir), "--json"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"Script failed: {result.stderr}"
+    # stdout should contain valid JSON
+    data = json.loads(result.stdout)
+    assert "before" in data
+    assert "after" in data
+    assert data["before"]["run_id"] == "compare-json-before"
+    assert data["after"]["run_id"] == "compare-json-after"

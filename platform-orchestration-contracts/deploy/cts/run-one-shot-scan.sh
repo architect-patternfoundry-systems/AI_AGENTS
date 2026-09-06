@@ -12,18 +12,23 @@
 #   ./deploy/cts/run-one-shot-scan.sh [OPTIONS]
 #
 # OPTIONS:
-#   --namespace NS       Target namespace (default: cts)
-#   --environment ENV    Environment label for evidence path (default: dev)
-#   --image DIGEST       Pinned image reference (required for --apply-job)
-#   --apply-rbac         Apply RBAC manifests before checks
-#   --apply-pvc          Apply PVC manifest before checks
-#   --apply-job          Apply and run the one-shot Job (requires --image)
-#   --retrieve           Retrieve evidence bundle from PVC after Job completes
-#   --verify             Verify manifest, checksums, and safety of retrieved bundle
-#   --all                Equivalent to --apply-rbac --apply-pvc --apply-job --retrieve --verify
-#   --dry-run            Render manifests and print checks without applying
-#   --keep-job           Do not delete Job object after completion (for debugging)
-#   --help               Show this help
+#   --namespace NS          Target namespace (default: cts)
+#   --environment ENV       Environment label for evidence path (default: dev)
+#   --image DIGEST          Pinned image reference (required for --apply-job)
+#   --apply-rbac            Apply RBAC manifests before checks
+#   --apply-pvc             Apply PVC manifest before checks
+#   --apply-job             Apply and run the one-shot Job (requires --image)
+#   --retrieve              Retrieve evidence bundle from PVC after Job completes
+#   --verify                Verify manifest, checksums, and safety of retrieved bundle
+#   --all                   Equivalent to --apply-rbac --apply-pvc --apply-job --retrieve --verify
+#   --dry-run               Render manifests and print checks without applying
+#   --keep-job              Do not delete Job object after completion (for debugging)
+#   --expect-source S=ST    Expected coverage status for source S (repeatable)
+#                           Default: kubernetes=completed,postgres=not_configured,
+#                           minio=not_configured,git_findings=not_configured
+#   --registry-allowlist R  Allowed registry prefix (repeatable, default: allow all)
+#   --evidence-dir DIR      Local directory for retrieved evidence (default: ./.security-evidence)
+#   --help                  Show this help
 #
 # EXIT CODES:
 #   0 — scan completed, no emergency findings (scan_status=completed)
@@ -39,19 +44,35 @@
 # SAFETY PROPERTIES ENFORCED BY THIS SCRIPT:
 #   1. Negative RBAC checks: service account CANNOT read/list/watch Secrets
 #   2. Positive RBAC checks: service account CAN list required workload types
-#   3. Image must be pinned by digest (not mutable tag)
-#   4. Job has backoffLimit=0, runAsNonRoot, readOnlyRootFilesystem
-#   5. Evidence bundle is retrieved and verified after Job completion
-#   6. Manifest scan_status is checked against process exit code
-#   7. Checksums in manifest.json are verified against actual files
-#   8. Redacted reports are scanned for prohibited secret markers
+#   3. Image must be pinned by digest (not mutable tag, not :latest)
+#   4. Image registry must be in allowlist if specified
+#   5. Job has backoffLimit=0, runAsNonRoot, readOnlyRootFilesystem
+#   6. Evidence bundle is retrieved and verified after Job completion
+#   7. Manifest scan_status is checked against process exit code
+#   8. Checksums in manifest.json are verified against actual files
+#   9. Redacted reports are scanned for prohibited secret markers
+#  10. Local evidence directory has restrictive permissions (0700)
 #
 # This script is defense in depth. The primary safety boundary remains
 # architectural: raw values discarded at the API boundary, raw API
 # objects never escape the client, and only redacted safe models are
 # persisted.
 
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# --- Error trap (logs only step name and line, never commands) ----------------
+
+CURRENT_STEP="initialization"
+
+on_error() {
+    local exit_code=$?
+    printf 'ERROR: one-shot discovery failed at step=%s line=%s exit_code=%s\n' \
+        "$CURRENT_STEP" "$LINENO" "$exit_code" >&2
+    exit "$exit_code"
+}
+
+trap on_error ERR
 
 # --- Configuration -----------------------------------------------------------
 
@@ -66,9 +87,22 @@ VERIFY=false
 DRY_RUN=false
 KEEP_JOB=false
 
+# Coverage expectations — configurable via --expect-source
+# Defaults match the Phase 1 Kubernetes-only canary
+declare -A EXPECT_COVERAGE=(
+    [kubernetes]="completed"
+    [postgres]="not_configured"
+    [minio]="not_configured"
+    [git_findings]="not_configured"
+)
+
+# Registry allowlist — configurable via --registry-allowlist
+# Empty array means allow all (for initial canary)
+REGISTRY_ALLOWLIST=()
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-EVIDENCE_DIR="${EVIDENCE_DIR:-/tmp/cts-discovery-evidence}"
+EVIDENCE_DIR="${EVIDENCE_DIR:-${REPO_ROOT}/.security-evidence}"
 JOB_NAME="credential-discovery-cts-once"
 SA_NAME="credential-discovery-kubernetes"
 PVC_NAME="credential-discovery-evidence"
@@ -109,12 +143,32 @@ while [[ $# -gt 0 ]]; do
         --all)         APPLY_RBAC=true; APPLY_PVC=true; APPLY_JOB=true; RETRIEVE=true; VERIFY=true; shift ;;
         --dry-run)     DRY_RUN=true; shift ;;
         --keep-job)    KEEP_JOB=true; shift ;;
+        --expect-source)
+            if [[ "$2" != *=* ]]; then
+                fail "--expect-source requires S=STATUS format, got: $2"
+                exit 1
+            fi
+            local_src="${2%%=*}"
+            local_status="${2#*=}"
+            EXPECT_COVERAGE["${local_src}"]="${local_status}"
+            shift 2
+            ;;
+        --registry-allowlist)
+            REGISTRY_ALLOWLIST+=("$2")
+            shift 2
+            ;;
+        --evidence-dir)
+            EVIDENCE_DIR="$2"
+            shift 2
+            ;;
         --help|-h)     usage ;;
         *)             fail "Unknown option: $1"; usage ;;
     esac
 done
 
 # --- Preflight: tool checks --------------------------------------------------
+
+CURRENT_STEP="tool-checks"
 
 check_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -131,6 +185,8 @@ log "Tools verified: kubectl, sha256sum, jq"
 
 # --- Step 1: Apply RBAC ------------------------------------------------------
 
+CURRENT_STEP="apply-rbac"
+
 if $APPLY_RBAC; then
     log "Step 1: Applying RBAC manifests to namespace ${NAMESPACE}"
     if $DRY_RUN; then
@@ -145,6 +201,8 @@ fi
 
 # --- Step 2: Apply PVC -------------------------------------------------------
 
+CURRENT_STEP="apply-pvc"
+
 if $APPLY_PVC; then
     log "Step 2: Applying PVC manifest to namespace ${NAMESPACE}"
     if $DRY_RUN; then
@@ -158,6 +216,8 @@ else
 fi
 
 # --- Step 3: RBAC verification (always run) ----------------------------------
+
+CURRENT_STEP="rbac-verification"
 
 log "Step 3: Verifying RBAC permissions for ${SA_NAME}"
 
@@ -207,6 +267,8 @@ ok "All RBAC checks passed"
 
 # --- Step 4: Verify PVC exists -----------------------------------------------
 
+CURRENT_STEP="pvc-verification"
+
 log "Step 4: Verifying PVC ${PVC_NAME} in namespace ${NAMESPACE}"
 
 PVC_STATUS=$(kubectl get pvc "${PVC_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "not_found")
@@ -225,10 +287,12 @@ else
     fi
 fi
 
-# --- Step 5: Image digest verification ---------------------------------------
+# --- Step 5: Image trust verification ----------------------------------------
+
+CURRENT_STEP="image-trust"
 
 if $APPLY_JOB; then
-    log "Step 5: Verifying image digest"
+    log "Step 5: Verifying image trust"
 
     if [[ -z "${IMAGE}" ]]; then
         fail "--apply-job requires --image <pinned-digest>"
@@ -236,15 +300,53 @@ if $APPLY_JOB; then
         exit 1
     fi
 
+    # 5a: Must be pinned by digest
     if [[ "${IMAGE}" != *@sha256:* ]]; then
         fail "Image must be pinned by digest (not mutable tag): ${IMAGE}"
         fail "Use: registry.../image@sha256:<64-hex-chars>"
         exit 1
     fi
+    ok "Image pinned by digest"
 
-    ok "Image pinned by digest: ${IMAGE}"
+    # 5b: Must not use :latest (defense in depth even with digest)
+    if [[ "${IMAGE}" == *:latest* ]]; then
+        fail "Image must not use :latest tag"
+        exit 1
+    fi
+    ok "Image does not use :latest"
+
+    # 5c: Registry allowlist check (if specified)
+    if [[ ${#REGISTRY_ALLOWLIST[@]} -gt 0 ]]; then
+        local_registry_ok=false
+        for allowed_registry in "${REGISTRY_ALLOWLIST[@]}"; do
+            if [[ "${IMAGE}" == "${allowed_registry}"* ]]; then
+                local_registry_ok=true
+                break
+            fi
+        done
+        if ! $local_registry_ok; then
+            fail "Image registry not in allowlist: ${IMAGE}"
+            fail "Allowed registries: ${REGISTRY_ALLOWLIST[*]}"
+            exit 1
+        fi
+        ok "Image registry is allowlisted"
+    else
+        warn "No registry allowlist specified — all registries allowed"
+        warn "Use --registry-allowlist to restrict trusted registries"
+    fi
+
+    # 5d: Future: Cosign/Sigstore signature verification
+    # When implemented, add:
+    #   cosign verify --key <key> "${IMAGE}"
+    # For now, document that signature verification is a future enhancement
+
+    log "  Image: ${IMAGE}"
+    log "  Note: Signature verification (Cosign/Sigstore) is a future enhancement"
+    log "  Note: SBOM/provenance attestation is a future enhancement"
 
     # --- Step 6: Render and apply Job ----------------------------------------
+
+    CURRENT_STEP="job-render"
 
     log "Step 6: Rendering and applying one-shot Job"
 
@@ -274,7 +376,6 @@ if $APPLY_JOB; then
         # Verify Job spec before applying
         if ! kubectl apply --dry-run=client -f "${RENDERED_JOB}" >/dev/null 2>&1; then
             fail "Job manifest failed client-side dry-run validation"
-            cat "${RENDERED_JOB}" >&2
             exit 1
         fi
         ok "Job manifest passed dry-run validation"
@@ -286,6 +387,8 @@ if $APPLY_JOB; then
         ok "Job applied: ${JOB_NAME} (run_id=${RUN_ID})"
 
         # --- Step 7: Wait for Job completion ---------------------------------
+
+        CURRENT_STEP="job-wait"
 
         log "Step 7: Waiting for Job completion (this may take a few minutes)"
 
@@ -358,6 +461,8 @@ fi
 
 # --- Step 8: Retrieve evidence bundle ----------------------------------------
 
+CURRENT_STEP="evidence-retrieve"
+
 if $RETRIEVE; then
     log "Step 8: Retrieving evidence bundle from PVC"
 
@@ -365,11 +470,15 @@ if $RETRIEVE; then
         log "  [dry-run] would create helper Pod to copy evidence from PVC"
         log "  [dry-run] evidence would be copied to: ${EVIDENCE_DIR}"
     else
+        # Create protected local evidence directory
+        # The bundle is redacted but still sensitive reconnaissance material
+        mkdir -p "${EVIDENCE_DIR}"
+        chmod 0700 "${EVIDENCE_DIR}"
+
         # Create a temporary helper Pod to copy evidence from the PVC
         # This Pod mounts the PVC read-only and does NOT use the scanner
         # service account — it uses a restricted ephemeral pod.
         HELPER_POD="evidence-reader-$(date -u +%s)"
-        mkdir -p "${EVIDENCE_DIR}"
 
         kubectl run "${HELPER_POD}" \
             --namespace="${NAMESPACE}" \
@@ -425,13 +534,21 @@ if $RETRIEVE; then
         # Clean up helper Pod
         kubectl delete pod "${HELPER_POD}" -n "${NAMESPACE}" --ignore-not-found=true >/dev/null 2>&1 || true
 
+        # Enforce restrictive permissions on retrieved evidence
+        chmod -R go-rwx "${EVIDENCE_DIR}"
+
         ok "Evidence bundle retrieved to: ${EVIDENCE_DIR}"
         log "  Bundle contents:"
         find "${EVIDENCE_DIR}" -type f | sort >&2
+        log "  Permissions: ${EVIDENCE_DIR} (0700, group/other access removed)"
+        log "  Note: This is redacted but still sensitive reconnaissance material"
+        log "  Note: Do not commit this directory to version control"
     fi
 fi
 
 # --- Step 9: Verify evidence bundle ------------------------------------------
+
+CURRENT_STEP="evidence-verify"
 
 if $VERIFY; then
     log "Step 9: Verifying evidence bundle integrity and safety"
@@ -469,7 +586,7 @@ if $VERIFY; then
             fi
             actual_hash=$(sha256sum "${filename}" | awk '{print $1}')
             if [[ "${expected_hash}" != "${actual_hash}" ]]; then
-                fail "Checksum mismatch for ${filename}: expected ${expected_hash}, got ${actual_hash}"
+                fail "Checksum mismatch for ${filename}"
                 popd >/dev/null
                 exit 1
             fi
@@ -505,30 +622,21 @@ if $VERIFY; then
                 ;;
         esac
 
-        # 9d: Verify coverage honesty
-        log "  Verifying coverage honesty..."
-        PG_STATUS=$(jq -r '.coverage.postgres' "${BUNDLE_DIR}/manifest.json")
-        MINIO_STATUS=$(jq -r '.coverage.minio' "${BUNDLE_DIR}/manifest.json")
-        GIT_STATUS=$(jq -r '.coverage.git_findings' "${BUNDLE_DIR}/manifest.json")
-        K8S_STATUS=$(jq -r '.coverage.kubernetes' "${BUNDLE_DIR}/manifest.json")
-
-        if [[ "${K8S_STATUS}" != "completed" ]]; then
-            fail "Kubernetes coverage should be 'completed', got: ${K8S_STATUS}"
-            exit 1
-        fi
-        if [[ "${PG_STATUS}" != "not_configured" ]]; then
-            fail "PostgreSQL coverage should be 'not_configured', got: ${PG_STATUS}"
-            exit 1
-        fi
-        if [[ "${MINIO_STATUS}" != "not_configured" ]]; then
-            fail "MinIO coverage should be 'not_configured', got: ${MINIO_STATUS}"
-            exit 1
-        fi
-        if [[ "${GIT_STATUS}" != "not_configured" ]]; then
-            fail "Git findings coverage should be 'not_configured', got: ${GIT_STATUS}"
-            exit 1
-        fi
-        ok "Coverage is honest: kubernetes=completed, others=not_configured"
+        # 9d: Verify coverage against expected values (--expect-source)
+        log "  Verifying coverage against expected values..."
+        for source in "${!EXPECT_COVERAGE[@]}"; do
+            expected_status="${EXPECT_COVERAGE[${source}]}"
+            actual_status=$(jq -r ".coverage[\"${source}\"]" "${BUNDLE_DIR}/manifest.json")
+            if [[ "${actual_status}" == "null" || -z "${actual_status}" ]]; then
+                fail "Coverage source '${source}' not found in manifest"
+                exit 1
+            fi
+            if [[ "${actual_status}" != "${expected_status}" ]]; then
+                fail "Coverage mismatch for ${source}: expected=${expected_status}, got=${actual_status}"
+                exit 1
+            fi
+            ok "  ${source}: ${actual_status} (matches expected)"
+        done
 
         # 9e: Verify correlation status in report
         log "  Verifying candidate correlation status..."
@@ -556,7 +664,7 @@ if $VERIFY; then
         for f in report.json report.md manifest.json checksums.txt; do
             for pattern in "${PROHIBITED_PATTERNS[@]}"; do
                 if grep -qi "${pattern}" "${BUNDLE_DIR}/${f}" 2>/dev/null; then
-                    fail "Prohibited marker '${pattern}' found in ${f}"
+                    fail "Prohibited marker found in ${f}"
                     exit 1
                 fi
             done
@@ -568,7 +676,7 @@ if $VERIFY; then
         EXPECTED_JSON_HASH=$(jq -r '.report_json_sha256' "${BUNDLE_DIR}/manifest.json" | sed 's/sha256://')
         ACTUAL_JSON_HASH=$(sha256sum "${BUNDLE_DIR}/report.json" | awk '{print $1}')
         if [[ "${EXPECTED_JSON_HASH}" != "${ACTUAL_JSON_HASH}" ]]; then
-            fail "report.json hash mismatch: manifest=${EXPECTED_JSON_HASH}, actual=${ACTUAL_JSON_HASH}"
+            fail "report.json hash mismatch"
             exit 1
         fi
         ok "  report.json hash matches manifest"
@@ -576,7 +684,7 @@ if $VERIFY; then
         EXPECTED_MD_HASH=$(jq -r '.report_markdown_sha256' "${BUNDLE_DIR}/manifest.json" | sed 's/sha256://')
         ACTUAL_MD_HASH=$(sha256sum "${BUNDLE_DIR}/report.md" | awk '{print $1}')
         if [[ "${EXPECTED_MD_HASH}" != "${ACTUAL_MD_HASH}" ]]; then
-            fail "report.md hash mismatch: manifest=${EXPECTED_MD_HASH}, actual=${ACTUAL_MD_HASH}"
+            fail "report.md hash mismatch"
             exit 1
         fi
         ok "  report.md hash matches manifest"
@@ -599,6 +707,7 @@ if $VERIFY; then
             warn "Treat ${MANIFEST_EMERGENCY} active_in_source item(s) as emergency remediation."
             warn "Rotate exposed credentials and replace inline values with secretKeyRef."
             warn "Re-run with a new run ID after remediation to verify the fix."
+            warn "Use compare-discovery-runs.sh to compare before/after bundles."
         elif [[ "${MANIFEST_SCAN_STATUS}" == "completed" ]]; then
             ok "SCAN COMPLETED — no emergency findings"
         else

@@ -1,0 +1,4 @@
+# Local security evidence — redacted but sensitive reconnaissance material.
+# Retrieved by run-one-shot-scan.sh from the evidence PVC.
+# Do not commit to version control.
+.security-evidence/
