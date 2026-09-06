@@ -404,16 +404,25 @@ def run_discovery(
     else:
         print(report_json)
 
-    # Print console summary
-    print(f"\n=== Credential Discovery Summary ===", file=sys.stderr)
-    print(f"Run ID: {run_id}", file=sys.stderr)
-    print(f"Namespace: {namespace}", file=sys.stderr)
-    print(f"Package version: {PACKAGE_VERSION}", file=sys.stderr)
-    print(f"Observations: {len(observations)}", file=sys.stderr)
-    print(f"Emergency items: {emergency_count}", file=sys.stderr)
-    print(f"Coverage: {coverage}", file=sys.stderr)
-    print(f"Entries SHA-256: {report.entries_sha256}", file=sys.stderr)
-    print(f"Exit code: {exit_code}", file=sys.stderr)
+    # Print console summary — machine-parseable DISCOVERY RESULT block
+    # followed by human-readable emergency detail. Contains only redacted
+    # metadata; no provider references, secret names, or report content.
+    from .evidence_bundle import _determine_scan_status
+    scan_status = _determine_scan_status(exit_code, emergency_count)
+    coverage_str = ",".join(f"{k}:{v}" for k, v in sorted(coverage.items()))
+
+    print(f"\nDISCOVERY RESULT", file=sys.stderr)
+    print(f"run_id={run_id}", file=sys.stderr)
+    print(f"scan_status={scan_status}", file=sys.stderr)
+    print(f"exit_code={exit_code}", file=sys.stderr)
+    print(f"total_credentials={report.total_credentials}", file=sys.stderr)
+    print(f"emergency_items={emergency_count}", file=sys.stderr)
+    print(f"coverage={coverage_str}", file=sys.stderr)
+    print(f"entries_sha256={report.entries_sha256}", file=sys.stderr)
+    if output_path:
+        print(f"evidence_bundle={bundle_path}", file=sys.stderr)
+    print(f"package_version={PACKAGE_VERSION}", file=sys.stderr)
+    print(f"policy_version=1", file=sys.stderr)
 
     if emergency_count > 0:
         print(f"\n=== EMERGENCY REMEDIATION ITEMS ===", file=sys.stderr)

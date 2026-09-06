@@ -26,6 +26,10 @@
 # Pin by digest (not tag) for the first security-sensitive run.
 #
 # PREREQUISITES:
+#   Use the repeatable scan script for the full preflight + execution sequence:
+#     ./deploy/cts/run-one-shot-scan.sh --all --image <pinned-digest>
+#
+#   Or apply manually:
 #   kubectl apply -f deploy/cts/rbac.yaml
 #   kubectl apply -f deploy/cts/pvc.yaml
 #   # Verify negative permission:

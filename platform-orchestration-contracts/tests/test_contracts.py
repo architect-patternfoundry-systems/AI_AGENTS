@@ -1,7 +1,9 @@
 """Tests for platform-orchestration-contracts."""
 
 import json
+import os
 import pytest
+from pathlib import Path
 from typing import Optional
 
 from platform_orchestration_contracts import (
@@ -6443,3 +6445,179 @@ def test_write_discovery_evidence_collision_different_run(tmp_path):
             report=report2,
             exit_code=0,
         )
+
+
+# --- Console summary (DISCOVERY RESULT block) tests ---
+
+
+def test_run_discovery_console_summary_contains_scan_status(tmp_path, capsys):
+    """Console summary includes machine-parseable DISCOVERY RESULT block."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:DATABASE_URL",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="kubernetes-secret:cts/cts-db-secret#uri",
+            consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+            owner_hint=OwnerRef(team="cts-platform"),
+            exposure_class=EXPOSURE_SECRET_DELIVERED,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            default_action=ACTION_ENROLLMENT_CANDIDATE,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            exit_code = run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-console-001",
+            )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    stderr = captured.err
+
+    # DISCOVERY RESULT block
+    assert "DISCOVERY RESULT" in stderr
+    assert "run_id=test-console-001" in stderr
+    assert "scan_status=completed" in stderr
+    assert "exit_code=0" in stderr
+    assert "emergency_items=0" in stderr
+    assert "coverage=" in stderr
+    assert "entries_sha256=" in stderr
+    assert "evidence_bundle=" in stderr
+    assert "package_version=" in stderr
+
+
+def test_run_discovery_console_summary_completed_with_findings(tmp_path, capsys):
+    """Console summary shows completed_with_findings for exit 2."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="inline-env:cts/cts-backend#POSTGRES_DSN",
+            consumer_refs=(ConsumerRef(
+                kind="Deployment", namespace="cts", name="cts-backend", container="cts-backend",
+            ),),
+            owner_hint=OwnerRef(team="cts-platform"),
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            inline_value_present=True,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            exit_code = run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-console-findings-001",
+            )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    stderr = captured.err
+
+    assert "DISCOVERY RESULT" in stderr
+    assert "scan_status=completed_with_findings" in stderr
+    assert "exit_code=2" in stderr
+    assert "emergency_items=1" in stderr
+
+
+def test_run_discovery_console_summary_no_secret_values(tmp_path, capsys):
+    """Console summary contains no secret values."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    raw_secret = "console-test-secret-MUST-NOT-APPEAR"
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="inline-env:cts/cts-backend#POSTGRES_DSN",
+            consumer_refs=(ConsumerRef(
+                kind="Deployment", namespace="cts", name="cts-backend", container="cts-backend",
+            ),),
+            owner_hint=OwnerRef(team="cts-platform"),
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            inline_value_present=True,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-console-nosecret-001",
+            )
+
+    captured = capsys.readouterr()
+    stderr = captured.err
+    assert raw_secret not in stderr
+    assert "MUST-NOT-APPEAR" not in stderr
+
+
+# --- One-shot scan script tests ---
+
+
+def test_one_shot_scan_script_syntax_valid():
+    """The one-shot scan script passes bash syntax validation."""
+    import subprocess
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    result = subprocess.run(
+        ["bash", "-n", str(script_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"Bash syntax error: {result.stderr}"
+
+
+def test_one_shot_scan_script_is_executable():
+    """The one-shot scan script has executable permissions."""
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    assert script_path.exists()
+    assert os.access(script_path, os.X_OK), "Script is not executable"
+
+
+def test_one_shot_scan_script_help_works():
+    """The one-shot scan script --help produces usage output."""
+    import subprocess
+    script_path = Path(__file__).parent.parent / "deploy" / "cts" / "run-one-shot-scan.sh"
+    result = subprocess.run(
+        ["bash", str(script_path), "--help"],
+        capture_output=True,
+        text=True,
+    )
+    # --help should produce non-empty stderr and exit non-zero (usage)
+    assert "USAGE" in result.stderr or "USAGE" in result.stdout
