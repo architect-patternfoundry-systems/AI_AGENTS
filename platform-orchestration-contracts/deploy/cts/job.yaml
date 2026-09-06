@@ -1,9 +1,9 @@
 # One-shot credential discovery Job for the CTS namespace.
 #
 # This Job runs a single discovery scan and writes the redacted posture
-# report to a protected evidence path. It is NOT a recurring schedule —
-# validate the first run against the acceptance checklist before
-# scheduling daily execution.
+# report to a durable evidence volume (PVC). It is NOT a recurring
+# schedule — validate the first run against the acceptance checklist
+# before scheduling daily execution.
 #
 # SECURITY PROPERTIES:
 # - Namespace-scoped to cts via serviceAccountName
@@ -13,10 +13,29 @@
 # - readOnlyRootFilesystem and runAsNonRoot
 # - All capabilities dropped
 # - backoffLimit: 0 (no retries — investigate failures manually)
-# - ttlSecondsAfterFinished: 3600 (clean up after 1 hour)
+# - ttlSecondsAfterFinished: 3600 (clean up Job object, not PVC)
+# - Evidence stored on PVC (survives Job cleanup)
+#
+# EXIT CODES:
+#   0 — scan completed, no emergency findings
+#   1 — scan failed (API error, validation error)
+#   2 — scan completed but found active_in_source exposures
+#       (treat as success-with-urgent-findings, not scanner failure)
 #
 # IMAGE: Replace <pinned-image-digest> with the actual image digest.
 # Pin by digest (not tag) for the first security-sensitive run.
+#
+# PREREQUISITES:
+#   kubectl apply -f deploy/cts/rbac.yaml
+#   kubectl apply -f deploy/cts/pvc.yaml
+#   # Verify negative permission:
+#   kubectl auth can-i get secrets \
+#     --as=system:serviceaccount:cts:credential-discovery-kubernetes -n cts
+#   # Must return: no
+#   # Verify positive permission:
+#   kubectl auth can-i list deployments \
+#     --as=system:serviceaccount:cts:credential-discovery-kubernetes -n cts
+#   # Must return: yes
 #
 # ACCEPTANCE CHECKLIST (verify before scheduling daily):
 # 1. Service account cannot read Kubernetes Secrets
@@ -30,6 +49,7 @@
 # 8. Logs contain no DSN, password, token, private-key, or raw API object
 # 9. Job makes no cluster mutations
 # 10. Any active_in_source observation is opened as emergency remediation
+# 11. Reports survive on PVC after Job TTL cleanup
 
 apiVersion: batch/v1
 kind: Job
@@ -92,5 +112,5 @@ spec:
               readOnly: false
       volumes:
         - name: evidence
-          emptyDir:
-            sizeLimit: 64Mi
+          persistentVolumeClaim:
+            claimName: credential-discovery-evidence

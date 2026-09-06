@@ -117,6 +117,7 @@ from platform_orchestration_contracts import (
     UnsafeObservationError,
     assert_observation_safe,
     assert_observations_safe,
+    assert_safe_report_text,
     FORBIDDEN_MARKERS,
     discover_kubernetes_credentials,
     KubernetesDiscoveryClient,
@@ -5339,7 +5340,7 @@ def test_observation_to_record_inline_credential():
         default_action=ACTION_EMERGENCY_ROTATION,
     )
     record = _observation_to_record(obs)
-    assert record.credential_set_id == "k8s-cts-deployment-cts-backend-cts-backend-postgres_dsn"
+    assert record.credential_set_id == "candidate-k8s-cts-deployment-cts-backend-cts-backend-postgres_dsn"
     assert record.lifecycle_state == LIFECYCLE_BOOTSTRAP_REQUIRED
     assert record.risk.tier == RISK_HIGH
     assert record.authority is not None
@@ -5613,3 +5614,153 @@ def test_run_discovery_evidence_manifest_ref(tmp_path):
     assert "security-evidence://" in report_data["evidence_manifest_ref"]
     assert "cts" in report_data["evidence_manifest_ref"]
     assert "test-evidence-001" in report_data["evidence_manifest_ref"]
+
+
+# --- Report safety gate tests ---
+
+
+def test_assert_safe_report_text_rejects_password():
+    """Report safety gate rejects password= patterns."""
+    # Construct dynamically to avoid triggering secret scanners
+    text = "config has pass" + "word=secret123 in it"
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_safe_report_text(text, context="test")
+
+
+def test_assert_safe_report_text_rejects_postgres_dsn():
+    """Report safety gate rejects postgres:// DSN patterns."""
+    # Construct dynamically to avoid triggering secret scanners
+    text = "DSN: postgres" + "ql://user:secret@host:5432/db"
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_safe_report_text(text, context="test")
+
+
+def test_assert_safe_report_text_rejects_token():
+    """Report safety gate rejects token= patterns."""
+    text = "auth tok" + "en=abc123def456"
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_safe_report_text(text, context="test")
+
+
+def test_assert_safe_report_text_rejects_api_key():
+    """Report safety gate rejects api_key= patterns."""
+    # Construct dynamically to avoid triggering secret scanners
+    text = "config api_" + "key=" + "syn" + "thetic"
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_safe_report_text(text, context="test")
+
+
+def test_assert_safe_report_text_rejects_bearer():
+    """Report safety gate rejects Authorization: Bearer patterns."""
+    text = "header authoriz" + "ation: bearer abc123token"
+    with pytest.raises(UnsafeObservationError, match="prohibited"):
+        assert_safe_report_text(text, context="test")
+
+
+def test_assert_safe_report_text_passes_clean_report():
+    """Report safety gate passes clean report text."""
+    text = json.dumps({
+        "run_id": "test-001",
+        "namespace": "cts",
+        "coverage": {"kubernetes": "completed"},
+        "entries_sha256": "abc123",
+        "observations": [
+            {"observation_id": "k8s-cts-deployment-cts-backend-postgres_dsn",
+             "inline_value_present": True,
+             "exposure_class": "active_in_source"}
+        ],
+    })
+    # Should not raise
+    assert_safe_report_text(text, context="test")
+
+
+def test_assert_safe_report_text_passes_env_var_names():
+    """Report safety gate passes legitimate env var names (no value indicator)."""
+    text = "POSTGRES_DSN AWS_SECRET_ACCESS_KEY DATABASE_URL"
+    # These are env var names without trailing = or :value patterns
+    # Should not raise because the forbidden markers require value indicators
+    assert_safe_report_text(text, context="test")
+
+
+def test_run_discovery_report_safety_gate_blocks_unsafe_output(tmp_path):
+    """run_discovery returns 1 if report text fails safety validation."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch, MagicMock
+
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:DATABASE_URL",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="kubernetes-secret:cts/cts-db-secret#uri",
+            consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+            exposure_class=EXPOSURE_SECRET_DELIVERED,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            default_action=ACTION_ENROLLMENT_CANDIDATE,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    # Mock assert_safe_report_text to raise
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            with patch("platform_orchestration_contracts.run_discovery.assert_safe_report_text") as mock_safe:
+                mock_discover.return_value = mock_observations
+                mock_safe.side_effect = UnsafeObservationError(
+                    observation_id="<json-report>",
+                    reason="test: blocked",
+                    marker="test-marker",
+                )
+                exit_code = run_discovery(
+                    namespace="cts",
+                    sources=["kubernetes"],
+                    output_path=output_path,
+                    run_id="test-gate-001",
+                )
+
+    assert exit_code == 1
+    # Report should NOT have been written
+    assert not (tmp_path / "credential-posture.json").exists()
+
+
+# --- Correlation metadata tests ---
+
+
+def test_observation_to_record_prefixes_candidate_id():
+    """Records from _observation_to_record are prefixed with candidate-."""
+    from platform_orchestration_contracts.run_discovery import _observation_to_record
+    obs = CredentialObservation(
+        observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        credential_class="postgresql_login",
+        exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+        default_action=ACTION_EMERGENCY_ROTATION,
+    )
+    record = _observation_to_record(obs)
+    assert record.credential_set_id.startswith("candidate-")
+    assert "k8s" in record.credential_set_id
+    assert "cts" in record.credential_set_id
+    assert "postgres_dsn" in record.credential_set_id
+
+
+def test_observation_to_record_candidate_id_is_lowercase():
+    """Candidate IDs are lowercase to satisfy credential_set_id validation."""
+    from platform_orchestration_contracts.run_discovery import _observation_to_record
+    obs = CredentialObservation(
+        observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        exposure_class=EXPOSURE_SECRET_DELIVERED,
+        default_action=ACTION_ENROLLMENT_CANDIDATE,
+    )
+    record = _observation_to_record(obs)
+    # Must be valid per credential_set_id pattern: [a-z0-9][a-z0-9_-]*
+    import re
+    assert re.match(r"^[a-z0-9][a-z0-9_-]*$", record.credential_set_id), \
+        f"credential_set_id {record.credential_set_id!r} does not match required pattern"

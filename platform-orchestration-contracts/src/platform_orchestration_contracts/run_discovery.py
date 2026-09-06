@@ -75,6 +75,7 @@ from .kubernetes_discovery_adapter import (
 from .observation_safety import (
     UnsafeObservationError,
     assert_observations_safe,
+    assert_safe_report_text,
 )
 
 logger = logging.getLogger("platform_orchestration_contracts.run_discovery")
@@ -163,8 +164,15 @@ def _observation_to_record(obs: CredentialObservation) -> CredentialSetRecord:
     # (credential_set_id must match [a-z0-9][a-z0-9_-]*)
     safe_id = obs.observation_id.lower().replace(":", "-").replace("/", "-").replace("#", "-")
 
+    # Prefix with "candidate-" to mark this as an unconfirmed correlation.
+    # The true credential-set identity may differ — for example, two workloads
+    # with POSTGRES_DSN may consume the same database credential. A later
+    # correlation service should merge records only with high-confidence
+    # evidence (shared secretKeyRef, provider-side identity, HMAC fingerprint).
+    candidate_id = f"candidate-{safe_id}"
+
     return CredentialSetRecord(
-        credential_set_id=safe_id,
+        credential_set_id=candidate_id,
         display_name=display_name,
         credential_class=obs.credential_class or "unknown",
         environment=obs.environment,
@@ -326,8 +334,25 @@ def run_discovery(
         evidence_manifest_ref=evidence_ref,
     )
 
-    # Write JSON report
+    # Generate report text
     report_json = report.to_json()
+    report_md = report.to_markdown()
+
+    # FINAL OUTPUT GATE: validate report text before writing to any storage.
+    # This protects against a later change in record conversion, report
+    # templating, exception formatting, or metadata fields bypassing
+    # observation-level validation.
+    try:
+        assert_safe_report_text(report_json, context="json-report")
+        assert_safe_report_text(report_md, context="markdown-report")
+    except UnsafeObservationError as e:
+        logger.error(
+            "Unsafe report text detected — aborting before write",
+            extra={"observation_id": e.observation_id, "marker": getattr(e, "marker", "")},
+        )
+        return 1
+
+    # Write reports
     if output_path:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -339,7 +364,7 @@ def run_discovery(
 
         # Also write Markdown report alongside
         md_path = output_file.with_suffix(".md")
-        md_path.write_text(report.to_markdown(), encoding="utf-8")
+        md_path.write_text(report_md, encoding="utf-8")
         logger.info(
             "Markdown report written",
             extra={"path": str(md_path)},

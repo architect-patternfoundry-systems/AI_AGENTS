@@ -168,3 +168,35 @@ def assert_observations_safe(
     """Validate a batch of observations. Raises on the first unsafe one."""
     for obs in observations:
         assert_observation_safe(obs)
+
+
+def assert_safe_report_text(text: str, context: str = "report") -> None:
+    """Validate that report text (JSON or Markdown) contains no secret material.
+
+    This is a FINAL OUTPUT GATE that checks the fully rendered report
+    text before it is written to any persistent storage. It protects
+    against a later change in record conversion, report templating,
+    exception formatting, or metadata fields bypassing observation-level
+    validation.
+
+    The check is pattern-based: it rejects known secret-bearing markers
+    that indicate a value (not just a field name) is present. It uses
+    the same marker philosophy as assert_observation_safe — markers for
+    env var names include a trailing "=" to distinguish legitimate
+    metadata from secret values.
+
+    Args:
+        text: The report text to validate (JSON or Markdown string).
+        context: Description of what is being validated (for error messages).
+
+    Raises:
+        UnsafeObservationError: If forbidden secret-like markers are found.
+    """
+    text_lower = text.lower()
+    for marker in FORBIDDEN_MARKERS:
+        if marker.lower() in text_lower:
+            raise UnsafeObservationError(
+                observation_id=f"<{context}>",
+                reason=f"report text contains prohibited secret-like material",
+                marker=marker,
+            )

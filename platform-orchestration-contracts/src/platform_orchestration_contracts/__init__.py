@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -216,6 +216,7 @@ from .observation_safety import (
     UnsafeObservationError,
     assert_observation_safe,
     assert_observations_safe,
+    assert_safe_report_text,
     FORBIDDEN_MARKERS,
 )
 
@@ -453,6 +454,7 @@ __all__ = [
     "UnsafeObservationError",
     "assert_observation_safe",
     "assert_observations_safe",
+    "assert_safe_report_text",
     "FORBIDDEN_MARKERS",
     # kubernetes discovery adapter (Phase 1 first real adapter)
     "discover_kubernetes_credentials",
