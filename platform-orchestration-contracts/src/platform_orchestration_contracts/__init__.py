@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 from .workflow_envelope import (
     WorkflowEnvelope,

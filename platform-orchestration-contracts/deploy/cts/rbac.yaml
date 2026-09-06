@@ -1,0 +1,81 @@
+# RBAC for credential discovery in the CTS namespace.
+#
+# This Role grants read-only access to workload metadata only.
+# It intentionally does NOT grant access to:
+#   - core/secrets (Secret data reads are prohibited)
+#   - pods (no pod access needed for metadata discovery)
+#   - pods/exec (no exec access)
+#   - pods/log (no log access)
+#   - serviceaccounts/token (no token creation)
+#
+# Before running the scanner, verify the negative permission:
+#   kubectl auth can-i get secrets \
+#     --as=system:serviceaccount:cts:credential-discovery-kubernetes \
+#     -n cts
+#   # Must return: no
+#
+# And verify the positive permission:
+#   kubectl auth can-i list deployments \
+#     --as=system:serviceaccount:cts:credential-discovery-kubernetes \
+#     -n cts
+#   # Must return: yes
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: credential-discovery-kubernetes
+  namespace: cts
+  labels:
+    app.kubernetes.io/name: credential-discovery
+    app.kubernetes.io/component: kubernetes-adapter
+    app.kubernetes.io/part-of: platform-orchestration-contracts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: credential-discovery-kubernetes
+  namespace: cts
+  labels:
+    app.kubernetes.io/name: credential-discovery
+    app.kubernetes.io/component: kubernetes-adapter
+    app.kubernetes.io/part-of: platform-orchestration-contracts
+rules:
+  # Workload metadata — needed to discover credential references
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  # ExternalSecret metadata — for external secret reference discovery
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets", "secretstores"]
+    verbs: ["get", "list"]
+  # CSI Secret Store metadata — for CSI provider reference discovery
+  - apiGroups: ["secrets-store.csi.x-k8s.io"]
+    resources: ["secretproviderclasses"]
+    verbs: ["get", "list"]
+  # INTENTIONALLY OMITTED:
+  #   - apiGroups: [""]
+  #     resources: ["secrets"]
+  #     verbs: ["get", "list"]
+  #   Secret data reads are PROHIBITED for the discovery scanner.
+  #   Credential references are derived from workload specs only.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: credential-discovery-kubernetes
+  namespace: cts
+  labels:
+    app.kubernetes.io/name: credential-discovery
+    app.kubernetes.io/component: kubernetes-adapter
+    app.kubernetes.io/part-of: platform-orchestration-contracts
+subjects:
+  - kind: ServiceAccount
+    name: credential-discovery-kubernetes
+    namespace: cts
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: credential-discovery-kubernetes

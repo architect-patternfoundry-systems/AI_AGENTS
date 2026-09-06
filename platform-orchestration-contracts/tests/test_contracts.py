@@ -5257,3 +5257,359 @@ def test_volume_secret_gets_certificate_exposure_class():
     vol_obs = [o for o in observations if "volume" in o.observation_id]
     assert len(vol_obs) == 1
     assert vol_obs[0].exposure_class == EXPOSURE_CERTIFICATE_DELIVERED
+
+
+# --- run_discovery module tests ---
+
+
+def test_build_coverage_kubernetes_only():
+    """Coverage map marks kubernetes as completed, others as not_configured."""
+    from platform_orchestration_contracts.run_discovery import _build_coverage
+    coverage = _build_coverage(["kubernetes"])
+    assert coverage[COVERAGE_SOURCE_KUBERNETES] == COVERAGE_COMPLETED
+    assert coverage[COVERAGE_SOURCE_POSTGRES] == COVERAGE_NOT_CONFIGURED
+    assert coverage[COVERAGE_SOURCE_MINIO] == COVERAGE_NOT_CONFIGURED
+    assert coverage[COVERAGE_SOURCE_GIT_FINDINGS] == COVERAGE_NOT_CONFIGURED
+
+
+def test_build_coverage_all_not_configured_when_empty():
+    """Empty sources list marks all as not_configured."""
+    from platform_orchestration_contracts.run_discovery import _build_coverage
+    coverage = _build_coverage([])
+    assert coverage[COVERAGE_SOURCE_KUBERNETES] == COVERAGE_NOT_CONFIGURED
+    assert coverage[COVERAGE_SOURCE_POSTGRES] == COVERAGE_NOT_CONFIGURED
+
+
+def test_count_emergency_items_with_inline():
+    """Emergency count includes active_in_source observations."""
+    from platform_orchestration_contracts.run_discovery import _count_emergency_items
+    obs = (
+        CredentialObservation(
+            observation_id="obs-1",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+        CredentialObservation(
+            observation_id="obs-2",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            exposure_class=EXPOSURE_SECRET_DELIVERED,
+            default_action=ACTION_ENROLLMENT_CANDIDATE,
+        ),
+    )
+    assert _count_emergency_items(obs) == 1
+
+
+def test_count_emergency_items_zero_when_none():
+    """Emergency count is zero when no active exposures."""
+    from platform_orchestration_contracts.run_discovery import _count_emergency_items
+    obs = (
+        CredentialObservation(
+            observation_id="obs-1",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            exposure_class=EXPOSURE_SECRET_DELIVERED,
+            default_action=ACTION_ENROLLMENT_CANDIDATE,
+        ),
+    )
+    assert _count_emergency_items(obs) == 0
+
+
+def test_observation_to_record_inline_credential():
+    """Observation with active_in_source becomes bootstrap_required record."""
+    from platform_orchestration_contracts.run_discovery import _observation_to_record
+    obs = CredentialObservation(
+        observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        credential_class="postgresql_login",
+        secret_authority_ref="inline-env:cts/cts-backend#POSTGRES_DSN",
+        consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+        owner_hint=OwnerRef(team="cts-platform"),
+        risk_signals=("credential-inlined-in-env-var",),
+        exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+        evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+        inline_value_present=True,
+        default_action=ACTION_EMERGENCY_ROTATION,
+    )
+    record = _observation_to_record(obs)
+    assert record.credential_set_id == "k8s-cts-deployment-cts-backend-cts-backend-postgres_dsn"
+    assert record.lifecycle_state == LIFECYCLE_BOOTSTRAP_REQUIRED
+    assert record.risk.tier == RISK_HIGH
+    assert record.authority is not None
+    assert record.authority.provider == "inline_env"
+    assert record.target_strategy == ACTION_EMERGENCY_ROTATION
+
+
+def test_observation_to_record_secret_key_ref():
+    """Observation with secretKeyRef becomes discovered record."""
+    from platform_orchestration_contracts.run_discovery import _observation_to_record
+    obs = CredentialObservation(
+        observation_id="k8s:cts:deployment:cts-backend:cts-backend:DATABASE_URL",
+        source=COVERAGE_SOURCE_KUBERNETES,
+        observed_at="2026-09-05T12:00:00+00:00",
+        environment="dev",
+        credential_class="postgresql_login",
+        secret_authority_ref="kubernetes-secret:cts/cts-db-secret#uri",
+        consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+        exposure_class=EXPOSURE_SECRET_DELIVERED,
+        evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+        default_action=ACTION_ENROLLMENT_CANDIDATE,
+    )
+    record = _observation_to_record(obs)
+    assert record.lifecycle_state == LIFECYCLE_DISCOVERED
+    assert record.risk.tier == RISK_LOW
+    assert record.authority is not None
+    assert record.authority.provider == "kubernetes_secret"
+    assert record.authority.namespace == "cts"
+    assert record.authority.secret_name == "cts-db-secret"
+    assert "uri" in record.authority.key_names
+
+
+def test_format_emergency_items_no_secret_values():
+    """Emergency item formatting contains no secret values."""
+    from platform_orchestration_contracts.run_discovery import _format_emergency_items
+    raw_secret = "formatting-test-secret-NOT-IN-OUTPUT"
+    obs = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            consumer_refs=(ConsumerRef(
+                kind="Deployment", namespace="cts", name="cts-backend", container="cts-backend",
+            ),),
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+    )
+    items = _format_emergency_items(obs)
+    assert len(items) == 1
+    item = items[0]
+    assert "cts-backend" in item
+    assert "POSTGRES_DSN" in item
+    assert "emergency_rotation" in item
+    # No secret values
+    assert raw_secret not in item
+    assert "password" not in item.lower()
+
+
+def test_run_discovery_writes_json_and_markdown(tmp_path):
+    """run_discovery writes JSON and Markdown reports to the output path."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    # Create mock observations to return from discover_kubernetes_credentials
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:DATABASE_URL",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="kubernetes-secret:cts/cts-db-secret#uri",
+            consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+            owner_hint=OwnerRef(team="cts-platform"),
+            exposure_class=EXPOSURE_SECRET_DELIVERED,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            default_action=ACTION_ENROLLMENT_CANDIDATE,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient") as mock_client_cls:
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            exit_code = run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                environment="dev",
+                run_id="test-run-001",
+            )
+
+    # No emergency items, so exit code should be 0
+    assert exit_code == 0
+
+    # Check JSON report exists
+    json_path = tmp_path / "credential-posture.json"
+    assert json_path.exists()
+    report_json = json_path.read_text()
+    report_data = json.loads(report_json)
+
+    # Verify report structure
+    assert report_data["run_id"] == "test-run-001"
+    assert report_data["report_version"] == "credential-posture-report.v1"
+    assert "contract_package_version" in report_data
+    assert "entries_sha256" in report_data
+    assert "evidence_manifest_ref" in report_data
+    assert "coverage" in report_data
+    assert report_data["coverage"][COVERAGE_SOURCE_KUBERNETES] == COVERAGE_COMPLETED
+    assert report_data["coverage"][COVERAGE_SOURCE_POSTGRES] == COVERAGE_NOT_CONFIGURED
+
+    # Check Markdown report exists
+    md_path = tmp_path / "credential-posture.md"
+    assert md_path.exists()
+    report_md = md_path.read_text()
+    assert "test-run-001" in report_md
+
+
+def test_run_discovery_returns_2_for_emergency_items(tmp_path):
+    """run_discovery returns exit code 2 when emergency items are found."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="inline-env:cts/cts-backend#POSTGRES_DSN",
+            consumer_refs=(ConsumerRef(
+                kind="Deployment", namespace="cts", name="cts-backend", container="cts-backend",
+            ),),
+            owner_hint=OwnerRef(team="cts-platform"),
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            inline_value_present=True,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            exit_code = run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                environment="dev",
+                run_id="test-emergency-001",
+            )
+
+    # Emergency items found → exit code 2
+    assert exit_code == 2
+
+    # Report should still be written
+    json_path = tmp_path / "credential-posture.json"
+    assert json_path.exists()
+
+
+def test_run_discovery_report_contains_no_secret_values(tmp_path):
+    """Posture report contains no secret values."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    raw_secret = "report-test-secret-MUST-NOT-APPEAR"
+
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="inline-env:cts/cts-backend#POSTGRES_DSN",
+            consumer_refs=(ConsumerRef(kind="Deployment", namespace="cts", name="cts-backend"),),
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            inline_value_present=True,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-no-secrets-001",
+            )
+
+    # Check JSON report has no secret values
+    json_report = (tmp_path / "credential-posture.json").read_text()
+    assert raw_secret not in json_report
+    assert "MUST-NOT-APPEAR" not in json_report
+
+    # Check Markdown report has no secret values
+    md_report = (tmp_path / "credential-posture.md").read_text()
+    assert raw_secret not in md_report
+    assert "MUST-NOT-APPEAR" not in md_report
+
+
+def test_run_discovery_coverage_honest(tmp_path):
+    """Report honestly marks non-kubernetes sources as not_configured."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    mock_observations = ()
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-coverage-001",
+            )
+
+    json_report = (tmp_path / "credential-posture.json").read_text()
+    report_data = json.loads(json_report)
+
+    # Kubernetes should be completed
+    assert report_data["coverage"][COVERAGE_SOURCE_KUBERNETES] == COVERAGE_COMPLETED
+    # Others should be not_configured
+    assert report_data["coverage"][COVERAGE_SOURCE_POSTGRES] == COVERAGE_NOT_CONFIGURED
+    assert report_data["coverage"][COVERAGE_SOURCE_MINIO] == COVERAGE_NOT_CONFIGURED
+    assert report_data["coverage"][COVERAGE_SOURCE_GIT_FINDINGS] == COVERAGE_NOT_CONFIGURED
+    # Should have limitations for missing sources
+    assert "limitations" in report_data
+    assert len(report_data["limitations"]) > 0
+
+
+def test_run_discovery_evidence_manifest_ref(tmp_path):
+    """Report includes evidence_manifest_ref."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    mock_observations = ()
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-evidence-001",
+            )
+
+    json_report = (tmp_path / "credential-posture.json").read_text()
+    report_data = json.loads(json_report)
+
+    assert "evidence_manifest_ref" in report_data
+    assert report_data["evidence_manifest_ref"] is not None
+    assert "security-evidence://" in report_data["evidence_manifest_ref"]
+    assert "cts" in report_data["evidence_manifest_ref"]
+    assert "test-evidence-001" in report_data["evidence_manifest_ref"]
