@@ -5,6 +5,7 @@ import pytest
 from typing import Optional
 
 from platform_orchestration_contracts import (
+    __version__,
     WorkflowEnvelope,
     RequestedBy,
     GovernanceBlock,
@@ -5871,7 +5872,7 @@ def test_build_evidence_manifest_structure():
             COVERAGE_SOURCE_POSTGRES: COVERAGE_NOT_CONFIGURED,
         },
         entries_sha256="sha256:abc123",
-        contract_package_version="0.11.0",
+        contract_package_version=__version__,
     )
     manifest_json = build_evidence_manifest(
         report=report,
@@ -5882,7 +5883,7 @@ def test_build_evidence_manifest_structure():
     assert manifest["manifest_version"] == "credential-discovery-evidence.v1"
     assert manifest["run_id"] == "test-manifest-001"
     assert manifest["entries_sha256"] == "sha256:abc123"
-    assert manifest["package_version"] == "0.11.0"
+    assert manifest["package_version"] == __version__
     assert manifest["policy_version"] == "1"
     assert "report_json_sha256" in manifest
     assert manifest["report_json_sha256"].startswith("sha256:")
@@ -5927,7 +5928,7 @@ def test_write_discovery_evidence_creates_bundle(tmp_path):
         entries=(),
         coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
         entries_sha256="sha256:abc123",
-        contract_package_version="0.11.0",
+        contract_package_version=__version__,
     )
     bundle_path = write_discovery_evidence(
         base_path=tmp_path,
@@ -5966,7 +5967,7 @@ def test_write_discovery_evidence_no_secret_values(tmp_path):
         entries=(),
         coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
         entries_sha256="sha256:abc123",
-        contract_package_version="0.11.0",
+        contract_package_version=__version__,
     )
     bundle_path = write_discovery_evidence(
         base_path=tmp_path,
@@ -6102,9 +6103,343 @@ def test_posture_report_markdown_includes_correlation_notice():
         entries=(entry,),
         coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
         entries_sha256="sha256:abc123",
-        contract_package_version="0.11.0",
+        contract_package_version=__version__,
     )
     md = report.to_markdown()
     assert "Correlation notice" in md
     assert "unconfirmed" in md
     assert "candidate" in md.lower()
+
+
+# --- Scan status and exit code in evidence manifest ---
+
+
+def test_evidence_manifest_includes_scan_status_completed():
+    """Manifest includes scan_status=completed for exit 0, no findings."""
+    from platform_orchestration_contracts.evidence_bundle import build_evidence_manifest
+    from platform_orchestration_contracts.credential_discovery_workflow import PostureReport
+    report = PostureReport(
+        run_id="test-status-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        entries_sha256="sha256:abc",
+        contract_package_version=__version__,
+    )
+    manifest = json.loads(build_evidence_manifest(
+        report=report,
+        report_json='{}',
+        report_markdown='# Test',
+        exit_code=0,
+    ))
+    assert manifest["scan_status"] == "completed"
+    assert manifest["exit_code"] == 0
+
+
+def test_evidence_manifest_includes_scan_status_completed_with_findings():
+    """Manifest includes scan_status=completed_with_findings for exit 2."""
+    from platform_orchestration_contracts.evidence_bundle import build_evidence_manifest
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, CredentialPostureEntry,
+    )
+    entry = CredentialPostureEntry(
+        credential_set_id="candidate-test",
+        credential_class="postgresql_login",
+        environment="dev",
+        owner=None,
+        lifecycle_state="bootstrap_required",
+        consumer_count=1,
+        provider_identity_ref=None,
+        secret_authority_status="unknown",
+        risk_tier="high",
+        provider_ready=False,
+        execution_ready=False,
+        eligible=False,
+        blockers=(),
+        exposure_status="active_in_source",
+        last_observed_use=None,
+        enrollment_deadline=None,
+        recommended_next_action="emergency_rotation",
+        input_fingerprint="abc",
+    )
+    report = PostureReport(
+        run_id="test-status-002",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=1,
+        eligible_count=0,
+        blocked_count=1,
+        unowned_count=1,
+        orphaned_count=0,
+        entries=(entry,),
+        entries_sha256="sha256:abc",
+        contract_package_version=__version__,
+    )
+    manifest = json.loads(build_evidence_manifest(
+        report=report,
+        report_json='{}',
+        report_markdown='# Test',
+        exit_code=2,
+    ))
+    assert manifest["scan_status"] == "completed_with_findings"
+    assert manifest["exit_code"] == 2
+    assert manifest["emergency_items"] == 1
+
+
+def test_evidence_manifest_includes_scan_status_failed():
+    """Manifest includes scan_status=failed for exit 1."""
+    from platform_orchestration_contracts.evidence_bundle import build_evidence_manifest
+    from platform_orchestration_contracts.credential_discovery_workflow import PostureReport
+    report = PostureReport(
+        run_id="test-status-003",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        entries_sha256="sha256:abc",
+        contract_package_version=__version__,
+    )
+    manifest = json.loads(build_evidence_manifest(
+        report=report,
+        report_json='{}',
+        report_markdown='# Test',
+        exit_code=1,
+    ))
+    assert manifest["scan_status"] == "failed"
+    assert manifest["exit_code"] == 1
+
+
+def test_evidence_manifest_rejects_invalid_scan_status():
+    """Manifest rejects invalid scan_status values."""
+    from platform_orchestration_contracts.evidence_bundle import build_evidence_manifest
+    from platform_orchestration_contracts.credential_discovery_workflow import PostureReport
+    report = PostureReport(
+        run_id="test-status-004",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        entries_sha256="sha256:abc",
+        contract_package_version=__version__,
+    )
+    with pytest.raises(ValueError, match="scan_status"):
+        build_evidence_manifest(
+            report=report,
+            report_json='{}',
+            report_markdown='# Test',
+            scan_status="bogus_status",
+        )
+
+
+def test_run_discovery_manifest_has_completed_with_findings(tmp_path):
+    """Evidence manifest records completed_with_findings for exit 2 runs."""
+    from platform_orchestration_contracts.run_discovery import run_discovery
+    from unittest.mock import patch
+
+    mock_observations = (
+        CredentialObservation(
+            observation_id="k8s:cts:deployment:cts-backend:cts-backend:POSTGRES_DSN",
+            source=COVERAGE_SOURCE_KUBERNETES,
+            observed_at="2026-09-05T12:00:00+00:00",
+            environment="dev",
+            credential_class="postgresql_login",
+            secret_authority_ref="inline-env:cts/cts-backend#POSTGRES_DSN",
+            consumer_refs=(ConsumerRef(
+                kind="Deployment", namespace="cts", name="cts-backend", container="cts-backend",
+            ),),
+            owner_hint=OwnerRef(team="cts-platform"),
+            exposure_class=EXPOSURE_ACTIVE_IN_SOURCE,
+            evidence_ref="kubernetes://apps/v1/namespaces/cts/deployments/cts-backend@12345",
+            inline_value_present=True,
+            default_action=ACTION_EMERGENCY_ROTATION,
+        ),
+    )
+
+    output_path = str(tmp_path / "credential-posture.json")
+
+    with patch("platform_orchestration_contracts.run_discovery.KubernetesPythonDiscoveryClient"):
+        with patch("platform_orchestration_contracts.run_discovery.discover_kubernetes_credentials") as mock_discover:
+            mock_discover.return_value = mock_observations
+            exit_code = run_discovery(
+                namespace="cts",
+                sources=["kubernetes"],
+                output_path=output_path,
+                run_id="test-findings-manifest-001",
+            )
+
+    assert exit_code == 2
+
+    bundle_path = tmp_path / "credential-discovery" / "environment=dev" / "run_id=test-findings-manifest-001"
+    manifest = json.loads((bundle_path / "manifest.json").read_text())
+    assert manifest["scan_status"] == "completed_with_findings"
+    assert manifest["exit_code"] == 2
+    assert manifest["emergency_items"] >= 1
+
+
+# --- Collision handling and idempotency tests ---
+
+
+def test_write_safe_evidence_bundle_idempotent_replay(tmp_path):
+    """Writing the same bundle twice is a safe replay (no error)."""
+    from platform_orchestration_contracts.evidence_bundle import write_safe_evidence_bundle
+    destination = tmp_path / "bundle"
+    files = {
+        "report.json": '{"run_id": "test-001"}',
+        "report.md": "# Test\ntest-001",
+    }
+    # First write
+    write_safe_evidence_bundle(destination=destination, files=files, run_id="test-001")
+    assert destination.exists()
+    # Second write with identical content — should not raise
+    write_safe_evidence_bundle(destination=destination, files=files, run_id="test-001")
+    # Content should be unchanged
+    assert (destination / "report.json").read_text() == '{"run_id": "test-001"}'
+
+
+def test_write_safe_evidence_bundle_collision_different_content(tmp_path):
+    """Writing different content to an existing bundle raises collision error."""
+    from platform_orchestration_contracts.evidence_bundle import (
+        write_safe_evidence_bundle,
+        EvidenceBundleCollisionError,
+    )
+    destination = tmp_path / "bundle"
+    files1 = {
+        "report.json": '{"run_id": "test-001"}',
+        "manifest.json": '{"run_id": "test-001", "manifest_version": "credential-discovery-evidence.v1"}',
+    }
+    write_safe_evidence_bundle(destination=destination, files=files1, run_id="test-001")
+
+    files2 = {
+        "report.json": '{"run_id": "test-002"}',
+        "manifest.json": '{"run_id": "test-002", "manifest_version": "credential-discovery-evidence.v1"}',
+    }
+    with pytest.raises(EvidenceBundleCollisionError, match="collision"):
+        write_safe_evidence_bundle(destination=destination, files=files2, run_id="test-002")
+
+
+def test_evidence_bundle_collision_error_contains_no_secrets():
+    """EvidenceBundleCollisionError contains only opaque paths and run IDs."""
+    from platform_orchestration_contracts.evidence_bundle import EvidenceBundleCollisionError
+    err = EvidenceBundleCollisionError(
+        destination="/evidence/credential-discovery/environment=dev/run_id=test-001",
+        existing_run_id="test-001",
+        requested_run_id="test-002",
+    )
+    msg = str(err)
+    assert "/evidence/" in msg
+    assert "test-001" in msg
+    assert "test-002" in msg
+    # No secret-like content
+    assert "password" not in msg.lower()
+    assert "token" not in msg.lower()
+
+
+def test_write_discovery_evidence_idempotent(tmp_path):
+    """write_discovery_evidence is idempotent for the same run."""
+    from platform_orchestration_contracts.evidence_bundle import write_discovery_evidence
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, COVERAGE_COMPLETED,
+    )
+    report = PostureReport(
+        run_id="test-idempotent-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:abc",
+        contract_package_version=__version__,
+    )
+    # First write
+    path1 = write_discovery_evidence(
+        base_path=tmp_path,
+        run_id="test-idempotent-001",
+        environment="dev",
+        report=report,
+        exit_code=0,
+    )
+    assert path1.exists()
+    # Second write — should not raise (safe replay)
+    path2 = write_discovery_evidence(
+        base_path=tmp_path,
+        run_id="test-idempotent-001",
+        environment="dev",
+        report=report,
+        exit_code=0,
+    )
+    assert path1 == path2
+    # Content should be unchanged
+    assert (path1 / "report.json").exists()
+
+
+def test_write_discovery_evidence_collision_different_run(tmp_path):
+    """write_discovery_evidence raises collision error for different content."""
+    from platform_orchestration_contracts.evidence_bundle import (
+        write_discovery_evidence,
+        EvidenceBundleCollisionError,
+    )
+    from platform_orchestration_contracts.credential_discovery_workflow import (
+        PostureReport, COVERAGE_COMPLETED,
+    )
+    report1 = PostureReport(
+        run_id="test-collision-001",
+        evaluated_at="2026-09-05T12:00:00+00:00",
+        policy_version="1",
+        total_credentials=0,
+        eligible_count=0,
+        blocked_count=0,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:abc",
+        contract_package_version=__version__,
+    )
+    write_discovery_evidence(
+        base_path=tmp_path,
+        run_id="test-collision-001",
+        environment="dev",
+        report=report1,
+        exit_code=0,
+    )
+
+    # Try to write a different report to the same path
+    report2 = PostureReport(
+        run_id="test-collision-001",
+        evaluated_at="2026-09-05T13:00:00+00:00",  # different timestamp
+        policy_version="1",
+        total_credentials=1,  # different content
+        eligible_count=0,
+        blocked_count=1,
+        unowned_count=0,
+        orphaned_count=0,
+        entries=(),
+        coverage={COVERAGE_SOURCE_KUBERNETES: COVERAGE_COMPLETED},
+        entries_sha256="sha256:def",
+        contract_package_version=__version__,
+    )
+    with pytest.raises(EvidenceBundleCollisionError):
+        write_discovery_evidence(
+            base_path=tmp_path,
+            run_id="test-collision-001",
+            environment="dev",
+            report=report2,
+            exit_code=0,
+        )

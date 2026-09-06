@@ -322,6 +322,13 @@ def run_discovery(
     # Convert observations to inventory records
     records = tuple(_observation_to_record(o) for o in observations)
 
+    # Build exposure status map from observations so posture entries
+    # carry the correct exposure classification (e.g. active_in_source).
+    exposure_status_map = {
+        rec.credential_set_id: obs.exposure_class
+        for obs, rec in zip(observations, records)
+    }
+
     # Build coverage map
     coverage = _build_coverage(sources)
 
@@ -333,6 +340,7 @@ def run_discovery(
         policy_version="1",
         coverage=coverage,
         evidence_manifest_ref=evidence_ref,
+        exposure_status_map=exposure_status_map,
     )
 
     # Generate report text
@@ -353,6 +361,11 @@ def run_discovery(
         )
         return 1
 
+    # Determine exit code BEFORE writing the evidence bundle so the
+    # manifest can record the correct scan_status and exit_code.
+    emergency_count = _count_emergency_items(observations)
+    exit_code = 2 if emergency_count > 0 else 0
+
     # Write evidence bundle
     if output_path:
         output_file = Path(output_path)
@@ -368,10 +381,11 @@ def run_discovery(
                 run_id=run_id,
                 environment=environment,
                 report=report,
+                exit_code=exit_code,
             )
             logger.info(
                 "Evidence bundle written",
-                extra={"path": str(bundle_path)},
+                extra={"path": str(bundle_path), "exit_code": exit_code},
             )
             print(f"Evidence bundle: {bundle_path}", file=sys.stderr)
         except UnsafeObservationError as e:
@@ -380,11 +394,17 @@ def run_discovery(
                 extra={"observation_id": e.observation_id, "marker": getattr(e, "marker", "")},
             )
             return 1
+        except Exception as e:
+            # Catch EvidenceBundleCollisionError and other write errors
+            logger.error(
+                "Evidence bundle write failed",
+                extra={"error_type": type(e).__name__},
+            )
+            return 1
     else:
         print(report_json)
 
     # Print console summary
-    emergency_count = _count_emergency_items(observations)
     print(f"\n=== Credential Discovery Summary ===", file=sys.stderr)
     print(f"Run ID: {run_id}", file=sys.stderr)
     print(f"Namespace: {namespace}", file=sys.stderr)
@@ -393,6 +413,7 @@ def run_discovery(
     print(f"Emergency items: {emergency_count}", file=sys.stderr)
     print(f"Coverage: {coverage}", file=sys.stderr)
     print(f"Entries SHA-256: {report.entries_sha256}", file=sys.stderr)
+    print(f"Exit code: {exit_code}", file=sys.stderr)
 
     if emergency_count > 0:
         print(f"\n=== EMERGENCY REMEDIATION ITEMS ===", file=sys.stderr)
@@ -403,9 +424,8 @@ def run_discovery(
             f"specifications and require immediate rotation.",
             file=sys.stderr,
         )
-        return 2
 
-    return 0
+    return exit_code
 
 
 def main(argv: Optional[list[str]] = None) -> int:

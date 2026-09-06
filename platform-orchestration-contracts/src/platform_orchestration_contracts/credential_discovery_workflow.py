@@ -550,6 +550,7 @@ def evaluate_posture(
     policy_version: str = "1",
     coverage: Optional[dict[str, str]] = None,
     evidence_manifest_ref: Optional[str] = None,
+    exposure_status_map: Optional[dict[str, str]] = None,
 ) -> PostureReport:
     """Evaluate posture for a set of credential inventory records.
 
@@ -621,7 +622,7 @@ def evaluate_posture(
         entry = build_posture_entry(
             record=record,
             eligibility=eligibility,
-            exposure_status="unknown",
+            exposure_status=(exposure_status_map or {}).get(record.credential_set_id, "unknown"),
         )
         entries.append(entry)
 

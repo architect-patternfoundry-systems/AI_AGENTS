@@ -4,7 +4,7 @@ Versioned schemas and adapters for cross-app Temporal workflow integration.
 See ADR-036 for the full integration standard.
 """
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 from .workflow_envelope import (
     WorkflowEnvelope,
@@ -259,6 +259,11 @@ from .kubernetes_discovery_adapter import (
 # evidence bundle writer (Phase 1 atomic evidence persistence)
 from .evidence_bundle import (
     EVIDENCE_MANIFEST_VERSION,
+    SCAN_STATUS_COMPLETED,
+    SCAN_STATUS_COMPLETED_WITH_FINDINGS,
+    SCAN_STATUS_FAILED,
+    SCAN_STATUS_PARTIAL,
+    EvidenceBundleCollisionError,
     build_evidence_manifest,
     build_checksums_text,
     write_safe_evidence_bundle,
@@ -500,6 +505,11 @@ __all__ = [
     "DiscoveryError",
     # evidence bundle writer (Phase 1 atomic evidence persistence)
     "EVIDENCE_MANIFEST_VERSION",
+    "SCAN_STATUS_COMPLETED",
+    "SCAN_STATUS_COMPLETED_WITH_FINDINGS",
+    "SCAN_STATUS_FAILED",
+    "SCAN_STATUS_PARTIAL",
+    "EvidenceBundleCollisionError",
     "build_evidence_manifest",
     "build_checksums_text",
     "write_safe_evidence_bundle",
