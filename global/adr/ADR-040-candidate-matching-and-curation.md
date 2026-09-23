@@ -58,13 +58,34 @@ Single weak attributes never produce a proposal — they annotate ambiguity.
 Confidence is recorded with `matching_basis` (the attribute set used), never
 as a bare score.
 
-### 4. Acceptance
+### 4. Acceptance and decision outcomes
 
-- A `match_decision` requires: `actor`, `recorded_at`, `evidence_ref`,
-  `decision` (`accepted`/`rejected`), and `reason_code`.
+A `match_decision` records one of five outcomes:
+
+| Decision outcome | Meaning |
+|---|---|
+| `accepted` | Candidate is linked to the canonical CI |
+| `rejected` | Candidate is explicitly **not** that canonical CI |
+| `deferred` | Insufficient evidence; revisit after a stated condition or date |
+| `superseded` | A later decision replaces the prior decision |
+| `withdrawn` | Proposal was invalidated before adjudication |
+
+Every decision requires: `candidate_id`, `canonical_ci_id`,
+`matching_basis` and confidence classification, `actor` (adjudicator
+identity), `recorded_at`, `decision`, `reason_code`, and `evidence_ref`.
+
 - Only an `accepted` decision may populate `canonical_ci_id` — and even then,
   via a new append-only linkage record, not by editing history.
-- Rejection with `reason_code` is a durable outcome, not a deletion.
+- `deferred` and `rejected` outcomes may carry an optional review-expiry
+  where the underlying evidence is expected to change.
+
+**Negative-match memory.** A `rejected` decision is a durable
+"do not re-propose under the same basis" control. The matcher must not
+re-surface a candidate/CI pair whose prior rejection basis still applies;
+re-proposal is permitted only when input evidence, candidate lineage
+(`candidate_supersedes_candidate_id` chain), the canonical CI record, or the
+matching policy has materially changed — and the new proposal must reference
+the superseded rejection. Rejection is a durable outcome, never a deletion.
 
 ### 5. Source movement and identity history
 
@@ -108,6 +129,9 @@ as a bare score.
 4. Contradictory strong attributes shall produce `conflict` findings.
 5. All match decisions shall be reversible only by supersession.
 6. Source moves shall preserve full candidate lineage.
+7. A `rejected` candidate/CI pair shall not be re-proposed under the same
+   matching basis; re-proposal requires materially changed evidence, lineage,
+   target, or policy, and must reference the superseded rejection.
 
 ## References
 
