@@ -112,6 +112,27 @@ A re-proposal **must** include `supersedes_decision_id`,
 machine-checkable escape hatch, not reviewer interpretation. Rejection is a
 durable outcome, never a deletion.
 
+**Deterministic basis equivalence.** Suppression cannot rely on text
+comparison. `matching_basis` shall be canonically serialized into a
+`basis_fingerprint`:
+
+```text
+basis_fingerprint = SHA-256(canonicalize(
+  candidate_id,
+  canonical_ci_id,
+  ordered(attribute, normalized_value, provenance_ref,
+          observed_at_or_snapshot),
+  matching_policy_version
+))
+```
+
+The conceptual suppression key is `(candidate_lineage_id, canonical_ci_id,
+matching_policy_version, basis_fingerprint)`. Tuple ordering, prose,
+inconsistent normalization, or irrelevant added evidence must not alter
+equivalence — a re-proposal is permitted only when an enumerated
+`material_change_type` corresponds to a changed, evidence-backed component
+of that key.
+
 ### 5. Source movement and identity history
 
 - File moves, renames, and coordinate changes produce a **new
@@ -164,6 +185,9 @@ durable outcome, never a deletion.
 8. `deferred` decisions shall carry a revisit condition or date; `actor`
    and `matching_policy_version` shall be resolvable, immutable identifiers
    on every decision.
+9. `matching_basis` shall be canonically serialized into a deterministic
+   `basis_fingerprint`; equivalence shall be decided by that fingerprint and
+   the suppression key, never by text comparison.
 
 ## References
 
