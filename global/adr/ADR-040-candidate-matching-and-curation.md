@@ -2,10 +2,11 @@
 
 ## Status
 
-**Proposed** — 2026-09-23. Builds on ADR-039 (accepted): the observation plane
-is implemented; this ADR proposes how source-derived candidates may eventually
-link to canonical CIs. Until accepted, `canonical_ci_id` remains an inert
-nullable external reference.
+**Accepted** — proposed 2026-09-23, accepted 2026-09-24. Builds on ADR-039
+(accepted): the observation plane is implemented; this ADR decides how
+source-derived candidates may eventually link to canonical CIs. Linkage
+requires the governed proposal/decision path defined here — `canonical_ci_id`
+remains inert until that path is implemented and separately authorized.
 
 ## Context
 

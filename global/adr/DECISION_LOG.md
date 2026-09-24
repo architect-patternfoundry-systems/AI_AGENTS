@@ -24,7 +24,7 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-028 | Service Delivery and Break-Glass Recovery Framework | Accepted (Certified) | 2026-08-16 | Platform Team | Infrastructure |
 | ADR-029 | Continuous DR Runbook Graph and Automated Recertification | Accepted | 2026-08-17 | Platform Team | Operations |
 | ADR-039 | Canonical CMDB & Source-Authority Consolidation (Aegis Control Plane) | Accepted | 2026-09-23 | Platform Team | Governance |
-| ADR-040 | Candidate-to-Canonical CI Matching, Curation, and Lifecycle Semantics | Proposed | 2026-09-23 | Platform Team | Governance |
+| ADR-040 | Candidate-to-Canonical CI Matching, Curation, and Lifecycle Semantics | Accepted | 2026-09-24 | Platform Team | Governance |
 
 ## Categories
 
