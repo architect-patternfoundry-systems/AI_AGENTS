@@ -98,13 +98,20 @@ canonical CI identity, matching-policy version, and evidence basis are
 materially equivalent to the rejected decision.
 
 A previously rejected pair may be re-proposed only when at least one of the
-following has changed relative to the rejected decision:
+following has changed relative to the rejected decision. Each is a named
+`material_change_type`:
 
-1. Candidate lineage or source snapshot identity;
-2. Canonical CI identity, lifecycle, or identifying attributes;
-3. Matching policy/rule version;
-4. A deterministic or strong identifier becomes available;
-5. Referenced evidence is corrected, superseded, or materially expanded.
+1. `candidate_lineage_or_source_snapshot_changed` — candidate lineage or
+   source snapshot identity;
+2. `canonical_ci_changed` — canonical CI identity, lifecycle, or
+   identifying attributes;
+3. `matching_policy_version_changed` — matching policy/rule version;
+4. `strong_identifier_available` — a deterministic or strong identifier
+   becomes available;
+5. `evidence_corrected_superseded_or_expanded` — referenced evidence is
+   corrected, superseded, or materially expanded;
+6. `basis_canonicalization_version_changed` — the canonicalizer version
+   changed (serialization rules are governance-controlled).
 
 A re-proposal **must** include `supersedes_decision_id`,
 `material_change_type`, `material_change_evidence_ref`, the new
@@ -131,7 +138,40 @@ matching_policy_version, basis_fingerprint)`. Tuple ordering, prose,
 inconsistent normalization, or irrelevant added evidence must not alter
 equivalence — a re-proposal is permitted only when an enumerated
 `material_change_type` corresponds to a changed, evidence-backed component
-of that key.
+of that key. Suppression comparisons apply only to fingerprints computed
+under the same `basis_canonicalization_version`; fingerprints across
+canonicalizer versions are incomparable by definition.
+
+**Canonicalization contract.** `canonicalize()` must produce identical
+bytes for semantically identical input across matcher versions and
+implementation languages:
+
+- Attribute names: fixed schema identifiers — never display labels.
+- Value normalization: defined per attribute type — UUIDs lowercase; MACs
+  lowercase colon notation; hostnames per a stated normalization policy;
+  whitespace handling, Unicode normalization form, and null representation
+  are all explicit.
+- Provenance references: immutable content digest, source snapshot ID, or
+  versioned URI — never a mutable "latest" path.
+- Timestamps: RFC 3339 UTC at stated precision, or the immutable source
+  snapshot identity in place of per-observation timestamps.
+- Tuple order: lexicographic sort over fixed fields with a stated
+  deterministic tie-breaker.
+- Relevance: only attributes flagged `matching_relevant: true` enter the
+  fingerprint; additional irrelevant evidence changes nothing.
+- Absence: `null`, missing, empty string, unknown, and redacted serialize
+  distinctly where their semantics differ.
+- Versioning: every proposal and decision records an immutable
+  `basis_canonicalization_version`; changing it changes fingerprints and is
+  a governed material change
+  (`basis_canonicalization_version_changed`), never an accidental global
+  reopening of rejected pairs.
+
+The fingerprint is an index and equivalence accelerator, not permission to
+conflate records: where fingerprints collide or cannot be computed, the
+canonical serialized payloads (or the versioned structured basis) are
+compared directly. A proposal whose basis cannot be canonically serialized
+is rejected before scoring or presentation.
 
 ### 5. Source movement and identity history
 
@@ -142,6 +182,13 @@ of that key.
   to *carry* the link to the superseding candidate — decided, never
   automatic. An accepted association does **not** transfer on a source move;
   the new candidate is unlinked until adjudicated.
+- A changed `candidate_id` alone is never evidence of a match. Because
+  `candidate_id` participates in the fingerprint, a move changes the
+  fingerprint — but this only makes the superseding candidate *eligible*
+  for re-adjudication under `candidate_lineage_or_source_snapshot_changed`.
+  The new proposal must still provide a newly computed `matching_basis` and
+  evidence; the material-change type is the auditable reason, not the
+  justification.
 - Splits/merges/decommissions are represented as proposals with explicit
   `source_change_kind`; the canonical CI lifecycle is owned by
   `service_management`, not by source observations.
@@ -188,6 +235,16 @@ of that key.
 9. `matching_basis` shall be canonically serialized into a deterministic
    `basis_fingerprint`; equivalence shall be decided by that fingerprint and
    the suppression key, never by text comparison.
+10. Canonicalization shall be specified deterministically enough for
+    independent implementations to produce identical fingerprints; only
+    `matching_relevant` attributes participate; absent, unknown, and
+    redacted values serialize distinctly.
+11. `basis_fingerprint` is an equivalence accelerator: differing canonical
+    payloads shall never be conflated on collision, and unserializable
+    bases shall be rejected before scoring.
+12. A changed `candidate_id` alone shall confer only eligibility for
+    re-adjudication under an explicit `material_change_type` — never an
+    implicit match or a carried-over accepted link.
 
 ## References
 
