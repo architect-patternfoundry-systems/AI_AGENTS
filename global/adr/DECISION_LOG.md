@@ -23,8 +23,36 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-027 | Standardize ToneRoot Logging | Accepted | 2026-08-01 | Platform Team | Observability |
 | ADR-028 | Service Delivery and Break-Glass Recovery Framework | Accepted (Certified) | 2026-08-16 | Platform Team | Infrastructure |
 | ADR-029 | Continuous DR Runbook Graph and Automated Recertification | Accepted | 2026-08-17 | Platform Team | Operations |
-| ADR-039 | Canonical CMDB & Source-Authority Consolidation (Aegis Control Plane) | Accepted | 2026-09-23 | Platform Team | Governance |
-| ADR-040 | Candidate-to-Canonical CI Matching, Curation, and Lifecycle Semantics | Accepted | 2026-09-24 | Platform Team | Governance |
+| ADR-030 | Model Caches Use Static Local PVs on cortex | Accepted (file pending merge on branch `feature/adr-030-static-local-pvs`) | 2026-08-19 | Platform Team | Infrastructure |
+| ADR-031 | Change Impact Analysis & Stakeholder Governance | Accepted | 2026-08-20 | Platform Team | Governance |
+| ADR-032 | Federated Governance & Multi-Plane Evidence Architecture | Accepted | 2026-08-22 | Platform Team | Governance |
+| ADR-033 | ML Model Storage Patterns | Accepted | 2026-08-25 | Platform Team | Infrastructure |
+| ADR-034 | ML Model Storage Vulnerability FMEA | Accepted | 2026-08-26 | Platform Team | Security |
+| ADR-035 | CTS Temporal Pilot — Ollama Lease Wiring | Accepted (Implementation Gated) | 2026-09-04 | Platform Team | Architecture |
+| ADR-036 | Temporal Integration Standard — Cross-App Durable Orchestration | Accepted | 2026-09-05 | Platform Team | Architecture |
+| ADR-037 | Credential Rotation Lifecycle Workflow | Proposed | 2026-09-05 | Platform Team | Security |
+| ADR-038 | Credential Discovery, Inventory, and Enrollment Standard | Proposed | 2026-09-05 | Platform Team | Security |
+| ADR-039 | Canonical CMDB and Authority Consolidation | Accepted (pending merge; branch `adr/039-observation-plane`, mirrored to aegis-control-plane) | 2026-09-23 | Platform Team | Governance |
+| ADR-040 | Candidate Matching and Curation | Accepted (mirrored to aegis-control-plane @ AI_AGENTS@78d52d9) | 2026-09-24 | Platform Team | Governance |
+| ADR-041 | GPU Tenancy Model — Registry, Classes, and Onboarding | Accepted (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-041-gpu-tenancy-model.md`) | 2026-09-24 | Platform Team | Infrastructure |
+| ADR-042 | Canonical Linkage Materialization Semantics | Earmarked — pending renumber of branch `adr/041-linkage-materialization` (dual-claimed 041; first-merged wins per ADR_NUMBERING.md) | 2026-09-24 | Platform Team | Governance |
+
+> **Next free: ADR-043.** Numbers are allocated only by a merged row in this
+> table — see `ADR_NUMBERING.md` for the full allocation policy, tiebreak rules,
+> and repo-local series (`INFRA-ADR-*`) guidance.
+
+## Legacy duplicate numbers (grandfathered, do not rename files)
+
+The following files share a number on `main`. The first-listed is the canonical
+entry above; suffix rows exist for cross-reference disambiguation only.
+
+| Suffix | File | Note |
+|--------|------|------|
+| ADR-015-b | `ADR-015-ollama-model-consolidation.md` | duplicate of 015 |
+| ADR-016-a … ADR-016-g | `ADR-016-{batch-generation-concurrency, enforce-subpath-mounts, gacs-data-retention, persistent-storage, registry-transport-split, scale-to-zero-transcription, split-dns-routing}.md` | seven files share 016 |
+| ADR-023-b | `ADR-023-cloudflare-tunnel-public-edge-pattern.md` | duplicate of 023 |
+| ADR-026-b | `ADR-026-gpu-scheduler-policy-baseline.md` | duplicate of 026 |
+| ADR-035-b | `ADR-035-dependency-git-status.md` | duplicate of 035 |
 
 ## Categories
 
@@ -52,7 +80,7 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 
 ## Document Control
 
-**Version:** 1.2  
-**Last Updated:** August 17, 2026  
-**Next Review:** Monthly  
+**Version:** 1.4
+**Last Updated:** September 24, 2026
+**Next Review:** Monthly
 **Maintained By:** AI_AGENTS Governance Team
