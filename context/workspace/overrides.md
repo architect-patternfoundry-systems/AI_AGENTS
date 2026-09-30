@@ -21,7 +21,9 @@ Workspace-specific overrides and additions to global governance.
   - `git branch --show-current` before any commit/branch operation
   - `git status` / `git diff origin/<branch>` before claiming push/commit state
   - `gh pr diff <n> --name-only` + `gh pr view <n> --json commits` before describing PR contents (a claim true at commit time can be stale after rebase, merge, or concurrent activity)
-- **Credential Generation Protocol (TAILSCALE-OAUTH-01):** Newly generated credentials must enter an approved encrypted secret-management flow (SOPS/age under `apps/secrets/`) immediately. Any credential displayed, copied, logged, committed, or transmitted outside that flow — including shell output, transcripts, diffs, or artifact bundles — is presumed exposed, must not be deployed, and must be revoked or discarded. Secret scanning must cover generated manifests, rendered output, live annotations (`kubectl.kubernetes.io/last-applied-configuration`), and evidence bundles — not just committed source files.
+- **Credential Generation Protocol (TAILSCALE-OAUTH-01):** Generate a credential only when its approved encrypted destination is ready (SOPS/age under `apps/secrets/`). Write it directly into that flow; never expose it through shell history, terminal output, clipboard staging, chat, logs, unencrypted files, pull-request diffs, CI artifacts, or generated bundles. Any credential that crosses an unapproved boundary is presumed exposed — do not deploy it; revoke or discard it before creating a replacement.
+  - An outcome-only validity or revocation test may record timestamp, actor, target identity, and success/failure status — it must not retain request/response payloads, token values, secret fragments, or headers.
+  - Secret scanning applies to source files, generated manifests, Helm/Kustomize render output, deployment artifacts, controller annotations (e.g. `kubectl.kubernetes.io/last-applied-configuration`), CI logs, and review bundles.
 
 ## Optimization Opportunities
 - **Ollama Model Consolidation**: See ADR-015 for opportunity to consolidate llama3 (4.7GB) + gemma2:9b (5.4GB) → single Qwen2.5-3B-Instruct (~3GB), potential 7GB savings
