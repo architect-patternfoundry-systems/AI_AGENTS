@@ -36,8 +36,9 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-040 | Candidate Matching and Curation | Accepted (mirrored to aegis-control-plane @ AI_AGENTS@78d52d9) | 2026-09-24 | Platform Team | Governance |
 | ADR-041 | GPU Tenancy Model — Registry, Classes, and Onboarding | Accepted (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-041-gpu-tenancy-model.md`) | 2026-09-24 | Platform Team | Infrastructure |
 | ADR-042 | Canonical Linkage Materialization Semantics | Earmarked — pending renumber of branch `adr/041-linkage-materialization` (dual-claimed 041; first-merged wins per ADR_NUMBERING.md) | 2026-09-24 | Platform Team | Governance |
+| ADR-043 | GPU Nanny as Durable, Policy-Governed Admission Authority | Proposed (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-043-gpu-nanny-durable-admission-authority.md`; extends ADR-041) | 2026-09-27 | Platform Team | Infrastructure |
 
-> **Next free: ADR-043.** Numbers are allocated only by a merged row in this
+> **Next free: ADR-044.** Numbers are allocated only by a merged row in this
 > table — see `ADR_NUMBERING.md` for the full allocation policy, tiebreak rules,
 > and repo-local series (`INFRA-ADR-*`) guidance.
 
