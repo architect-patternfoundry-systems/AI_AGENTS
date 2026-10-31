@@ -37,7 +37,11 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 | ADR-041 | GPU Tenancy Model — Registry, Classes, and Onboarding | Accepted (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-041-gpu-tenancy-model.md`) | 2026-09-24 | Platform Team | Infrastructure |
 | ADR-042 | Canonical Linkage Materialization Semantics | Earmarked — pending renumber of branch `adr/041-linkage-materialization` (dual-claimed 041; first-merged wins per ADR_NUMBERING.md) | 2026-09-24 | Platform Team | Governance |
 
-> **Next free: ADR-043.** Numbers are allocated only by a merged row in this
+| ADR-044 | Stable Diffusion Serialization-Peer Membership — Conditional Non-Peer | Proposed (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-044-sd-serialization-peer-membership.md`) | 2026-10-30 | Platform Team | Infrastructure |
+
+| ADR-045 | Serialization-Peer Membership as a Class Rule — Unbounded Compute vs Declared SLO | Proposed (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-045-serialization-class-rule.md`) | 2026-10-30 | Platform Team | Infrastructure |
+
+> **Next free: ADR-046.** Numbers are allocated only by a merged row in this
 > table — see `ADR_NUMBERING.md` for the full allocation policy, tiebreak rules,
 > and repo-local series (`INFRA-ADR-*`) guidance.
 
