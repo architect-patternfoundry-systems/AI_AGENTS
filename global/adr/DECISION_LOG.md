@@ -39,7 +39,9 @@ This document tracks all Architectural Decision Records (ADRs) in the AI_AGENTS 
 
 | ADR-044 | Stable Diffusion Serialization-Peer Membership — Conditional Non-Peer | Proposed (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-044-sd-serialization-peer-membership.md`) | 2026-10-30 | Platform Team | Infrastructure |
 
-> **Next free: ADR-045.** Numbers are allocated only by a merged row in this
+| ADR-045 | Serialization-Peer Membership as a Class Rule — Unbounded Compute vs Declared SLO | Proposed (hosted in `infrastructure` repo: `docs/artifacts/proposals/ADR-045-serialization-class-rule.md`) | 2026-10-30 | Platform Team | Infrastructure |
+
+> **Next free: ADR-046.** Numbers are allocated only by a merged row in this
 > table — see `ADR_NUMBERING.md` for the full allocation policy, tiebreak rules,
 > and repo-local series (`INFRA-ADR-*`) guidance.
 
