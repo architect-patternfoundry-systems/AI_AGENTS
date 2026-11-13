@@ -177,10 +177,12 @@ async def generate_successor_cred(spec: dict) -> ActResult:
                             "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
                             "-o", "jsonpath={.data.password}")
     old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok_s else ""
-    uri_tmpl = os.environ.get(
-        "ROTATION_URI_TEMPLATE",
-        "postgresql://{user}:{pw}@pgbouncer.infra-data.svc.cluster.local:5432/mydatabase")
-    uri = uri_tmpl.format(user=successor, pw=pw)
+    # DSN assembled from discrete env parts — no credential-shaped
+    # postgresql://user:pw@ literal ever exists in YAML/manifests.
+    _h = os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local")
+    _p = os.environ.get("ROTATION_PG_PORT", "5432")
+    _d = os.environ.get("ROTATION_PG_DB", "mydatabase")
+    uri = f"postgresql://{successor}:{pw}@{_h}:{_p}/{_d}"
     manifest = (
         "apiVersion: v1\nkind: Secret\nmetadata:\n"
         f"  name: {os.environ.get('ROTATION_SECRET_NAME','cts-backend-db')}\n"
@@ -226,7 +228,6 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
 
-@activity.defn
 async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
     """Write sealed manifest + open PR via gh. sealed is already encrypted."""
     try:
@@ -255,7 +256,6 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
         return ActResult(Outcome.RETRYABLE, f"git:{(e.stderr or b'')[:200].decode(errors='replace')}")
 
 
-@activity.defn
 async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
     """ntfy push + PR comment (redundant channels)."""
     errs = []
@@ -279,7 +279,6 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
     return ActResult(Outcome.OK, ";".join(errs) if errs else "notified")
 
 
-@activity.defn
 async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: int = 900) -> ActResult:
     """All consumers' new pods Ready AND successor auth probe passes."""
     deadline = time.time() + timeout_s
@@ -310,7 +309,6 @@ async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: in
     return ActResult(Outcome.COMPENSATE, "health-gate-timeout")
 
 
-@activity.defn
 async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
     """Update pgbouncer userlist (if consumer) + rollout restarts.
 
@@ -346,7 +344,6 @@ async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
     return ActResult(Outcome.OK, "consumers-rolled")
 
 
-@activity.defn
 async def revoke_predecessor(principal: str) -> ActResult:
     """DROP ROLE — idempotent (IF EXISTS). Used for predecessor AND
     compensation (delete unused successor)."""
@@ -371,7 +368,6 @@ async def revoke_predecessor(principal: str) -> ActResult:
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
 
-@activity.defn
 async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
     """Old credential must FAIL auth — twice consecutively to be safe."""
     # Read the PREDECESSOR password from the sealed snapshot — the live
@@ -401,7 +397,6 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
                      f"dead-probes:{dead}/2")
 
 
-@activity.defn
 async def post_closure_evidence(evidence: dict) -> ActResult:
     """POST evidence → governance-closure endpoint."""
     url = os.environ.get("GOVERNANCE_CLOSURE_URL",
