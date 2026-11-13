@@ -163,8 +163,12 @@ class CredentialRotationWorkflow:
     # ---- main -------------------------------------------------------
     @workflow.run
     async def run(self, spec: RotationSpec) -> RotationState:
-        # Import activities - they are registered by the worker
+        # Create activity stubs with proper Temporal SDK pattern
         from platform_orchestration_contracts import credential_rotation_activities as acts
+
+        # Mark the activities module as pass-through for sandbox
+        with workflow.unsafe.imports_passed_through():
+            from platform_orchestration_contracts import credential_rotation_activities as acts_unsafe
 
         spec.successor_name = spec.successor_name or f"{spec.principal}_r{int(workflow.now().timestamp()) % 100000}"
         self._state.successor = spec.successor_name
@@ -186,17 +190,33 @@ class CredentialRotationWorkflow:
                     raise RuntimeError(f"{step}: {res.detail}")
                 return res.ref
 
-            sealed = _req(await acts.generate_successor_cred(
-                {"principal": spec.principal, "successor": spec.successor_name}
+            sealed = _req(await workflow.execute_activity(
+                acts_unsafe.generate_successor_cred,
+                {"principal": spec.principal, "successor": spec.successor_name},
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
             ), "generate_successor_cred")
-            _req(await acts.create_role(spec.principal, spec.successor_name, sealed, {
-                "db_host": spec.db_host, "db_name": spec.db_name,
-            }), "create_role")
+            _req(await workflow.execute_activity(
+                acts_unsafe.create_role,
+                spec.principal, spec.successor_name, sealed,
+                {"db_host": spec.db_host, "db_name": spec.db_name},
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            ), "create_role")
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-            self._state.pr_url = _req(await acts.sops_encrypt_and_open_pr(sealed, branch),
-                                      "sops_encrypt_and_open_pr")
+            self._state.pr_url = _req(await workflow.execute_activity(
+                acts_unsafe.sops_encrypt_and_open_pr,
+                sealed, branch,
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            ), "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
-            await acts.notify_human(self._state.pr_url, spec.principal, "rotation PR ready")
+            await workflow.execute_activity(
+                acts_unsafe.notify_human,
+                self._state.pr_url, spec.principal, "rotation PR ready",
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            )
 
             if spec.dry_run:
                 self._state.stage = "dry_run_complete"
@@ -212,40 +232,72 @@ class CredentialRotationWorkflow:
             except workflow.TimeoutError:
                 self._state.stage = "expired"
                 # Gate window elapsed — clean up the unused successor
-                await acts.revoke_predecessor(spec.successor_name)
+                await workflow.execute_activity(
+                    acts_unsafe.revoke_predecessor,
+                    spec.successor_name,
+                    schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=4),
+                )
                 return self._state
             if self._merge_rejected or self._aborted:
                 self._state.stage = "aborted"
-                await acts.revoke_predecessor(spec.successor_name)
+                await workflow.execute_activity(
+                    acts_unsafe.revoke_predecessor,
+                    spec.successor_name,
+                    schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=4),
+                )
                 return self._state
 
             # CUTOVER — flip consumers to successor, verify, then revoke
             self._state.stage = "cutover"
-            _req(await acts.patch_and_roll(spec.consumers, sealed), "patch_and_roll")
+            _req(await workflow.execute_activity(
+                acts_unsafe.patch_and_roll,
+                spec.consumers, sealed,
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            ), "patch_and_roll")
             # Gate contract: every listed consumer must auth on the successor
             # (fresh TCP probes, no pool reuse). Old role still valid here.
-            _req(await acts.wait_consumer_healthy(
-                spec.consumers, sealed, timeout_s=900
+            _req(await workflow.execute_activity(
+                acts_unsafe.wait_consumer_healthy,
+                spec.consumers, sealed, 900,
+                schedule_to_close_timeout=workflow.timedelta(minutes=15),
+                retry_policy=RetryPolicy(maximum_attempts=4),
             ), "wait_consumer_healthy")
 
             if spec.soak_seconds:
                 await workflow.sleep(spec.soak_seconds)
 
-            await acts.revoke_predecessor(spec.principal)  # ALTER ROLE NOLOGIN — DROP deferred
+            await workflow.execute_activity(
+                acts_unsafe.revoke_predecessor,
+                spec.principal,
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            )
             self._state.stage = "verify"
 
             # VERIFY — old credential must now fail auth; ZeroTrace re-scan clean
             # Strict: predecessor must fail auth on fresh connections —
             # a still-alive result forces compensation before close.
-            _req(await acts.liveness_dead_check(spec.principal, sealed),
-                 "liveness_dead_check")
+            _req(await workflow.execute_activity(
+                acts_unsafe.liveness_dead_check,
+                spec.principal, sealed,
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            ), "liveness_dead_check")
             self._state.evidence["liveness_dead"] = True
             self._state.evidence["verified_at"] = workflow.now().isoformat()
 
             # CLOSE — post evidence; optional human ack is time-boxed and
             # non-blocking when automatic evidence is strong.
             self._state.stage = "closing"
-            await acts.post_closure_evidence(self._state.evidence)
+            await workflow.execute_activity(
+                acts_unsafe.post_closure_evidence,
+                self._state.evidence,
+                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=4),
+            )
             if spec.closure_ack_required:
                 try:
                     await workflow.wait_condition(
@@ -264,7 +316,12 @@ class CredentialRotationWorkflow:
             self._state.stage = "cutover_failed"
             self._state.error = str(e)
             try:
-                await acts.revoke_predecessor(spec.successor_name)
+                await workflow.execute_activity(
+                    acts_unsafe.revoke_predecessor,
+                    spec.successor_name,
+                    schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=4),
+                )
                 self._state.evidence["compensated"] = True
             except Exception as ce:
                 self._state.evidence["compensation_error"] = str(ce)
