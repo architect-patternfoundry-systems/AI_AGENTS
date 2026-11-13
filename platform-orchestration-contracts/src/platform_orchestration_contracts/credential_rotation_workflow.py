@@ -99,6 +99,7 @@ class RotationSpec:
     merge_wait_hours: int = 168          # finite gate window; expiry cleans up
     health_min_samples: int = 2          # min old-role auth failures before revoke
     closure_ack_required: bool = False   # human ack optional/time-boxed
+    dry_run: bool = False                # stop after open_pr+notify — zero mutation
     ntfy_topic: str = "ops-credential-rotation"
 
 
@@ -184,6 +185,11 @@ class CredentialRotationWorkflow:
             self._state.pr_url = await a.sops_encrypt_and_open_pr(sealed, branch)
             self._state.stage = "await_approval"
             await a.notify_human(self._state.pr_url, spec.principal, "rotation PR ready")
+
+            if spec.dry_run:
+                self._state.stage = "dry_run_complete"
+                self._state.evidence["dry_run"] = True
+                return self._state
 
             # APPROVE — wait for merge signal (the human gate)
             try:
