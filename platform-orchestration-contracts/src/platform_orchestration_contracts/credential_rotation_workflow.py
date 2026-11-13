@@ -163,11 +163,8 @@ class CredentialRotationWorkflow:
     # ---- main -------------------------------------------------------
     @workflow.run
     async def run(self, spec: RotationSpec) -> RotationState:
-        a = workflow.activities(
-            "rotation",
-            schedule_to_close_timeout=workflow.timedelta(minutes=10),
-            retry_policy=RetryPolicy(maximum_attempts=4),
-        )
+        # Import activities - they are registered by the worker
+        from platform_orchestration_contracts import credential_rotation_activities as acts
 
         spec.successor_name = spec.successor_name or f"{spec.principal}_r{int(workflow.now().timestamp()) % 100000}"
         self._state.successor = spec.successor_name
@@ -189,17 +186,17 @@ class CredentialRotationWorkflow:
                     raise RuntimeError(f"{step}: {res.detail}")
                 return res.ref
 
-            sealed = _req(await a.generate_successor_cred(
+            sealed = _req(await acts.generate_successor_cred(
                 {"principal": spec.principal, "successor": spec.successor_name}
             ), "generate_successor_cred")
-            _req(await a.create_role(spec.principal, spec.successor_name, sealed, {
+            _req(await acts.create_role(spec.principal, spec.successor_name, sealed, {
                 "db_host": spec.db_host, "db_name": spec.db_name,
             }), "create_role")
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-            self._state.pr_url = _req(await a.sops_encrypt_and_open_pr(sealed, branch),
+            self._state.pr_url = _req(await acts.sops_encrypt_and_open_pr(sealed, branch),
                                       "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
-            await a.notify_human(self._state.pr_url, spec.principal, "rotation PR ready")
+            await acts.notify_human(self._state.pr_url, spec.principal, "rotation PR ready")
 
             if spec.dry_run:
                 self._state.stage = "dry_run_complete"
@@ -215,32 +212,32 @@ class CredentialRotationWorkflow:
             except workflow.TimeoutError:
                 self._state.stage = "expired"
                 # Gate window elapsed — clean up the unused successor
-                await a.revoke_predecessor(spec.successor_name)
+                await acts.revoke_predecessor(spec.successor_name)
                 return self._state
             if self._merge_rejected or self._aborted:
                 self._state.stage = "aborted"
-                await a.revoke_predecessor(spec.successor_name)
+                await acts.revoke_predecessor(spec.successor_name)
                 return self._state
 
             # CUTOVER — flip consumers to successor, verify, then revoke
             self._state.stage = "cutover"
-            _req(await a.patch_and_roll(spec.consumers, sealed), "patch_and_roll")
+            _req(await acts.patch_and_roll(spec.consumers, sealed), "patch_and_roll")
             # Gate contract: every listed consumer must auth on the successor
             # (fresh TCP probes, no pool reuse). Old role still valid here.
-            _req(await a.wait_consumer_healthy(
+            _req(await acts.wait_consumer_healthy(
                 spec.consumers, sealed, timeout_s=900
             ), "wait_consumer_healthy")
 
             if spec.soak_seconds:
                 await workflow.sleep(spec.soak_seconds)
 
-            await a.revoke_predecessor(spec.principal)  # ALTER ROLE NOLOGIN — DROP deferred
+            await acts.revoke_predecessor(spec.principal)  # ALTER ROLE NOLOGIN — DROP deferred
             self._state.stage = "verify"
 
             # VERIFY — old credential must now fail auth; ZeroTrace re-scan clean
             # Strict: predecessor must fail auth on fresh connections —
             # a still-alive result forces compensation before close.
-            _req(await a.liveness_dead_check(spec.principal, sealed),
+            _req(await acts.liveness_dead_check(spec.principal, sealed),
                  "liveness_dead_check")
             self._state.evidence["liveness_dead"] = True
             self._state.evidence["verified_at"] = workflow.now().isoformat()
@@ -248,7 +245,7 @@ class CredentialRotationWorkflow:
             # CLOSE — post evidence; optional human ack is time-boxed and
             # non-blocking when automatic evidence is strong.
             self._state.stage = "closing"
-            await a.post_closure_evidence(self._state.evidence)
+            await acts.post_closure_evidence(self._state.evidence)
             if spec.closure_ack_required:
                 try:
                     await workflow.wait_condition(
@@ -267,7 +264,7 @@ class CredentialRotationWorkflow:
             self._state.stage = "cutover_failed"
             self._state.error = str(e)
             try:
-                await a.revoke_predecessor(spec.successor_name)
+                await acts.revoke_predecessor(spec.successor_name)
                 self._state.evidence["compensated"] = True
             except Exception as ce:
                 self._state.evidence["compensation_error"] = str(ce)
