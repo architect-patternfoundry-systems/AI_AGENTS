@@ -155,6 +155,7 @@ def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
 # ----------------------------------------------------------------------
 
 @activity.defn
+@activity.defn
 async def generate_successor_cred(spec: dict) -> ActResult:
     """Generate high-entropy password; seal it immediately.
 
@@ -201,6 +202,7 @@ async def generate_successor_cred(spec: dict) -> ActResult:
 
 
 @activity.defn
+@activity.defn
 async def create_role(principal: str, successor: str, sealed: str, role_spec: dict) -> ActResult:
     """CREATE ROLE successor (idempotent) + inherit principal's grants."""
     pw = _plaintext_from_sealed(sealed)
@@ -227,6 +229,7 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
     except Exception as e:
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
+@activity.defn
 
 async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
     """Write sealed manifest + open PR via gh. sealed is already encrypted."""
@@ -254,6 +257,7 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
         return ActResult(Outcome.OK, ref=r.stdout.strip())
     except subprocess.CalledProcessError as e:
         return ActResult(Outcome.RETRYABLE, f"git:{(e.stderr or b'')[:200].decode(errors='replace')}")
+@activity.defn
 
 
 async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
@@ -276,6 +280,7 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
         errs.append("gh-comment")
     if errs and len(errs) == 2:
         return ActResult(Outcome.RETRYABLE, ",".join(errs))
+@activity.defn
     return ActResult(Outcome.OK, ";".join(errs) if errs else "notified")
 
 
@@ -305,6 +310,7 @@ async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: in
                 except Exception:
                     pass
             return ActResult(Outcome.OK, "consumers-ready")
+@activity.defn
         time.sleep(10)
     return ActResult(Outcome.COMPENSATE, "health-gate-timeout")
 
@@ -339,6 +345,7 @@ async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
             continue
         ok, d = _kubectl("rollout", "restart", f"deploy/{c}", "-n",
                          os.environ.get("ROTATION_NAMESPACE", "cts"))
+@activity.defn
         if not ok:
             return ActResult(Outcome.RETRYABLE, f"restart-{c}:{d}")
     return ActResult(Outcome.OK, "consumers-rolled")
@@ -362,6 +369,7 @@ async def revoke_predecessor(principal: str) -> ActResult:
         # ownership intact — DROP would fail while the role owns
         # tables/migrations (always true for cortex_db_admin).
         cur.execute(psql.SQL("ALTER ROLE {} NOLOGIN").format(psql.Identifier(principal)))
+@activity.defn
         conn.close()
         return ActResult(Outcome.OK, f"role-nologin:{principal}")
     except Exception as e:
@@ -390,6 +398,7 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
             if "password authentication failed" in msg or "not permitted to log in" in msg:
                 dead += 1
             else:
+@activity.defn
                 time.sleep(3)
         except Exception:
             time.sleep(3)
