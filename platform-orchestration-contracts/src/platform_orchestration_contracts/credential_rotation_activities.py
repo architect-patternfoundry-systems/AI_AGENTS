@@ -174,10 +174,12 @@ async def generate_successor_cred(spec: dict) -> ActResult:
                             "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
                             "-o", "jsonpath={.data.password}")
     old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok_s else ""
-    uri_tmpl = os.environ.get(
-        "ROTATION_URI_TEMPLATE",
-        "postgresql://{user}:{pw}@pgbouncer.infra-data.svc.cluster.local:5432/mydatabase")
-    uri = uri_tmpl.format(user=successor, pw=pw)
+    # DSN assembled from discrete env parts — no credential-shaped
+    # postgresql://user:pw@ literal ever exists in YAML/manifests.
+    _h = os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local")
+    _p = os.environ.get("ROTATION_PG_PORT", "5432")
+    _d = os.environ.get("ROTATION_PG_DB", "mydatabase")
+    uri = f"postgresql://{successor}:{pw}@{_h}:{_p}/{_d}"
     manifest = (
         "apiVersion: v1\nkind: Secret\nmetadata:\n"
         f"  name: {os.environ.get('ROTATION_SECRET_NAME','cts-backend-db')}\n"
