@@ -88,6 +88,27 @@ def _kubectl(*args: str, input_bytes: bytes | None = None, timeout: int = 30) ->
         return False, "kubectl-timeout"
 
 
+def _sealed_field(sealed: str, key: str) -> str | None:
+    """Extract `key` from the sops-encrypted manifest's stringData."""
+    try:
+        ref = json.loads(sealed)
+        blob = base64.b64decode(ref["sealed"])
+        r = subprocess.run(
+            ["sops", "-d", "--input-type", "yaml", "--output-type", "yaml", "/dev/stdin"],
+            input=blob, capture_output=True, timeout=30,
+            env={**os.environ, "SOPS_AGE_KEY_FILE": os.environ.get("SOPS_AGE_KEY_FILE", "/etc/sops/age-key.txt")},
+        )
+        if r.returncode != 0:
+            return None
+        for line in r.stdout.decode().splitlines():
+            ls = line.strip()
+            if ls.startswith(key + ":"):
+                return ls.split(":", 1)[1].strip().strip('"')
+        return None
+    except Exception:
+        return None
+
+
 def _plaintext_from_sealed(sealed: str) -> str | None:
     """Decrypt the sealed manifest with the mounted age key; extract PG_PASS.
 
@@ -145,6 +166,14 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     # Live cts-backend-db carries `password` + `uri` (full DSN) — both
     # must carry the successor cred. URI template comes from env so the
     # password stays alnum-safe (no URI escaping ever needed).
+    # Snapshot the PREDECESSOR credential before merge — post-merge Flux
+    # overwrites the live secret with the successor, so liveness checks
+    # later must use this sealed snapshot, not the live secret.
+    ok_s, old_b64 = _kubectl("get", "secret",
+                            os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
+                            "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
+                            "-o", "jsonpath={.data.password}")
+    old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok_s else ""
     uri_tmpl = os.environ.get(
         "ROTATION_URI_TEMPLATE",
         "postgresql://{user}:{pw}@pgbouncer.infra-data.svc.cluster.local:5432/mydatabase")
@@ -155,9 +184,10 @@ async def generate_successor_cred(spec: dict) -> ActResult:
         f"  namespace: {os.environ.get('ROTATION_NAMESPACE','cts')}\n"
         "type: Opaque\nstringData:\n"
         f"  password: \"{pw}\"\n  uri: \"{uri}\"\n"
+        f"  predecessor_password: \"{old_pw}\"\n"
     ).encode()
     ok, sealed = _sops_encrypt(manifest)
-    del pw
+    del pw, old_pw
     if not ok:
         return ActResult(Outcome.FATAL, f"sops-encrypt-failed:{sealed}")
     sc = SealedCred(base64.b64encode(sealed if isinstance(sealed, bytes) else sealed.encode()).decode(),
@@ -334,13 +364,11 @@ async def revoke_predecessor(principal: str) -> ActResult:
 
 async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
     """Old credential must FAIL auth — twice consecutively to be safe."""
-    ok, old_b64 = _kubectl("get", "secret",
-                           os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
-                           "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
-                           "-o", "jsonpath={.data.password}")
-    old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok else None
+    # Read the PREDECESSOR password from the sealed snapshot — the live
+    # secret has been overwritten by Flux post-merge (successor creds).
+    old_pw = _sealed_field(sealed, "predecessor_password")
     if not old_pw:
-        return ActResult(Outcome.RETRYABLE, "old-cred-unreadable")
+        return ActResult(Outcome.RETRYABLE, "predecessor-cred-unsealed")
     dead = 0
     for _ in range(2):
         try:
@@ -352,7 +380,8 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
             conn.close()
             return ActResult(Outcome.COMPENSATE, "predecessor-still-valid")
         except psycopg2.OperationalError as e:
-            if "password authentication failed" in str(e):
+            msg = str(e)
+            if "password authentication failed" in msg or "not permitted to log in" in msg:
                 dead += 1
             else:
                 time.sleep(3)
