@@ -141,9 +141,11 @@ def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
     """sops -e using the repo .sops.yaml age key (runner pod mounts it)."""
     try:
         key_file = os.environ.get("SOPS_AGE_KEY_FILE", "/etc/sops/age-key.txt")
+        with open(key_file) as f:
+            age_key = f.read().strip()
         r = subprocess.run(
-            ["sops", "-e", "--input-type", "yaml", "--output-type", "yaml", "--age", f"AGE-SECRET-KEY-$(cat {key_file})", "/dev/stdin"],
-            input=manifest, capture_output=True, timeout=30, shell=True,
+            ["sops", "-e", "--input-type", "yaml", "--output-type", "yaml", "--age", f"AGE-SECRET-KEY-{age_key}", "/dev/stdin"],
+            input=manifest, capture_output=True, timeout=30,
         )
         return (r.returncode == 0), (r.stdout if r.returncode == 0 else r.stderr[:300])
     except Exception as e:
