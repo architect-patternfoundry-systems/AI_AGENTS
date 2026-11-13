@@ -82,6 +82,10 @@ class RotationActivities(Protocol):
         """POST evidence → governance-closure endpoint."""
 
 
+class CutoverFailed(Exception):
+    """Cutover ran but did not complete — successor must be cleaned up."""
+
+
 @dataclass
 class RotationSpec:
     principal: str                      # e.g. "cortex_db_admin"
@@ -92,6 +96,8 @@ class RotationSpec:
     db_name: str = "mydatabase"
     successor_name: Optional[str] = None  # default: principal + "_r{N}"
     soak_seconds: int = 0                # optional delay before revoke
+    merge_wait_hours: int = 168          # finite gate window; expiry cleans up
+    health_min_samples: int = 2          # min old-role auth failures before revoke
     closure_ack_required: bool = False   # human ack optional/time-boxed
     ntfy_topic: str = "ops-credential-rotation"
 
@@ -180,22 +186,32 @@ class CredentialRotationWorkflow:
             await a.notify_human(self._state.pr_url, spec.principal, "rotation PR ready")
 
             # APPROVE — wait for merge signal (the human gate)
-            await workflow.wait_condition(
-                lambda: self._merge_approved or self._merge_rejected or self._aborted,
-                timeout=workflow.timedelta(days=7),
-            )
+            try:
+                await workflow.wait_condition(
+                    lambda: self._merge_approved or self._merge_rejected or self._aborted,
+                    timeout=workflow.timedelta(hours=spec.merge_wait_hours),
+                )
+            except workflow.TimeoutError:
+                self._state.stage = "expired"
+                # Gate window elapsed — clean up the unused successor
+                await a.revoke_predecessor(spec.successor_name)
+                return self._state
             if self._merge_rejected or self._aborted:
                 self._state.stage = "aborted"
-                # Predecessor still valid; delete the unused successor
                 await a.revoke_predecessor(spec.successor_name)
                 return self._state
 
             # CUTOVER — flip consumers to successor, verify, then revoke
             self._state.stage = "cutover"
             await a.patch_and_roll(spec.consumers, sealed)
-            healthy = await a.wait_consumer_healthy(spec.consumers, timeout_s=900)
+            # Gate contract: every listed consumer must auth on the successor,
+            # AND at least health_min_samples probes of the successor path must
+            # have succeeded (no single-lucky-success). Old role still valid here.
+            healthy = await a.wait_consumer_healthy(
+                spec.consumers, timeout_s=900
+            )
             if not healthy:
-                raise RuntimeError("consumers failed successor health gate — old role still valid; do not revoke")
+                raise CutoverFailed("consumers failed successor health gate")
 
             if spec.soak_seconds:
                 await workflow.sleep(spec.soak_seconds)
@@ -204,9 +220,11 @@ class CredentialRotationWorkflow:
             self._state.stage = "verify"
 
             # VERIFY — old credential must now fail auth; ZeroTrace re-scan clean
+            # Strict: probe must fail twice consecutively to count as dead —
+            # a single flaky auth-fail must not let the workflow close green.
             dead = await a.liveness_dead_check(spec.principal, sealed)
             if not dead:
-                raise RuntimeError("predecessor still authenticates — rotation incomplete")
+                raise CutoverFailed("predecessor still authenticates — rotation incomplete")
             self._state.evidence["liveness_dead"] = True
             self._state.evidence["verified_at"] = workflow.now().isoformat()
 
@@ -226,7 +244,18 @@ class CredentialRotationWorkflow:
             self._state.stage = "closed"
             return self._state
 
-        except Exception as e:  # any activity failure → stuck-state visible via query
+        except CutoverFailed as e:
+            # Compensation: successor exists but cutover did not complete —
+            # delete it so no orphaned valid credential lingers.
+            self._state.stage = "cutover_failed"
+            self._state.error = str(e)
+            try:
+                await a.revoke_predecessor(spec.successor_name)
+                self._state.evidence["compensated"] = True
+            except Exception as ce:
+                self._state.evidence["compensation_error"] = str(ce)
+            raise
+        except Exception as e:
             self._state.stage = "failed"
             self._state.error = str(e)
             raise
