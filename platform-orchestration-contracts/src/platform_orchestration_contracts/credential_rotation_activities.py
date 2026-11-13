@@ -88,6 +88,31 @@ def _kubectl(*args: str, input_bytes: bytes | None = None, timeout: int = 30) ->
         return False, "kubectl-timeout"
 
 
+def _plaintext_from_sealed(sealed: str) -> str | None:
+    """Decrypt the sealed manifest with the mounted age key; extract PG_PASS.
+
+    Called by every activity that needs the successor password — the
+    sealed blob is durable in Temporal history, so any worker can
+    decrypt locally. Plaintext never leaves this process.
+    """
+    try:
+        ref = json.loads(sealed)
+        blob = base64.b64decode(ref["sealed"])
+        r = subprocess.run(
+            ["sops", "-d", "--input-type", "yaml", "--output-type", "yaml", "/dev/stdin"],
+            input=blob, capture_output=True, timeout=30,
+            env={**os.environ, "SOPS_AGE_KEY_FILE": os.environ.get("SOPS_AGE_KEY_FILE", "/etc/sops/age-key.txt")},
+        )
+        if r.returncode != 0:
+            return None
+        for line in r.stdout.decode().splitlines():
+            if line.strip().startswith("PG_PASS:"):
+                return line.split(":", 1)[1].strip().strip('"')
+        return None
+    except Exception:
+        return None
+
+
 def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
     """sops -e using the repo .sops.yaml age key (runner pod mounts it)."""
     try:
@@ -123,26 +148,21 @@ async def generate_successor_cred(spec: dict) -> ActResult:
         "type: Opaque\nstringData:\n"
         f"  PG_PASS: \"{pw}\"\n  PG_USER: \"{successor}\"\n"
     ).encode()
-    os.environ["_ROT_PLAINTEXT_TMP"] = pw
-    del pw  # plaintext lives in env only now; cleared on activity end
-
     ok, sealed = _sops_encrypt(manifest)
+    del pw
     if not ok:
-        os.environ.pop("_ROT_PLAINTEXT_TMP", None)
         return ActResult(Outcome.FATAL, f"sops-encrypt-failed:{sealed}")
     sc = SealedCred(base64.b64encode(sealed if isinstance(sealed, bytes) else sealed.encode()).decode(),
-                    successor, "_ROT_PLAINTEXT_TMP")
-    return ActResult(Outcome.OK, ref=json.dumps({"sealed": sc.sealed_b64, "ref": sc.plaintext_ref}))
+                    successor)
+    return ActResult(Outcome.OK, ref=json.dumps({"sealed": sc.sealed_b64, "successor": successor}))
 
 
-async def create_role(principal: str, successor: str, role_spec: dict) -> ActResult:
+async def create_role(principal: str, successor: str, sealed: str, role_spec: dict) -> ActResult:
     """CREATE ROLE successor (idempotent) + inherit principal's grants."""
-    pw = os.environ.pop("_ROT_PLAINTEXT_TMP", None)
+    pw = _plaintext_from_sealed(sealed)
     if pw is None:
-        return ActResult(Outcome.FATAL, "plaintext-ref-missing")
+        return ActResult(Outcome.FATAL, "sealed-decrypt-failed")
     try:
-        ok, d = _pg('CREATE ROLE %s LOGIN PASSWORD %s', (successor, pw)) if False else (True, "skip")
-        # AsIs quoting via psycopg2.sql for identifiers:
         from psycopg2 import sql as psql
         import psycopg2
         conn = psycopg2.connect(os.environ["ROTATION_PG_DSN"], connect_timeout=8)
@@ -209,7 +229,7 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
     return ActResult(Outcome.OK, ";".join(errs) if errs else "notified")
 
 
-async def wait_consumer_healthy(consumers: list[str], timeout_s: int = 900) -> ActResult:
+async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: int = 900) -> ActResult:
     """All consumers' new pods Ready AND successor auth probe passes."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -221,14 +241,14 @@ async def wait_consumer_healthy(consumers: list[str], timeout_s: int = 900) -> A
                 all_ready = False
         if all_ready:
             # probe: can the successor actually authenticate?
-            pw = os.environ.get("_ROT_PLAINTEXT_TMP")
+            pw = _plaintext_from_sealed(sealed)
             if pw:
                 import psycopg2
                 try:
                     conn = psycopg2.connect(
                         os.environ["ROTATION_PG_DSN"].replace(
                             f"user={os.environ.get('ROTATION_PRINCIPAL','')}",
-                            f"user={os.environ.get('_ROT_SUCCESSOR','')}"),
+                            f"user={json.loads(sealed).get('successor','')}"),
                         connect_timeout=6)
                     conn.close()
                     return ActResult(Outcome.OK, "consumers-ready+successor-auth")
@@ -245,8 +265,8 @@ async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
     Idempotent-ish: rollout restart is safe to re-issue. The userlist
     patch appends only if the successor line is absent.
     """
-    successor = os.environ.get("_ROT_SUCCESSOR", "")
-    pw = os.environ.get("_ROT_PLAINTEXT_TMP", "")
+    successor = json.loads(sealed).get("successor", "") if sealed.startswith("{") else ""
+    pw = _plaintext_from_sealed(sealed) or ""
     if "pgbouncer" in consumers:
         # append successor to userlist (plaintext form — pgbouncer SCRAMs it)
         ok, cur = _kubectl("get", "secret", "pgbouncer-userlist", "-n", "infra-data",
@@ -283,22 +303,35 @@ async def revoke_predecessor(principal: str) -> ActResult:
         conn = psycopg2.connect(os.environ["ROTATION_PG_DSN"], connect_timeout=8)
         conn.autocommit = True
         cur = conn.cursor()
-        cur.execute(psql.SQL("REASSIGN OWNED BY {} TO postgres").format(psql.Identifier(principal))) \
-            if os.environ.get("ROTATION_REASSIGN") else None
-        cur.execute(psql.SQL("DROP ROLE IF EXISTS {}").format(psql.Identifier(principal)))
+        if os.environ.get("ROTATION_ALLOW_DROP"):
+            cur.execute(psql.SQL("REASSIGN OWNED BY {} TO postgres").format(psql.Identifier(principal)))
+            cur.execute(psql.SQL("DROP OWNED BY {}").format(psql.Identifier(principal)))
+            cur.execute(psql.SQL("DROP ROLE IF EXISTS {}").format(psql.Identifier(principal)))
+            return ActResult(Outcome.OK, f"role-dropped:{principal}")
+        # Default: NOLOGIN kills auth immediately but keeps object
+        # ownership intact — DROP would fail while the role owns
+        # tables/migrations (always true for cortex_db_admin).
+        cur.execute(psql.SQL("ALTER ROLE {} NOLOGIN").format(psql.Identifier(principal)))
         conn.close()
-        return ActResult(Outcome.OK, f"role-dropped:{principal}")
+        return ActResult(Outcome.OK, f"role-nologin:{principal}")
     except Exception as e:
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
 
 async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
     """Old credential must FAIL auth — twice consecutively to be safe."""
+    ok, old_b64 = _kubectl("get", "secret",
+                           os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
+                           "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
+                           "-o", "jsonpath={.data.PG_PASS}")
+    old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok else None
+    if not old_pw:
+        return ActResult(Outcome.RETRYABLE, "old-cred-unreadable")
     dead = 0
     for _ in range(2):
         try:
             import psycopg2
-            pw = os.environ.get("_ROT_OLD_PW")  # injected by runner for the probe
+            pw = old_pw
             conn = psycopg2.connect(
                 os.environ["ROTATION_PG_DSN"].split(" user=")[0]
                 + f" user={principal} password={pw}", connect_timeout=5)

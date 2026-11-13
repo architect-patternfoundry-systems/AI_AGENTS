@@ -24,7 +24,6 @@ ops can observe where a rotation is stuck.
 from __future__ import annotations
 
 import json
-import time
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
@@ -169,20 +168,28 @@ class CredentialRotationWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=4),
         )
 
-        spec.successor_name = spec.successor_name or f"{spec.principal}_r{int(time.time()) % 10000}"
+        spec.successor_name = spec.successor_name or f"{spec.principal}_r{int(workflow.now().timestamp()) % 100000}"
         self._state.successor = spec.successor_name
         self._state.stage = "prepare"
 
         try:
             # PREPARE — sealed cred + role + PR; no mutation of consumers
-            sealed = await a.generate_successor_cred(
+            def _req(res, step):
+                if not res.ok:
+                    if res.outcome.name == "COMPENSATE":
+                        raise CutoverFailed(f"{step}: {res.detail}")
+                    raise RuntimeError(f"{step}: {res.detail}")
+                return res.ref
+
+            sealed = _req(await a.generate_successor_cred(
                 {"principal": spec.principal, "successor": spec.successor_name}
-            )
-            await a.create_role(spec.principal, spec.successor_name, {
+            ), "generate_successor_cred")
+            _req(await a.create_role(spec.principal, spec.successor_name, sealed, {
                 "db_host": spec.db_host, "db_name": spec.db_name,
-            })
+            }), "create_role")
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-            self._state.pr_url = await a.sops_encrypt_and_open_pr(sealed, branch)
+            self._state.pr_url = _req(await a.sops_encrypt_and_open_pr(sealed, branch),
+                                      "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
             await a.notify_human(self._state.pr_url, spec.principal, "rotation PR ready")
 
@@ -209,28 +216,24 @@ class CredentialRotationWorkflow:
 
             # CUTOVER — flip consumers to successor, verify, then revoke
             self._state.stage = "cutover"
-            await a.patch_and_roll(spec.consumers, sealed)
-            # Gate contract: every listed consumer must auth on the successor,
-            # AND at least health_min_samples probes of the successor path must
-            # have succeeded (no single-lucky-success). Old role still valid here.
-            healthy = await a.wait_consumer_healthy(
-                spec.consumers, timeout_s=900
-            )
-            if not healthy:
-                raise CutoverFailed("consumers failed successor health gate")
+            _req(await a.patch_and_roll(spec.consumers, sealed), "patch_and_roll")
+            # Gate contract: every listed consumer must auth on the successor
+            # (fresh TCP probes, no pool reuse). Old role still valid here.
+            _req(await a.wait_consumer_healthy(
+                spec.consumers, sealed, timeout_s=900
+            ), "wait_consumer_healthy")
 
             if spec.soak_seconds:
                 await workflow.sleep(spec.soak_seconds)
 
-            await a.revoke_predecessor(spec.principal)
+            await a.revoke_predecessor(spec.principal)  # ALTER ROLE NOLOGIN — DROP deferred
             self._state.stage = "verify"
 
             # VERIFY — old credential must now fail auth; ZeroTrace re-scan clean
-            # Strict: probe must fail twice consecutively to count as dead —
-            # a single flaky auth-fail must not let the workflow close green.
-            dead = await a.liveness_dead_check(spec.principal, sealed)
-            if not dead:
-                raise CutoverFailed("predecessor still authenticates — rotation incomplete")
+            # Strict: predecessor must fail auth on fresh connections —
+            # a still-alive result forces compensation before close.
+            _req(await a.liveness_dead_check(spec.principal, sealed),
+                 "liveness_dead_check")
             self._state.evidence["liveness_dead"] = True
             self._state.evidence["verified_at"] = workflow.now().isoformat()
 
