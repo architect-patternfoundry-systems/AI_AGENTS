@@ -99,6 +99,7 @@ class RotationSpec:
     health_min_samples: int = 2          # min old-role auth failures before revoke
     closure_ack_required: bool = False   # human ack optional/time-boxed
     dry_run: bool = False                # stop after open_pr+notify — zero mutation
+    zerotrace_baseline: str = ""         # e.g. discovery-20260911T091040Z-21876 (Auth-1)
     ntfy_topic: str = "ops-credential-rotation"
 
 
@@ -171,6 +172,13 @@ class CredentialRotationWorkflow:
         spec.successor_name = spec.successor_name or f"{spec.principal}_r{int(workflow.now().timestamp()) % 100000}"
         self._state.successor = spec.successor_name
         self._state.stage = "prepare"
+        info = workflow.info()
+        self._state.evidence.update({
+            "principal": spec.principal,
+            "zerotrace_baseline": spec.zerotrace_baseline,
+            "workflow_id": info.workflow_id,
+            "run_id": info.run_id,
+        })
 
         try:
             # PREPARE — sealed cred + role + PR; no mutation of consumers

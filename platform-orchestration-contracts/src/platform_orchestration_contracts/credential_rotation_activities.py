@@ -106,8 +106,9 @@ def _plaintext_from_sealed(sealed: str) -> str | None:
         if r.returncode != 0:
             return None
         for line in r.stdout.decode().splitlines():
-            if line.strip().startswith("PG_PASS:"):
-                return line.split(":", 1)[1].strip().strip('"')
+            ls = line.strip()
+            if ls.startswith("password:") or ls.startswith("PG_PASS:"):
+                return ls.split(":", 1)[1].strip().strip('"')
         return None
     except Exception:
         return None
@@ -141,12 +142,19 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     successor = spec["successor"]
     pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
 
+    # Live cts-backend-db carries `password` + `uri` (full DSN) — both
+    # must carry the successor cred. URI template comes from env so the
+    # password stays alnum-safe (no URI escaping ever needed).
+    uri_tmpl = os.environ.get(
+        "ROTATION_URI_TEMPLATE",
+        "postgresql://{user}:{pw}@pgbouncer.infra-data.svc.cluster.local:5432/mydatabase")
+    uri = uri_tmpl.format(user=successor, pw=pw)
     manifest = (
         "apiVersion: v1\nkind: Secret\nmetadata:\n"
         f"  name: {os.environ.get('ROTATION_SECRET_NAME','cts-backend-db')}\n"
         f"  namespace: {os.environ.get('ROTATION_NAMESPACE','cts')}\n"
         "type: Opaque\nstringData:\n"
-        f"  PG_PASS: \"{pw}\"\n  PG_USER: \"{successor}\"\n"
+        f"  password: \"{pw}\"\n  uri: \"{uri}\"\n"
     ).encode()
     ok, sealed = _sops_encrypt(manifest)
     del pw
@@ -170,6 +178,12 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
         cur = conn.cursor()
         cur.execute(psql.SQL("CREATE ROLE {} LOGIN PASSWORD {} IN ROLE {}").format(
             psql.Identifier(successor), psql.Literal(pw), psql.Identifier(principal)))
+        # Keep successor-created objects administrable by the principal so a
+        # later DROP doesn't fragment ownership across _r{N} roles.
+        cur.execute(psql.SQL(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA public "
+            "GRANT ALL ON TABLES TO {}").format(
+            psql.Identifier(successor), psql.Identifier(principal)))
         conn.close()
         return ActResult(Outcome.OK, f"role-created:{successor}")
     except psycopg2.errors.DuplicateObject:
@@ -323,7 +337,7 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
     ok, old_b64 = _kubectl("get", "secret",
                            os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
                            "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
-                           "-o", "jsonpath={.data.PG_PASS}")
+                           "-o", "jsonpath={.data.password}")
     old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok else None
     if not old_pw:
         return ActResult(Outcome.RETRYABLE, "old-cred-unreadable")
