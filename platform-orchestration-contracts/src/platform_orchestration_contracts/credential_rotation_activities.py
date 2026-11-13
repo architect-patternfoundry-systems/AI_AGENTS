@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from temporalio import activity
+
 
 class Outcome(str, Enum):
     OK = "ok"
@@ -152,6 +154,7 @@ def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
 # Activities
 # ----------------------------------------------------------------------
 
+@activity.defn
 async def generate_successor_cred(spec: dict) -> ActResult:
     """Generate high-entropy password; seal it immediately.
 
@@ -195,6 +198,7 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     return ActResult(Outcome.OK, ref=json.dumps({"sealed": sc.sealed_b64, "successor": successor}))
 
 
+@activity.defn
 async def create_role(principal: str, successor: str, sealed: str, role_spec: dict) -> ActResult:
     """CREATE ROLE successor (idempotent) + inherit principal's grants."""
     pw = _plaintext_from_sealed(sealed)
@@ -222,6 +226,7 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
 
+@activity.defn
 async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
     """Write sealed manifest + open PR via gh. sealed is already encrypted."""
     try:
@@ -250,6 +255,7 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
         return ActResult(Outcome.RETRYABLE, f"git:{(e.stderr or b'')[:200].decode(errors='replace')}")
 
 
+@activity.defn
 async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
     """ntfy push + PR comment (redundant channels)."""
     errs = []
@@ -273,6 +279,7 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
     return ActResult(Outcome.OK, ";".join(errs) if errs else "notified")
 
 
+@activity.defn
 async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: int = 900) -> ActResult:
     """All consumers' new pods Ready AND successor auth probe passes."""
     deadline = time.time() + timeout_s
@@ -303,6 +310,7 @@ async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: in
     return ActResult(Outcome.COMPENSATE, "health-gate-timeout")
 
 
+@activity.defn
 async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
     """Update pgbouncer userlist (if consumer) + rollout restarts.
 
@@ -338,6 +346,7 @@ async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
     return ActResult(Outcome.OK, "consumers-rolled")
 
 
+@activity.defn
 async def revoke_predecessor(principal: str) -> ActResult:
     """DROP ROLE — idempotent (IF EXISTS). Used for predecessor AND
     compensation (delete unused successor)."""
@@ -362,6 +371,7 @@ async def revoke_predecessor(principal: str) -> ActResult:
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
 
+@activity.defn
 async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
     """Old credential must FAIL auth — twice consecutively to be safe."""
     # Read the PREDECESSOR password from the sealed snapshot — the live
@@ -391,6 +401,7 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
                      f"dead-probes:{dead}/2")
 
 
+@activity.defn
 async def post_closure_evidence(evidence: dict) -> ActResult:
     """POST evidence → governance-closure endpoint."""
     url = os.environ.get("GOVERNANCE_CLOSURE_URL",
