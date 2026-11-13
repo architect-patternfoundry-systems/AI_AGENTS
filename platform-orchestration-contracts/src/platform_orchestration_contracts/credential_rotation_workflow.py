@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Optional
 
 from temporalio import workflow
@@ -193,28 +194,28 @@ class CredentialRotationWorkflow:
             sealed = _req(await workflow.execute_activity(
                 acts_unsafe.generate_successor_cred,
                 {"principal": spec.principal, "successor": spec.successor_name},
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "generate_successor_cred")
             _req(await workflow.execute_activity(
                 acts_unsafe.create_role,
                 spec.principal, spec.successor_name, sealed,
                 {"db_host": spec.db_host, "db_name": spec.db_name},
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "create_role")
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
             self._state.pr_url = _req(await workflow.execute_activity(
                 acts_unsafe.sops_encrypt_and_open_pr,
                 sealed, branch,
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
             await workflow.execute_activity(
                 acts_unsafe.notify_human,
                 self._state.pr_url, spec.principal, "rotation PR ready",
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             )
 
@@ -227,7 +228,7 @@ class CredentialRotationWorkflow:
             try:
                 await workflow.wait_condition(
                     lambda: self._merge_approved or self._merge_rejected or self._aborted,
-                    timeout=workflow.timedelta(hours=spec.merge_wait_hours),
+                    timeout=timedelta(hours=spec.merge_wait_hours),
                 )
             except workflow.TimeoutError:
                 self._state.stage = "expired"
@@ -235,7 +236,7 @@ class CredentialRotationWorkflow:
                 await workflow.execute_activity(
                     acts_unsafe.revoke_predecessor,
                     spec.successor_name,
-                    schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                    schedule_to_close_timeout=timedelta(minutes=10),
                     retry_policy=RetryPolicy(maximum_attempts=4),
                 )
                 return self._state
@@ -244,7 +245,7 @@ class CredentialRotationWorkflow:
                 await workflow.execute_activity(
                     acts_unsafe.revoke_predecessor,
                     spec.successor_name,
-                    schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                    schedule_to_close_timeout=timedelta(minutes=10),
                     retry_policy=RetryPolicy(maximum_attempts=4),
                 )
                 return self._state
@@ -254,7 +255,7 @@ class CredentialRotationWorkflow:
             _req(await workflow.execute_activity(
                 acts_unsafe.patch_and_roll,
                 spec.consumers, sealed,
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "patch_and_roll")
             # Gate contract: every listed consumer must auth on the successor
@@ -262,7 +263,7 @@ class CredentialRotationWorkflow:
             _req(await workflow.execute_activity(
                 acts_unsafe.wait_consumer_healthy,
                 spec.consumers, sealed, 900,
-                schedule_to_close_timeout=workflow.timedelta(minutes=15),
+                schedule_to_close_timeout=timedelta(minutes=15),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "wait_consumer_healthy")
 
@@ -272,7 +273,7 @@ class CredentialRotationWorkflow:
             await workflow.execute_activity(
                 acts_unsafe.revoke_predecessor,
                 spec.principal,
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             )
             self._state.stage = "verify"
@@ -283,7 +284,7 @@ class CredentialRotationWorkflow:
             _req(await workflow.execute_activity(
                 acts_unsafe.liveness_dead_check,
                 spec.principal, sealed,
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "liveness_dead_check")
             self._state.evidence["liveness_dead"] = True
@@ -295,14 +296,14 @@ class CredentialRotationWorkflow:
             await workflow.execute_activity(
                 acts_unsafe.post_closure_evidence,
                 self._state.evidence,
-                schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             )
             if spec.closure_ack_required:
                 try:
                     await workflow.wait_condition(
                         lambda: self._closure_acked or self._aborted,
-                        timeout=workflow.timedelta(hours=24),
+                        timeout=timedelta(hours=24),
                     )
                 except workflow.TimeoutError:
                     self._state.evidence["closure_ack_timeout"] = True
@@ -319,7 +320,7 @@ class CredentialRotationWorkflow:
                 await workflow.execute_activity(
                     acts_unsafe.revoke_predecessor,
                     spec.successor_name,
-                    schedule_to_close_timeout=workflow.timedelta(minutes=10),
+                    schedule_to_close_timeout=timedelta(minutes=10),
                     retry_policy=RetryPolicy(maximum_attempts=4),
                 )
                 self._state.evidence["compensated"] = True
