@@ -197,6 +197,28 @@ class CredentialRotationWorkflow:
                 schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "generate_successor_cred")
+
+            if spec.dry_run:
+                # Dry-run: skip all PostgreSQL mutations and rollouts
+                branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
+                self._state.pr_url = _req(await workflow.execute_activity(
+                    acts_unsafe.sops_encrypt_and_open_pr,
+                    args=[sealed, branch],
+                    schedule_to_close_timeout=timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=4),
+                ), "sops_encrypt_and_open_pr")
+                self._state.stage = "await_approval"
+                await workflow.execute_activity(
+                    acts_unsafe.notify_human,
+                    args=[self._state.pr_url, spec.principal, "rotation PR ready (dry-run)"],
+                    schedule_to_close_timeout=timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=4),
+                )
+                self._state.stage = "dry_run_complete"
+                self._state.evidence["dry_run"] = True
+                return self._state
+
+            # Live rotation: execute full pipeline
             _req(await workflow.execute_activity(
                 acts_unsafe.create_role,
                 args=[spec.principal, spec.successor_name, sealed, {"db_host": spec.db_host, "db_name": spec.db_name}],
@@ -217,11 +239,6 @@ class CredentialRotationWorkflow:
                 schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             )
-
-            if spec.dry_run:
-                self._state.stage = "dry_run_complete"
-                self._state.evidence["dry_run"] = True
-                return self._state
 
             # APPROVE — wait for merge signal (the human gate)
             try:
