@@ -331,8 +331,11 @@ async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: in
     while time.time() < deadline:
         all_ready = True
         for c in consumers:
+            # pgbouncer lives in infra-data, not the rotation namespace —
+            # probing it in ROTATION_NAMESPACE never resolves (post-mortem)
+            ns = "infra-data" if c == "pgbouncer" else os.environ.get("ROTATION_NAMESPACE", "cts")
             ok, _ = _kubectl("rollout", "status", f"deploy/{c}", "-n",
-                             os.environ.get("ROTATION_NAMESPACE", "cts"), f"--timeout=10s")
+                             ns, f"--timeout=10s")
             if not ok:
                 all_ready = False
         if all_ready:
@@ -341,10 +344,12 @@ async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: in
             if pw:
                 import psycopg2
                 try:
+                    # conninfo: later params override — append successor creds
+                    # rather than string-replacing user (which kept the
+                    # rotation_worker password and always failed auth)
                     conn = psycopg2.connect(
-                        os.environ["ROTATION_PG_DSN"].replace(
-                            f"user={os.environ.get('ROTATION_PRINCIPAL','')}",
-                            f"user={json.loads(sealed).get('successor','')}"),
+                        os.environ["ROTATION_PG_DSN"]
+                        + f" user={json.loads(sealed).get('successor','')} password={pw}",
                         connect_timeout=6)
                     conn.close()
                     return ActResult(Outcome.OK, "consumers-ready+successor-auth")
