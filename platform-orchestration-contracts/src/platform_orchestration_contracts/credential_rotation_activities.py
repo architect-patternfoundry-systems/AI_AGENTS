@@ -286,7 +286,7 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
         subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch], check=True, capture_output=True, env=git_env)
         r = subprocess.run(["gh", "pr", "create", "--fill", "-R",
                             os.environ["ROTATION_REPO_SLUG"]],
-                           cwd=repo, capture_output=True, text=True)
+                           cwd=repo, capture_output=True, text=True, env=git_env)
         if r.returncode != 0:
             return ActResult(Outcome.RETRYABLE, f"gh:{r.stderr[:200]}")
         return ActResult(Outcome.OK, ref=r.stdout.strip())
