@@ -256,26 +256,34 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
     gh_token = os.environ.get("GH_TOKEN", "")
     if gh_token and repo_url.startswith("https://") and "@" not in repo_url:
         repo_url = repo_url.replace("https://", f"https://x-access-token:{gh_token}@", 1)
+    # env-based git config: root FS is read-only so `git config --global`
+    # can't write ~/.gitconfig. GIT_CONFIG_* applies to every invocation.
+    git_env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": repo,
+    }
     try:
         # Clone or update the repository
         if os.path.exists(os.path.join(repo, ".git")):
-            subprocess.run(["git", "-C", repo, "fetch", "origin"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", repo, "checkout", "main"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", repo, "pull", "origin", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "fetch", "origin"], check=True, capture_output=True, env=git_env)
+            subprocess.run(["git", "-C", repo, "checkout", "main"], check=True, capture_output=True, env=git_env)
+            subprocess.run(["git", "-C", repo, "pull", "origin", "main"], check=True, capture_output=True, env=git_env)
         else:
             os.makedirs(repo, exist_ok=True)
-            subprocess.run(["git", "clone", repo_url, repo], check=True, capture_output=True)
-        subprocess.run(["git", "-C", repo, "checkout", "-B", branch], check=True, capture_output=True)
+            subprocess.run(["git", "clone", repo_url, repo], check=True, capture_output=True, env=git_env)
+        subprocess.run(["git", "-C", repo, "checkout", "-B", branch], check=True, capture_output=True, env=git_env)
         subprocess.run(["git", "-C", repo, "config", "user.name", "credential-rotation-worker"],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=git_env)
         subprocess.run(["git", "-C", repo, "config", "user.email",
-                        "rotation-worker@patternfoundry.dev"], check=True, capture_output=True)
+                        "rotation-worker@patternfoundry.dev"], check=True, capture_output=True, env=git_env)
         open(os.path.join(repo, secret_path), "wb").write(blob)
-        subprocess.run(["git", "-C", repo, "add", secret_path], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "add", secret_path], check=True, capture_output=True, env=git_env)
         subprocess.run(["git", "-C", repo, "commit", "-m",
                         "security: rotate credential (sops-encrypted) [rotation-workflow]"],
-                       check=True, capture_output=True)
-        subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch], check=True, capture_output=True)
+                       check=True, capture_output=True, env=git_env)
+        subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch], check=True, capture_output=True, env=git_env)
         r = subprocess.run(["gh", "pr", "create", "--fill", "-R",
                             os.environ["ROTATION_REPO_SLUG"]],
                            cwd=repo, capture_output=True, text=True)
