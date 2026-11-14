@@ -188,29 +188,38 @@ class CredentialRotationWorkflow:
 
         try:
             # PREPARE — sealed cred + role + PR; no mutation of consumers
-            def _req(res, step):
-                if not res.ok:
+            async def _req(fn, args, step, timeout_minutes=10, attempts=6):
+                """Execute an activity; re-execute on application-level
+                RETRYABLE outcomes (with backoff). A recorded RETRYABLE
+                result otherwise replays forever — raising inside the WFT
+                never reschedules the activity, wedging the run. FATAL and
+                COMPENSATE raise immediately."""
+                for i in range(attempts):
+                    res = await workflow.execute_activity(
+                        fn, args=args,
+                        schedule_to_close_timeout=timedelta(minutes=timeout_minutes),
+                        retry_policy=RetryPolicy(maximum_attempts=4),
+                    )
+                    if res.ok:
+                        return res.ref
                     if res.outcome.name == "COMPENSATE":
                         raise CutoverFailed(f"{step}: {res.detail}")
-                    raise RuntimeError(f"{step}: {res.detail}")
-                return res.ref
+                    if res.outcome.name == "FATAL" or i == attempts - 1:
+                        raise RuntimeError(f"{step}: {res.detail}")
+                    await workflow.sleep(min(120, 10 * 2 ** i))
 
-            sealed = _req(await workflow.execute_activity(
+            sealed = await _req(
                 acts_unsafe.generate_successor_cred,
-                args=[{"principal": spec.principal, "successor": spec.successor_name}],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            ), "generate_successor_cred")
+                [{"principal": spec.principal, "successor": spec.successor_name}],
+                "generate_successor_cred")
 
             if spec.dry_run:
                 # Dry-run: skip all PostgreSQL mutations and rollouts
                 branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-                self._state.pr_url = _req(await workflow.execute_activity(
+                self._state.pr_url = await _req(
                     acts_unsafe.sops_encrypt_and_open_pr,
-                    args=[sealed, branch, True],
-                    schedule_to_close_timeout=timedelta(minutes=10),
-                    retry_policy=RetryPolicy(maximum_attempts=4),
-                ), "sops_encrypt_and_open_pr")
+                    [sealed, branch, True],
+                    "sops_encrypt_and_open_pr")
                 self._state.stage = "await_approval"
                 await workflow.execute_activity(
                     acts_unsafe.notify_human,
@@ -223,19 +232,15 @@ class CredentialRotationWorkflow:
                 return self._state
 
             # Live rotation: execute full pipeline
-            _req(await workflow.execute_activity(
+            await _req(
                 acts_unsafe.create_role,
-                args=[spec.principal, spec.successor_name, sealed, {"db_host": spec.db_host, "db_name": spec.db_name}],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            ), "create_role")
+                [spec.principal, spec.successor_name, sealed, {"db_host": spec.db_host, "db_name": spec.db_name}],
+                "create_role")
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-            self._state.pr_url = _req(await workflow.execute_activity(
+            self._state.pr_url = await _req(
                 acts_unsafe.sops_encrypt_and_open_pr,
-                args=[sealed, branch, spec.dry_run],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            ), "sops_encrypt_and_open_pr")
+                [sealed, branch, spec.dry_run],
+                "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
             await workflow.execute_activity(
                 acts_unsafe.notify_human,
@@ -272,20 +277,16 @@ class CredentialRotationWorkflow:
 
             # CUTOVER — flip consumers to successor, verify, then revoke
             self._state.stage = "cutover"
-            _req(await workflow.execute_activity(
+            await _req(
                 acts_unsafe.patch_and_roll,
-                args=[spec.consumers, sealed],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            ), "patch_and_roll")
+                [spec.consumers, sealed],
+                "patch_and_roll")
             # Gate contract: every listed consumer must auth on the successor
             # (fresh TCP probes, no pool reuse). Old role still valid here.
-            _req(await workflow.execute_activity(
+            await _req(
                 acts_unsafe.wait_consumer_healthy,
-                args=[spec.consumers, sealed, 900],
-                schedule_to_close_timeout=timedelta(minutes=15),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            ), "wait_consumer_healthy")
+                [spec.consumers, sealed, 900],
+                "wait_consumer_healthy", timeout_minutes=15)
 
             if spec.soak_seconds:
                 await workflow.sleep(spec.soak_seconds)
@@ -301,12 +302,10 @@ class CredentialRotationWorkflow:
             # VERIFY — old credential must now fail auth; ZeroTrace re-scan clean
             # Strict: predecessor must fail auth on fresh connections —
             # a still-alive result forces compensation before close.
-            _req(await workflow.execute_activity(
+            await _req(
                 acts_unsafe.liveness_dead_check,
-                args=[spec.principal, sealed],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            ), "liveness_dead_check")
+                [spec.principal, sealed],
+                "liveness_dead_check")
             self._state.evidence["liveness_dead"] = True
             self._state.evidence["verified_at"] = workflow.now().isoformat()
 
