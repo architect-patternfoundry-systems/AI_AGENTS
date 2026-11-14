@@ -253,6 +253,9 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
     repo_url = os.environ.get("ROTATION_REPO_URL")
     if not repo_url:
         return ActResult(Outcome.FATAL, "ROTATION_REPO_URL not set")
+    gh_token = os.environ.get("GH_TOKEN", "")
+    if gh_token and repo_url.startswith("https://") and "@" not in repo_url:
+        repo_url = repo_url.replace("https://", f"https://x-access-token:{gh_token}@", 1)
     try:
         # Clone or update the repository
         if os.path.exists(os.path.join(repo, ".git")):
@@ -263,6 +266,10 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
             os.makedirs(repo, exist_ok=True)
             subprocess.run(["git", "clone", repo_url, repo], check=True, capture_output=True)
         subprocess.run(["git", "-C", repo, "checkout", "-B", branch], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "config", "user.name", "credential-rotation-worker"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "config", "user.email",
+                        "rotation-worker@patternfoundry.dev"], check=True, capture_output=True)
         open(os.path.join(repo, secret_path), "wb").write(blob)
         subprocess.run(["git", "-C", repo, "add", secret_path], check=True, capture_output=True)
         subprocess.run(["git", "-C", repo, "commit", "-m",
