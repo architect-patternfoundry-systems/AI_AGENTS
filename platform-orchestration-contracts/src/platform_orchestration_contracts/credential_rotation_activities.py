@@ -225,11 +225,12 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
         cur = conn.cursor()
         cur.execute(psql.SQL("CREATE ROLE {} LOGIN PASSWORD {} IN ROLE {}").format(
             psql.Identifier(successor), psql.Literal(pw), psql.Identifier(principal)))
-        # PG16: the creator receives ADMIN but not SET on a created role, so
-        # ALTER DEFAULT PRIVILEGES FOR ROLE below would fail with
-        # InsufficientPrivilege. Self-grant membership (INHERIT FALSE — only
-        # the SET capability is needed, not the successor's privileges).
-        cur.execute(psql.SQL("GRANT {} TO CURRENT_USER WITH INHERIT FALSE").format(
+        # PG16: the creator receives ADMIN but not privilege-of on a created
+        # role, so ALTER DEFAULT PRIVILEGES FOR ROLE below would fail with
+        # InsufficientPrivilege (has_privs_of_role requires an INHERIT-able
+        # membership). Self-grant membership — rotation_worker already holds
+        # ADMIN on the successor and minted its password.
+        cur.execute(psql.SQL("GRANT {} TO CURRENT_USER").format(
             psql.Identifier(successor)))
         # Keep successor-created objects administrable by the principal so a
         # later DROP doesn't fragment ownership across _r{N} roles.
