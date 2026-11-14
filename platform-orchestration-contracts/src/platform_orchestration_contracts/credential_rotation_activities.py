@@ -728,9 +728,13 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
 async def post_closure_evidence(evidence: dict) -> ActResult:
     """POST evidence → governance-closure endpoint. Advisory: the Temporal
     history + merged PR ARE the evidence — a dead endpoint must not fail a
-    completed rotation. Retryable only on 5xx; DNS/refused/4xx → OK-with-note."""
-    url = os.environ.get("GOVERNANCE_CLOSURE_URL",
-                         "https://governance-closure.patternfoundry.dev/api/evidence")
+    completed rotation. Retryable only on 5xx; DNS/refused/4xx → OK-with-note.
+    ROTATION_CLOSURE_URL="" disables posting (default until the sink exists);
+    GOVERNANCE_CLOSURE_URL is the legacy name."""
+    url = (os.environ.get("ROTATION_CLOSURE_URL")
+           or os.environ.get("GOVERNANCE_CLOSURE_URL") or "")
+    if not url:
+        return ActResult(Outcome.OK, "closure-disabled")
     try:
         req = urllib.request.Request(url, data=json.dumps(evidence).encode(),
                                      headers={"Content-Type": "application/json"}, method="POST")
