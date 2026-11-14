@@ -144,7 +144,7 @@ def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
         with open(key_file) as f:
             age_key = f.read().strip()
         r = subprocess.run(
-            ["sops", "-e", "--input-type", "yaml", "--output-type", "yaml", "--age", f"AGE-SECRET-KEY-{age_key}", "/dev/stdin"],
+            ["sops", "-e", "--input-type", "yaml", "--output-type", "yaml", "--age", age_key, "/dev/stdin"],
             input=manifest, capture_output=True, timeout=30,
         )
         return (r.returncode == 0), (r.stdout if r.returncode == 0 else r.stderr[:300])
