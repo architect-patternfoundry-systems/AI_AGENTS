@@ -396,7 +396,9 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
                        check=True, capture_output=True, env=git_env)
         subprocess.run(["git", "-C", repo, "config", "user.email",
                         "rotation-worker@patternfoundry.dev"], check=True, capture_output=True, env=git_env)
-        open(os.path.join(repo, secret_path), "wb").write(blob)
+        _sp = os.path.join(repo, secret_path)
+        os.makedirs(os.path.dirname(_sp), exist_ok=True)
+        open(_sp, "wb").write(blob)
         subprocess.run(["git", "-C", repo, "add", secret_path], check=True, capture_output=True, env=git_env)
         # gitops-mode consumer secrets: one sealed file each, written at
         # the live Flux-managed path with the secret's own key schema.
