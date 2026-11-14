@@ -203,7 +203,7 @@ class CredentialRotationWorkflow:
                 branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
                 self._state.pr_url = _req(await workflow.execute_activity(
                     acts_unsafe.sops_encrypt_and_open_pr,
-                    args=[sealed, branch],
+                    args=[sealed, branch, True],
                     schedule_to_close_timeout=timedelta(minutes=10),
                     retry_policy=RetryPolicy(maximum_attempts=4),
                 ), "sops_encrypt_and_open_pr")
@@ -228,7 +228,7 @@ class CredentialRotationWorkflow:
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
             self._state.pr_url = _req(await workflow.execute_activity(
                 acts_unsafe.sops_encrypt_and_open_pr,
-                args=[sealed, branch],
+                args=[sealed, branch, spec.dry_run],
                 schedule_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=4),
             ), "sops_encrypt_and_open_pr")

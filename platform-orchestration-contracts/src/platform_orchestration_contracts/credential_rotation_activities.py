@@ -240,8 +240,13 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
 
 
 @activity.defn
-async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
-    """Write sealed manifest + open PR via gh. sealed is already encrypted."""
+async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = False) -> ActResult:
+    """Write sealed manifest + open PR via gh. sealed is already encrypted.
+
+    dry_run=True forces a Draft PR — GitHub blocks merging drafts, so a
+    dry-run artifact can never reach a Flux-reconciled path via merge
+    (cf. the PR #304 auto-merge incident).
+    """
     try:
         ref = json.loads(sealed)
         blob = base64.b64decode(ref["sealed"])
@@ -284,9 +289,10 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
                         "security: rotate credential (sops-encrypted) [rotation-workflow]"],
                        check=True, capture_output=True, env=git_env)
         subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch], check=True, capture_output=True, env=git_env)
-        r = subprocess.run(["gh", "pr", "create", "--fill", "-R",
-                            os.environ["ROTATION_REPO_SLUG"]],
-                           cwd=repo, capture_output=True, text=True, env=git_env)
+        pr_cmd = ["gh", "pr", "create", "--fill", "-R", os.environ["ROTATION_REPO_SLUG"]]
+        if dry_run:
+            pr_cmd += ["--draft", "--title", "[DRY-RUN] credential rotation artifact — DO NOT MERGE"]
+        r = subprocess.run(pr_cmd, cwd=repo, capture_output=True, text=True, env=git_env)
         if r.returncode != 0:
             return ActResult(Outcome.RETRYABLE, f"gh:{r.stderr[:200]}")
         return ActResult(Outcome.OK, ref=r.stdout.strip())
