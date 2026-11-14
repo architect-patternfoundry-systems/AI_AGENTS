@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: platform-orchestration-contracts
+Version: 0.2.0
+Summary: Versioned schemas and adapters for cross-app Temporal workflow integration (ADR-036)
+Author: Platform Team
+License: Proprietary
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Private :: Do Not Upload
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: temporal
+Requires-Dist: temporalio>=1.7.0; extra == "temporal"
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"
+Requires-Dist: pytest-asyncio>=0.23; extra == "test"

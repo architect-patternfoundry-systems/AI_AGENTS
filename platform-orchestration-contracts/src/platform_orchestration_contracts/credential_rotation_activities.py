@@ -94,6 +94,15 @@ def _kubectl(*args: str, input_bytes: bytes | None = None, timeout: int = 30) ->
 _USERLIST_LINE = re.compile(r'^"([^"]+)" "([^"]*)"$')
 
 
+def _secret_keys(s: dict) -> dict:
+    """secret spec → {key: value_template}. Supports multi-key `keys`
+    mapping ({POSTGRES_USER: '{user}', POSTGRES_PASSWORD: '{pw}'}) and
+    the legacy single-key {key, value_template} form."""
+    if "keys" in s:
+        return s["keys"]
+    return {s["key"]: s.get("value_template", "{pw}")}
+
+
 def _consumer(c) -> dict:
     """Normalize a consumer entry to {name, namespace, kind, secret?}.
 
@@ -204,6 +213,39 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     principal = spec["principal"]
     successor = spec["successor"]
     pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+
+    # Pre-flight consumer validation — runs in dry-run too, so a bad
+    # namespace/kind/secret-key in the spec fails BEFORE any live run.
+    # Read-only `get` calls double as an RBAC check: if the worker SA
+    # can't read a target, that's a transient/permissions problem →
+    # RETRYABLE; a verified-missing object is a spec bug → FATAL.
+    for c in (_consumer(x) for x in spec.get("consumers", [])):
+        ok, d = _kubectl("get", c["kind"], c["name"], "-n", c["namespace"],
+                         "-o", "name")
+        if not ok:
+            if "NotFound" in d or "not found" in d:
+                return ActResult(Outcome.FATAL,
+                                 f"consumer-missing:{c['namespace']}/{c['kind']}/{c['name']}")
+            return ActResult(Outcome.RETRYABLE,
+                             f"consumer-get:{c['namespace']}/{c['kind']}/{c['name']}:{d}")
+        s = c["secret"]
+        if s:
+            ok, d = _kubectl("get", "secret", s["name"], "-n", c["namespace"],
+                             "-o", "jsonpath={.data}")
+            if not ok:
+                if "NotFound" in d or "not found" in d:
+                    return ActResult(Outcome.FATAL,
+                                     f"secret-missing:{c['namespace']}/{s['name']}")
+                return ActResult(Outcome.RETRYABLE,
+                                 f"secret-get:{c['namespace']}/{s['name']}:{d}")
+            try:
+                data = json.loads(d)
+            except ValueError:
+                return ActResult(Outcome.RETRYABLE, f"secret-parse:{s['name']}")
+            missing = [k for k in _secret_keys(s) if k not in data]
+            if missing:
+                return ActResult(Outcome.FATAL,
+                                 f"secret-keys-missing:{c['namespace']}/{s['name']}:{','.join(missing)}")
 
     # Live cts-backend-db carries `password` + `uri` (full DSN) — both
     # must carry the successor cred. URI template comes from env so the
@@ -458,17 +500,20 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
             print(f"userlist: dropped {dropped} malformed lines")
 
     # Out-of-band (non-GitOps) secrets: write the successor credential
-    # directly — the GitOps sealed path can't reach them.
+    # directly — the GitOps sealed path can't reach them. Multi-key
+    # secrets (e.g. POSTGRES_USER + POSTGRES_PASSWORD) patch atomically
+    # in one merge so consumers never see a mixed-credential read.
+    fmt = {"user": successor, "pw": pw,
+           "host": os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local"),
+           "port": os.environ.get("ROTATION_PG_PORT", "5432"),
+           "db": os.environ.get("ROTATION_PG_DB", "mydatabase")}
     for c in cons:
         s = c["secret"]
         if not s:
             continue
-        val = s.get("value_template", "{pw}").format(
-            user=successor, pw=pw,
-            host=os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local"),
-            port=os.environ.get("ROTATION_PG_PORT", "5432"),
-            db=os.environ.get("ROTATION_PG_DB", "mydatabase"))
-        patch = json.dumps({"data": {s["key"]: base64.b64encode(val.encode()).decode()}})
+        data = {k: base64.b64encode(t.format(**fmt).encode()).decode()
+                for k, t in _secret_keys(s).items()}
+        patch = json.dumps({"data": data})
         ok, d = _kubectl("patch", "secret", s["name"], "-n", c["namespace"],
                          "--type", "merge", "-p", patch)
         if not ok:

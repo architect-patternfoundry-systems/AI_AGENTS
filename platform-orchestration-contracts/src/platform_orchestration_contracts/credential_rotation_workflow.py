@@ -210,7 +210,8 @@ class CredentialRotationWorkflow:
 
             sealed = await _req(
                 acts_unsafe.generate_successor_cred,
-                [{"principal": spec.principal, "successor": spec.successor_name}],
+                [{"principal": spec.principal, "successor": spec.successor_name,
+                  "consumers": spec.consumers}],
                 "generate_successor_cred")
 
             if spec.dry_run:

@@ -1,0 +1,1026 @@
+# Registry Migration Inventory
+# Single source of truth for migrating from registry-bridge.tailc2cafc.ts.net to 10.43.194.191:80
+# Generated: 2026-08-10 21:20 UTC
+# Canary Status: ✅ SUCCESS (gacs/k8s-state-ingestor completed - excluded from migration count)
+
+# Inventory Summary (Generated from cluster discovery)
+summary:
+  total_discovered_affected_workloads: 49
+  total_discovered_affected_image_references: 56
+  completed_canary: 1
+  pending_migration: 48
+  blocked_missing_image: 0
+  excluded: 0
+  migration_status: in_progress
+  batch_1_status: planned_not_authorized
+  batch_1_authorization_required: true
+
+pending_workload_breakdown:
+  deployments: 45
+  daemonsets: 3
+  total: 48
+
+pending_image_references: 55
+multi_container_workloads: 7
+
+# Node Validation Status
+node_validation:
+  cortex:
+    status: validated
+    registries_yaml_hash: "6085e7758af30bf270fb9c4047d87c481eb1fd24bf5a6047341c791bb56f765b"
+    registries_yaml: present
+    mirror_configured: true
+    crictl_pull_success: true
+    tested_reference: "10.43.194.191:80/python:3.10-slim"
+    tested_reference_type: mutable_tag
+    actual_transport: HTTP (via mirror)
+    timestamp: 2026-08-10T20:00:00Z
+  synapse:
+    status: validated
+    registries_yaml_hash: "6085e7758af30bf270fb9c4047d87c481eb1fd24bf5a6047341c791bb56f765b"
+    registries_yaml: present
+    mirror_configured: true
+    crictl_pull_success: true
+    tested_reference: "registry-bridge.tailc2cafc.ts.net/python:3.10-slim"
+    tested_reference_type: mutable_tag
+    actual_transport: HTTP (via mirror redirect)
+    dns_resolution: failed (registry-bridge.tailc2cafc.ts.net not resolvable)
+    mirror_bypass: true
+    timestamp: 2026-08-10T21:40:00Z
+  ran-ubuntu-inspiron:
+    status: validated
+    registries_yaml_hash: "6085e7758af30bf270fb9c4047d87c481eb1fd24bf5a6047341c791bb56f765b"
+    registries_yaml: present
+    mirror_configured: true
+    crictl_pull_success: true
+    tested_reference: "registry-bridge.tailc2cafc.ts.net/python:3.10-slim"
+    tested_reference_type: mutable_tag
+    actual_transport: HTTP (via mirror redirect)
+    timestamp: 2026-08-10T21:40:00Z
+
+# Transport Analysis
+transport_analysis:
+  mirror_behavior: confirmed
+  mechanism: "K3s registry mirrors redirect registry-bridge.tailc2cafc.ts.net to http://10.43.194.191:80"
+  evidence: "crictl inspecti shows image has both repoDigests: 10.43.194.191:80 and registry-bridge.tailc2cafc.ts.net with same sha256"
+  actual_transport: HTTP (not HTTPS)
+  canonical_https: not_used_by_nodes
+  dns_resolution: "synapse cannot resolve registry-bridge.tailc2cafc.ts.net, mirror bypasses DNS"
+  architecture_intent: "HTTP mirror for node pulls, HTTPS for external/operator access"
+
+# Architecture Decision Record (ADR)
+adr_decision:
+  title: "Deliberate split transport for container registry access"
+  decision_date: "2026-08-10T21:50:00Z"
+  status: "approved"
+  option: "A - Deliberate split transport"
+
+  decision:
+    node_runtime_pull_transport: >
+      Continue using the K3s-configured internal HTTP mirror for node image pulls.
+    external_operator_transport: >
+      Use registry-bridge.tailc2cafc.ts.net via Tailscale HTTPS.
+    artifact_identity: >
+      Require canonical image repository references plus immutable sha256 digests
+      for governed integration and future production workloads.
+    registry_publishing_authority: >
+      Explicitly out of scope for this ADR; requires a separate registry capability decision.
+    internal_tls: deferred
+    canonical_https_node_pulls: not_claimed
+
+  rationale:
+    - Existing three-node mirror configuration is consistent and operational.
+    - Node pulls remain independent of Tailscale DNS and ProxyGroup availability.
+    - Internal TLS/PKI and registry publisher authorization are separate capability investments.
+    - Digest references preserve declared artifact identity despite mirror resolution.
+
+  non_goals:
+    - Claiming encrypted node-to-registry transport
+    - Claiming registry publisher authentication
+    - Claiming immutable tags or deletion protection
+    - Migrating existing workload image references
+    - Changing registries.yaml or restarting K3s
+
+  compensating_controls:
+    image_identity:
+      integration_and_future_prod:
+        required_format: "canonical-hostname/repository:tag@sha256:digest"
+        reject:
+          - ":latest"
+          - "tilt-*"
+          - "tag-only references"
+
+    mirror_configuration:
+      source_of_truth: "Git/OpenTofu/config-management"
+      drift_detection:
+        - hash registries.yaml across every node
+        - alert on unreviewed differences
+      service_identity:
+        avoid: "hardcoded ClusterIP as long-term design dependency"
+        future_state: "stable internal DNS endpoint or controlled service-discovery mechanism"
+
+    network_boundary:
+      registry_service:
+        exposure: "cluster-internal only"
+      kubernetes_network_policy:
+        allow_registry_access_only_from_required_namespaces: true
+      host_network:
+        hardening: "restrict untrusted host access and node-level compromise"
+
+    transport_claims:
+      allowed_claim: "HTTPS protects external/operator registry access"
+      prohibited_claim: "All node image pulls use HTTPS"
+
+    artifact_recovery:
+      retain:
+        - current_verified_digest
+        - previous_verified_digest
+      verify:
+        - pullability_from_every_node_runtime_class
+        - digest_availability_before_rollout_approval
+
+    supply_chain:
+      deferred_separate_decision:
+        - repository_scoped_ci_write_authority
+        - immutable_tags
+        - push_delete_audit_evidence
+        - deletion_protection
+        - artifact_provenance_enforcement
+
+  decision_triggers:
+    internal_network_untrusted:
+      trigger: "Internal network becomes shared, untrusted, or reachable by guest/IoT devices"
+      response: "Move to internal TLS or isolated registry network"
+    sensitive_artifacts:
+      trigger: "Sensitive or regulated artifact layers are introduced"
+      response: "Move to internal TLS and authenticated registry access"
+    clusterip_changes:
+      trigger: "Registry ClusterIP changes or Service recreation breaks pulls"
+      response: "Replace hard-coded IP endpoint with durable service identity"
+    tailscale_dependency:
+      trigger: "Nodes already require Tailscale for core cluster operations"
+      response: "Reconsider canonical HTTPS node pulls"
+    registry_upgrade:
+      trigger: "A registry platform upgrade is selected"
+      response: "Reassess internal TLS, repository authorization, immutability, audit, and retention together"
+    cross_cluster_pulls:
+      trigger: "Cross-cluster or remote-node pulls become common"
+      response: "Prefer canonical HTTPS or an authenticated internal TLS endpoint"
+    transport_integrity_incident:
+      trigger: "A transport-integrity incident occurs"
+      response: "Escalate to Option C design immediately"
+
+  future_target:
+    node_runtime: "authenticated internal TLS registry endpoint"
+    operator_remote_client: "Tailscale HTTPS registry endpoint"
+    ci: "repository-scoped authenticated publish endpoint"
+    gitops: "canonical digest reference"
+    admission: "release approval bound to exact digest/workload/environment"
+    registry: "immutable publication and retained rollback artifacts"
+
+workloads:
+  # Completed Canary (Excluded from pending migration count)
+  - namespace: gacs
+    kind: Deployment
+    name: k8s-state-ingestor
+    container: ingestor
+    old_image: registry-bridge.tailc2cafc.ts.net/k8s-state-ingestor:latest
+    new_image: 10.43.194.191:80/k8s-state-ingestor@sha256:900ebb861f5d63419141107743c252d87d7278ff003a0ece5e2a4e43c961bd58
+    git_sha: 8330a6eae07b
+    tier: P0
+    migration_status: completed_canary
+    health_check: liveness_probe
+    rollback_image: "N/A - First migration, no prior known-good image in local registry"
+    rollback_available: false
+    rollback_reason: "Original image used broken registry endpoint, no prior local-registry version available"
+    validation_timestamp: 2026-08-10T21:08:00Z
+    node_pull_verified:
+      - cortex
+    observed_image_id: "10.43.194.191:80/k8s-state-ingestor@sha256:900ebb861f5d63419141107743c252d87d7278ff003a0ece5e2a4e43c961bd58"
+    rollout_duration_seconds: 16
+    health_check_evidence: "Liveness probe passed, application started successfully, watching namespaces"
+    rollout_evidence:
+      - pod_name: k8s-state-ingestor-779dc59b89-btl6w
+      - pod_status: Running
+      - pod_ready: true
+      - restart_count: 0
+      - imageID_verified: true
+      - liveness_probe_passed: true
+      - application_started: true
+
+  # Batch 1: GACS Remaining Services (2 workloads, 2 image references)
+  - namespace: gacs
+    kind: Deployment
+    name: telemetry-ingestor
+    container: ingestor
+    old_image: registry-bridge.tailc2cafc.ts.net/telemetry-ingestor:latest
+    new_image: 10.43.194.191:80/telemetry-ingestor@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P0
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/telemetry-ingestor@sha256:<prior-known-good-digest>
+
+  - namespace: gacs
+    kind: Deployment
+    name: span-processor
+    container: processor
+    old_image: registry-bridge.tailc2cafc.ts.net/span-processor:latest
+    new_image: 10.43.194.191:80/span-processor@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P0
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/span-processor@sha256:<prior-known-good-digest>
+
+  # Batch 2: Infra-System and Infra-Data (8 workloads, 8 image references)
+  - namespace: infra-system
+    kind: Deployment
+    name: sovereign-portal
+    container: portal
+    old_image: registry-bridge.tailc2cafc.ts.net/sovereign-portal:latest
+    new_image: 10.43.194.191:80/sovereign-portal@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P0
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/sovereign-portal@sha256:<prior-known-good-digest>
+
+  - namespace: infra-system
+    kind: Deployment
+    name: sync-ledger-steward
+    container: steward
+    old_image: registry-bridge.tailc2cafc.ts.net/sync-ledger-steward:v1
+    new_image: 10.43.194.191:80/sync-ledger-steward@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P0
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/sync-ledger-steward@sha256:<prior-known-good-digest>
+
+  - namespace: infra-system
+    kind: Deployment
+    name: devops-platform
+    container: devops-platform
+    old_image: registry-bridge.tailc2cafc.ts.net/devops-platform:latest
+    new_image: 10.43.194.191:80/devops-platform@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/devops-platform@sha256:<prior-known-good-digest>
+
+  - namespace: infra-system
+    kind: Deployment
+    name: devops-platform
+    container: devops-platform-api
+    old_image: registry-bridge.tailc2cafc.ts.net/devops-platform:latest
+    new_image: 10.43.194.191:80/devops-platform@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/devops-platform@sha256:<prior-known-good-digest>
+
+  - namespace: infra-system
+    kind: Deployment
+    name: discovery-local
+    container: discovery-local
+    old_image: registry-bridge.tailc2cafc.ts.net/registry-service:20260614202005-9645684
+    new_image: 10.43.194.191:80/registry-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/registry-service@sha256:<prior-known-good-digest>
+
+  - namespace: infra-system
+    kind: Deployment
+    name: emc-mode-controller
+    container: controller
+    old_image: registry-bridge.tailc2cafc.ts.net/emc-controller:latest
+    new_image: 10.43.194.191:80/emc-controller@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/emc-controller@sha256:<prior-known-good-digest>
+
+  - namespace: infra-system
+    kind: Deployment
+    name: stable-diffusion-webui
+    container: stable-diffusion-webui
+    old_image: registry-bridge.tailc2cafc.ts.net/stable-diffusion-webui:20260620074144-1c701f4
+    new_image: 10.43.194.191:80/stable-diffusion-webui@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/stable-diffusion-webui@sha256:<prior-known-good-digest>
+
+  - namespace: infra-data
+    kind: Deployment
+    name: opentofu-backend
+    container: opentofu-backend
+    old_image: registry-bridge.tailc2cafc.ts.net/opentofu-backend:latest
+    new_image: 10.43.194.191:80/opentofu-backend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/opentofu-backend@sha256:<prior-known-good-digest>
+
+  - namespace: infra-data
+    kind: Deployment
+    name: pgbouncer
+    container: pgbouncer
+    old_image: registry-bridge.tailc2cafc.ts.net/pgbouncer:latest
+    new_image: 10.43.194.191:80/pgbouncer@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: tcp_readiness
+    rollback_image: 10.43.194.191:80/pgbouncer@sha256:<prior-known-good-digest>
+
+  # Batch 3: Core Application Namespaces (10 workloads, 10 image references)
+  - namespace: cts
+    kind: Deployment
+    name: cts-backend
+    container: cts-backend
+    old_image: registry-bridge.tailc2cafc.ts.net/cts-backend:tilt-e1c473bee9174503
+    new_image: 10.43.194.191:80/cts-backend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/cts-backend@sha256:<prior-known-good-digest>
+
+  - namespace: cts
+    kind: Deployment
+    name: cts-frontend
+    container: cts-frontend
+    old_image: registry-bridge.tailc2cafc.ts.net/cts-frontend:tilt-056870c44133dd47
+    new_image: 10.43.194.191:80/cts-frontend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/cts-frontend@sha256:<prior-known-good-digest>
+
+  - namespace: cts
+    kind: Deployment
+    name: cts-watchdog
+    container: cts-watchdog
+    old_image: registry-bridge.tailc2cafc.ts.net/cts-backend:tilt-e1c473bee9174503
+    new_image: 10.43.194.191:80/cts-backend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/cts-backend@sha256:<prior-known-good-digest>
+
+  - namespace: story-system
+    kind: Deployment
+    name: controller-manager
+    container: manager
+    old_image: registry-bridge.tailc2cafc.ts.net/story-controller:tilt-76ce85294e367732
+    new_image: 10.43.194.191:80/story-controller@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/story-controller@sha256:<prior-known-good-digest>
+
+  - namespace: local-ai
+    kind: Deployment
+    name: video-assembler-backend
+    container: backend
+    old_image: registry-bridge.tailc2cafc.ts.net/video-assembler-backend:latest
+    new_image: 10.43.194.191:80/video-assembler-backend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/video-assembler-backend@sha256:<prior-known-good-digest>
+
+  - namespace: project-open-hearth
+    kind: Deployment
+    name: poh-api
+    container: api
+    old_image: registry-bridge.tailc2cafc.ts.net/poh-api:latest
+    new_image: 10.43.194.191:80/poh-api@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/poh-api@sha256:<prior-known-good-digest>
+
+  - namespace: storyloom-dev
+    kind: Deployment
+    name: storyloom-api
+    container: api
+    old_image: registry-bridge.tailc2cafc.ts.net/storyloom-api:tilt-31758d41cc7ea291
+    new_image: 10.43.194.191:80/storyloom-api@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/storyloom-api@sha256:<prior-known-good-digest>
+
+  - namespace: storyloom-dev
+    kind: Deployment
+    name: storyloom-web
+    container: web
+    old_image: registry-bridge.tailc2cafc.ts.net/storyloom-web:tilt-4fdabd6ec8c2d78d
+    new_image: 10.43.194.191:80/storyloom-web@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/storyloom-web@sha256:<prior-known-good-digest>
+
+  - namespace: storyloom
+    kind: Deployment
+    name: storyloom-api
+    container: api
+    old_image: registry-bridge.tailc2cafc.ts.net/storyloom-api:20260804085204-8af4e0f
+    new_image: 10.43.194.191:80/storyloom-api@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/storyloom-api@sha256:<prior-known-good-digest>
+
+  - namespace: storyloom
+    kind: Deployment
+    name: storyloom-web
+    container: web
+    old_image: registry-bridge.tailc2cafc.ts.net/storyloom-web:20260606062331-a3e50e4
+    new_image: 10.43.194.191:80/storyloom-web@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/storyloom-web@sha256:<prior-known-good-digest>
+
+  - namespace: strategy-os
+    kind: Deployment
+    name: strategy-brain
+    container: brain
+    old_image: registry-bridge.tailc2cafc.ts.net/strategy-brain:5df3fbd-v9
+    new_image: 10.43.194.191:80/strategy-brain@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/strategy-brain@sha256:<prior-known-good-digest>
+
+  - namespace: strategy-os
+    kind: Deployment
+    name: strategy-ui
+    container: ui
+    old_image: registry-bridge.tailc2cafc.ts.net/strategy-ui:5df3fbd
+    new_image: 10.43.194.191:80/strategy-ui@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/strategy-ui@sha256:<prior-known-good-digest>
+
+  - namespace: talent-platform-dev
+    kind: Deployment
+    name: talent-platform-api
+    container: api
+    old_image: registry-bridge.tailc2cafc.ts.net/talent-platform:tilt-89641c0480907b8f
+    new_image: 10.43.194.191:80/talent-platform@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P1
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/talent-platform@sha256:<prior-known-good-digest>
+
+  # Batch 4: ToneRoot and Remaining Workloads (25 workloads, 32 image references)
+  - namespace: default
+    kind: Deployment
+    name: ace-step-service
+    container: ace-step
+    old_image: registry-bridge.tailc2cafc.ts.net/ace-step-service:20260704201811-b03a66f
+    new_image: 10.43.194.191:80/ace-step-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/ace-step-service@sha256:<prior-known-good-digest>
+
+  - namespace: default
+    kind: Deployment
+    name: alltalk-tts
+    container: alltalk-tts
+    old_image: registry-bridge.tailc2cafc.ts.net/alltalk-tts:latest
+    new_image: 10.43.194.191:80/alltalk-tts@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/alltalk-tts@sha256:<prior-known-good-digest>
+
+  - namespace: default
+    kind: Deployment
+    name: mcp-server
+    container: mcp-server
+    old_image: registry-bridge.tailc2cafc.ts.net/mcp-server:latest
+    new_image: 10.43.194.191:80/mcp-server@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/mcp-server@sha256:<prior-known-good-digest>
+
+  - namespace: default
+    kind: Deployment
+    name: rclone-gateway
+    container: rclone
+    old_image: registry-bridge.tailc2cafc.ts.net/rclone-gateway:20260614201525-9645684
+    new_image: 10.43.194.191:80/rclone-gateway@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/rclone-gateway@sha256:<prior-known-good-digest>
+
+  - namespace: default
+    kind: Deployment
+    name: rclone-gateway
+    container: rclone-metrics-exporter
+    old_image: registry-bridge.tailc2cafc.ts.net/rclone-metrics-exporter:20260706114500-fix
+    new_image: 10.43.194.191:80/rclone-metrics-exporter@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/rclone-metrics-exporter@sha256:<prior-known-good-digest>
+
+  - namespace: default
+    kind: Deployment
+    name: stable-diffusion-webui
+    container: stable-diffusion-webui
+    old_image: registry-bridge.tailc2cafc.ts.net/stable-diffusion-webui:20260424235302-96552a3
+    new_image: 10.43.194.191:80/stable-diffusion-webui@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/stable-diffusion-webui@sha256:<prior-known-good-digest>
+
+  - namespace: governance
+    kind: Deployment
+    name: governance-service
+    container: sentinel
+    old_image: registry-bridge.tailc2cafc.ts.net/governance-service:20260804104051-35f1e65
+    new_image: 10.43.194.191:80/governance-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/governance-service@sha256:<prior-known-good-digest>
+
+  - namespace: governance
+    kind: Deployment
+    name: governance-service
+    container: registry-exporter
+    old_image: registry-bridge.tailc2cafc.ts.net/governance-service:20260804104051-35f1e65
+    new_image: 10.43.194.191:80/governance-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/governance-service@sha256:<prior-known-good-digest>
+
+  - namespace: governance
+    kind: Deployment
+    name: governance-service
+    container: worker
+    old_image: registry-bridge.tailc2cafc.ts.net/governance-service:20260804104051-35f1e65
+    new_image: 10.43.194.191:80/governance-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/governance-service@sha256:<prior-known-good-digest>
+
+  # ToneRoot Services (18 deployments, 25 image references)
+  - namespace: toneroot
+    kind: Deployment
+    name: ace-step-service
+    container: ace-step
+    old_image: registry-bridge.tailc2cafc.ts.net/ace-step-service:20260704201811-b03a66f
+    new_image: 10.43.194.191:80/ace-step-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/ace-step-service@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: alltalk-tts
+    container: alltalk-tts
+    old_image: registry-bridge.tailc2cafc.ts.net/alltalk-tts:latest
+    new_image: 10.43.194.191:80/alltalk-tts@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/alltalk-tts@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: f5-tts-service
+    container: f5-tts
+    old_image: registry-bridge.tailc2cafc.ts.net/f5-tts-service:20260620074511-1c701f4
+    new_image: 10.43.194.191:80/f5-tts-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/f5-tts-service@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: fish-speech-service
+    container: fish-speech
+    old_image: registry-bridge.tailc2cafc.ts.net/fish-speech-service:20260806-torchvision-fix
+    new_image: 10.43.194.191:80/fish-speech-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/fish-speech-service@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: freesound-mcp-server
+    container: freesound-mcp-server
+    old_image: registry-bridge.tailc2cafc.ts.net/freesound-mcp-server:20260706124000-fix
+    new_image: 10.43.194.191:80/freesound-mcp-server@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/freesound-mcp-server@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: gpu-nanny-controller
+    container: controller
+    old_image: registry-bridge.tailc2cafc.ts.net/gpu-nanny-controller:20260620220400-cts-ollama
+    new_image: 10.43.194.191:80/gpu-nanny-controller@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/gpu-nanny-controller@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: heartmula-service
+    container: heartmula
+    old_image: registry-bridge.tailc2cafc.ts.net/heartmula-service:20260704220505-7803b04
+    new_image: 10.43.194.191:80/heartmula-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/heartmula-service@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: main-backend-service
+    container: main-backend-service
+    old_image: registry-bridge.tailc2cafc.ts.net/backend-api:20260603103150-539435a
+    new_image: 10.43.194.191:80/backend-api@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/backend-api@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: rclone-gateway
+    container: rclone
+    old_image: registry-bridge.tailc2cafc.ts.net/rclone-gateway:20260614201525-9645684
+    new_image: 10.43.194.191:80/rclone-gateway@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/rclone-gateway@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: rclone-gateway
+    container: rclone-metrics-exporter
+    old_image: registry-bridge.tailc2cafc.ts.net/rclone-metrics-exporter:20260706114500-fix
+    new_image: 10.43.194.191:80/rclone-metrics-exporter@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/rclone-metrics-exporter@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: stable-diffusion-webui-http-pilot
+    container: stable-diffusion-webui
+    old_image: registry-bridge.tailc2cafc.ts.net/stable-diffusion-webui:20260620074144-1c701f4
+    new_image: 10.43.194.191:80/stable-diffusion-webui@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/stable-diffusion-webui@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: synthesis-worker
+    container: worker
+    old_image: registry-bridge.tailc2cafc.ts.net/storyloom-api:20260804085204-8af4e0f
+    new_image: 10.43.194.191:80/storyloom-api@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/storyloom-api@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: toneroot-backend
+    container: toneroot-backend
+    old_image: registry-bridge.tailc2cafc.ts.net/toneroot-backend-dev:tilt-0dc2803562ae0a6d
+    new_image: 10.43.194.191:80/toneroot-backend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/toneroot-backend-dev@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: toneroot-backend
+    container: toneroot-ipc
+    old_image: registry-bridge.tailc2cafc.ts.net/toneroot-ipc-dev:tilt-0dc2803562ae0a6d
+    new_image: 10.43.194.191:80/toneroot-ipc@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/toneroot-ipc-dev@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: toneroot-frontend
+    container: toneroot-frontend
+    old_image: registry-bridge.tailc2cafc.ts.net/toneroot-frontend-dev:tilt-281715bfaab79da8
+    new_image: 10.43.194.191:80/toneroot-frontend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: http_readiness
+    rollback_image: 10.43.194.191:80/toneroot-frontend-dev@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: toneroot-whisper-poller
+    container: whisper-poller
+    old_image: registry-bridge.tailc2cafc.ts.net/whisper-worker:20260804104514-35f1e65
+    new_image: 10.43.194.191:80/whisper-worker@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/whisper-worker@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: toneroot-whisper-service
+    container: toneroot-whisper-service
+    old_image: registry-bridge.tailc2cafc.ts.net/whisper-worker:20260804104514-35f1e65
+    new_image: 10.43.194.191:80/whisper-worker@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/whisper-worker@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: toneroot-worker
+    container: toneroot-worker
+    old_image: registry-bridge.tailc2cafc.ts.net/toneroot-backend-dev:tilt-0dc2803562ae0a6d
+    new_image: 10.43.194.191:80/toneroot-backend@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/toneroot-backend-dev@sha256:<prior-known-good-digest>
+
+  - namespace: toneroot
+    kind: Deployment
+    name: whisper-worker
+    container: worker
+    old_image: registry-bridge.tailc2cafc.ts.net/whisper-worker:20260710055555-c54ee2a
+    new_image: 10.43.194.191:80/whisper-worker@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/whisper-worker@sha256:<prior-known-good-digest>
+
+  # Batch 5: DaemonSets (Higher Risk) (3 workloads, 3 image references)
+  - namespace: default
+    kind: DaemonSet
+    name: governance-agent
+    container: agent
+    old_image: registry-bridge.tailc2cafc.ts.net/governance-service:20260401235059-a2287c0
+    new_image: 10.43.194.191:80/governance-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/governance-service@sha256:<prior-known-good-digest>
+
+  - namespace: kube-system
+    kind: DaemonSet
+    name: image-warmer
+    container: f5-tts-warmer
+    old_image: registry-bridge.tailc2cafc.ts.net/f5-tts-service:20260620074511-1c701f4
+    new_image: 10.43.194.191:80/f5-tts-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/f5-tts-service@sha256:<prior-known-good-digest>
+
+  - namespace: kube-system
+    kind: DaemonSet
+    name: image-warmer
+    container: sd-warmer
+    old_image: registry-bridge.tailc2cafc.ts.net/fish-speech-service:20260806-torchvision-fix
+    new_image: 10.43.194.191:80/fish-speech-service@sha256:<digest>
+    git_sha: <git-sha>
+    tier: P2
+    migration_status: pending
+    health_check: liveness_probe
+    rollback_image: 10.43.194.191:80/fish-speech-service@sha256:<prior-known-good-digest>
+
+# Rollout Validation Rules
+validation_rules:
+  reject_if:
+    - contains registry-bridge.tailc2cafc.ts.net
+    - uses_latest_tag: true
+    - missing_digest: true
+    - unvalidated_registry: true
+    - missing_rollback: true
+    - inventory_totals_inconsistent: true
+    - missing_audit_fields: true
+    - rollback_uses_broken_registry: true
+    - rollback_image_equals_new_image: true
+  
+  require:
+    - node_crictl_pull_success: true
+    - mirror_behavior_confirmed: true
+    - transport_architecture_understood: true
+    - rollback_artifact_available: true
+    - rollback_image_local_registry_verified: true
+    - rollback_image_differs_from_target: true
+    - pod_running_and_ready: true
+    - health_check_passed: true
+    - imageID_contains_digest: true
+    - cluster_discovery_matches_inventory: true
+
+# Required Audit Fields for Completed Workloads
+required_audit_fields:
+  - old_image
+  - new_image
+  - rollback_image
+  - rollback_available
+  - rollback_reason
+  - node_pull_verified
+  - observed_image_id
+  - rollout_duration_seconds
+  - health_check_evidence
+  - validation_timestamp
+
+# Batch 1 Pre-Migration Gates
+batch_1_pre_migration_gates:
+  - Identify currently running image's exact imageID/digest before changing anything
+  - Copy that exact image into 10.43.194.191:80 if not already there
+  - Pull the resulting internal-registry digest using crictl
+  - Store that distinct digest as rollback_image
+  - Confirm rollback_image != new_image
+  - Only then build and deploy the new digest-pinned image
+
+# Batch 1 Execution Rules
+batch_1_execution_rules:
+  execution_mode: serial
+  stop_condition: "Do not begin second rollout unless first service is Ready, has expected digest in imageID, has no unexpected restarts, and passes service-specific health check"
+  inventory_update: "Update inventory transactionally after each service completion"
+  health_check_gates:
+    - pod_ready: true
+    - imageID_contains_digest: true
+    - restart_count: 0
+    - service_health_check_passed: true
+  rollback_verification:
+    source_image_digest: sha256:<prior-known-good-digest>
+    local_registry_pull_verified: true
+    node_pull_verified:
+      - cortex
+    rollback_complete: false  # Reserved for actual rollback scenario
+
+# Batch 1 Approval Sequence
+batch_1_approval_sequence:
+  status: planned_not_authorized
+  authorization_required: true
+
+  b1_a_artifact_and_rollback_evidence:
+    status: pending
+    required_fields:
+      - workload: "gacs/telemetry-ingestor | gacs/span-processor"
+      - current_image_reference: "<exact live and Git reference>"
+      - target_image_reference: "<canonical repository@sha256 digest>"
+      - target_manifest_preflight:
+          status: 200
+          returned_digest_matches: true
+          media_type: "<value>"
+      - target_pullability:
+          eligible_nodes: []
+          result_per_node: {}
+      - rollback_image_reference: "<distinct canonical repository@sha256 digest>"
+      - rollback_manifest_preflight:
+          status: 200
+          returned_digest_matches: true
+      - rollback_pullability:
+          eligible_nodes: []
+          result_per_node: {}
+      - registry_write_required: true|false
+      - source_provenance: "<CI/source commit/build evidence>"
+    approval_required: true
+
+  b1_b_git_desired_state_change:
+    status: pending
+    prerequisite: b1_a_artifact_and_rollback_evidence_approved
+    required_fields:
+      - repository: "<exact repository>"
+      - branch: "<new branch>"
+      - exact_files: []
+      - old_image: "<value>"
+      - new_image: "<tag@sha256 digest>"
+      - no_other_manifest_fields_changed: true
+      - digest_policy_check: pass
+      - review_required: true
+      - flux_reconciliation: not_authorized
+    approval_required: true
+
+  b1_c_live_deployment_correction:
+    status: pending
+    prerequisite: b1_b_git_desired_state_change_approved
+    required_fields:
+      - cluster_context: "<exact context>"
+      - namespace: gacs
+      - resource: "<exact Deployment and container>"
+      - expected_current_image: "<value>"
+      - expected_resource_version: "<value>"
+      - target_image: "<approved canonical tag@digest>"
+      - replicas_behavior: "<must remain unchanged unless separately approved>"
+      - rollout_behavior: "<explicit>"
+      - validation: "<imageID, readiness, logs, rollback trigger>"
+    approval_required: true
+
+# Batch 1 Serial Stop Condition
+batch_1_stop_condition:
+  trigger:
+    - target_digest_unavailable
+    - target_or_rollback_pull_failure
+    - image_reference_not_exact
+    - unexpected_manifest_diff
+    - resource_version_conflict
+    - rollout_failure
+    - runtime_imageID_mismatch
+    - readiness_or_health_failure
+    - rollback_artifact_unavailable
+  effect:
+    - do_not_start_next_workload
+    - do_not_retry_with_modified_scope
+    - capture_evidence
+    - request_fresh_approval_for_remediation
+
+# Completion Criteria
+completion_criteria:
+  all_workloads_migrated: false
+  no_latest_tags: false
+  all_digest_pinned: false
+  no_imagepullbackoff: false
+  all_nodes_validated: false
+  rollback_references_recorded: false
+  application_defects_classified: false

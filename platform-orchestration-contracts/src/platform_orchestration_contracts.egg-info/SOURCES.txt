@@ -1,0 +1,15 @@
+pyproject.toml
+src/platform_orchestration_contracts/__init__.py
+src/platform_orchestration_contracts/artifact_manifest.py
+src/platform_orchestration_contracts/error_taxonomy.py
+src/platform_orchestration_contracts/outbox.py
+src/platform_orchestration_contracts/temporal_client.py
+src/platform_orchestration_contracts/workflow_envelope.py
+src/platform_orchestration_contracts/workflow_ids.py
+src/platform_orchestration_contracts/workflow_result.py
+src/platform_orchestration_contracts.egg-info/PKG-INFO
+src/platform_orchestration_contracts.egg-info/SOURCES.txt
+src/platform_orchestration_contracts.egg-info/dependency_links.txt
+src/platform_orchestration_contracts.egg-info/requires.txt
+src/platform_orchestration_contracts.egg-info/top_level.txt
+tests/test_contracts.py
