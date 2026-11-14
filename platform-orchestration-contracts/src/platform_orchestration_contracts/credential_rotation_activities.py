@@ -726,7 +726,9 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
 
 @activity.defn
 async def post_closure_evidence(evidence: dict) -> ActResult:
-    """POST evidence → governance-closure endpoint."""
+    """POST evidence → governance-closure endpoint. Advisory: the Temporal
+    history + merged PR ARE the evidence — a dead endpoint must not fail a
+    completed rotation. Retryable only on 5xx; DNS/refused/4xx → OK-with-note."""
     url = os.environ.get("GOVERNANCE_CLOSURE_URL",
                          "https://governance-closure.patternfoundry.dev/api/evidence")
     try:
@@ -734,5 +736,9 @@ async def post_closure_evidence(evidence: dict) -> ActResult:
                                      headers={"Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(req, timeout=10)
         return ActResult(Outcome.OK, "closure-posted")
+    except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            return ActResult(Outcome.RETRYABLE, f"closure:HTTP{e.code}")
+        return ActResult(Outcome.OK, f"closure-post-failed:HTTP{e.code}")
     except Exception as e:
-        return ActResult(Outcome.RETRYABLE, f"closure:{type(e).__name__}")
+        return ActResult(Outcome.OK, f"closure-post-unreachable:{type(e).__name__}")
