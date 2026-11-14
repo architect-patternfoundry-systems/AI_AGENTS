@@ -143,9 +143,11 @@ def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
         key_file = os.environ.get("SOPS_AGE_KEY_FILE", "/etc/sops/age-key.txt")
         with open(key_file) as f:
             age_key = f.read().strip()
+        # Use SOPS_AGE_KEY env var for encryption/decryption with secret key
+        env = {**os.environ, "SOPS_AGE_KEY": age_key}
         r = subprocess.run(
-            ["sops", "-e", "--input-type", "yaml", "--output-type", "yaml", "--age", age_key, "/dev/stdin"],
-            input=manifest, capture_output=True, timeout=30,
+            ["sops", "-e", "--input-type", "yaml", "--output-type", "yaml", "/dev/stdin"],
+            input=manifest, capture_output=True, timeout=30, env=env,
         )
         return (r.returncode == 0), (r.stdout if r.returncode == 0 else r.stderr[:300])
     except Exception as e:
