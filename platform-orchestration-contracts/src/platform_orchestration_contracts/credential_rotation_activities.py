@@ -250,7 +250,18 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str) -> ActResult:
     secret_path = os.environ["ROTATION_SECRET_PATH"]  # e.g. apps/secrets/cts/cts-backend-db.yaml
     ok, d = _kubectl("config", "current-context")  # sanity
     repo = os.environ.get("ROTATION_REPO_DIR", "/workspace")
+    repo_url = os.environ.get("ROTATION_REPO_URL")
+    if not repo_url:
+        return ActResult(Outcome.FATAL, "ROTATION_REPO_URL not set")
     try:
+        # Clone or update the repository
+        if os.path.exists(os.path.join(repo, ".git")):
+            subprocess.run(["git", "-C", repo, "fetch", "origin"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "pull", "origin", "main"], check=True, capture_output=True)
+        else:
+            os.makedirs(repo, exist_ok=True)
+            subprocess.run(["git", "clone", repo_url, repo], check=True, capture_output=True)
         subprocess.run(["git", "-C", repo, "checkout", "-B", branch], check=True, capture_output=True)
         open(os.path.join(repo, secret_path), "wb").write(blob)
         subprocess.run(["git", "-C", repo, "add", secret_path], check=True, capture_output=True)
