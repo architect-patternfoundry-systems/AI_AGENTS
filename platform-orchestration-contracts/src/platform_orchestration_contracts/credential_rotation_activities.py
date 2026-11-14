@@ -602,6 +602,20 @@ async def revoke_predecessor(principal: str) -> ActResult:
         conn = psycopg2.connect(os.environ["ROTATION_PG_DSN"], connect_timeout=8)
         conn.autocommit = True
         cur = conn.cursor()
+        # State check first — idempotent for already-gone/dead roles, and
+        # for SUPERUSER principals (e.g. cortex_db_admin) whose ALTER ROLE
+        # requires a superuser: the operator applies NOLOGIN out-of-band
+        # while this activity retries, and the retry then sees the dead
+        # role and proceeds instead of wedging on InsufficientPrivilege.
+        cur.execute("SELECT rolcanlogin FROM pg_roles WHERE rolname = %s",
+                    (principal,))
+        row = cur.fetchone()
+        if row is None:
+            conn.close()
+            return ActResult(Outcome.OK, f"role-absent:{principal}")
+        if not os.environ.get("ROTATION_ALLOW_DROP") and row[0] is False:
+            conn.close()
+            return ActResult(Outcome.OK, f"role-already-nologin:{principal}")
         if os.environ.get("ROTATION_ALLOW_DROP"):
             cur.execute(psql.SQL("REASSIGN OWNED BY {} TO postgres").format(psql.Identifier(principal)))
             cur.execute(psql.SQL("DROP OWNED BY {}").format(psql.Identifier(principal)))
