@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import secrets
 import string
 import subprocess
@@ -88,6 +89,33 @@ def _kubectl(*args: str, input_bytes: bytes | None = None, timeout: int = 30) ->
         return r.returncode == 0, (r.stderr or r.stdout)[:400].decode(errors="replace")
     except subprocess.TimeoutExpired:
         return False, "kubectl-timeout"
+
+
+_USERLIST_LINE = re.compile(r'^"([^"]+)" "([^"]*)"$')
+
+
+def _consumer(c) -> dict:
+    """Normalize a consumer entry to {name, namespace, kind, secret?}.
+
+    Accepts plain names ("cts-backend") and dicts:
+      {"name": ..., "namespace": ..., "kind": "deployment",
+       "secret": {"name": ..., "key": ...,
+                  "value_template": "postgresql://{user}:{pw}@{host}:{port}/{db}"}}
+
+    Defaults: namespace=ROTATION_NAMESPACE (pgbouncer→infra-data),
+    kind=deployment. `secret` marks an out-of-band (non-GitOps) secret
+    the worker patches directly before rolling the consumer.
+    """
+    if isinstance(c, str):
+        c = {"name": c}
+    return {
+        "name": c["name"],
+        "namespace": c.get("namespace") or (
+            "infra-data" if c["name"] == "pgbouncer"
+            else os.environ.get("ROTATION_NAMESPACE", "cts")),
+        "kind": c.get("kind", "deployment"),
+        "secret": c.get("secret"),
+    }
 
 
 def _sealed_field(sealed: str, key: str) -> str | None:
@@ -187,7 +215,23 @@ async def generate_successor_cred(spec: dict) -> ActResult:
                             os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
                             "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
                             "-o", "jsonpath={.data.password}")
-    old_pw = base64.b64decode(old_b64.strip('"')).decode() if ok_s else ""
+    if not ok_s:
+        # Transient API failure must NOT silently produce an empty snapshot —
+        # an empty predecessor_password leaves liveness_dead_check blind.
+        return ActResult(Outcome.RETRYABLE, f"predecessor-snapshot:{old_b64}")
+    old_pw = base64.b64decode(old_b64.strip('"')).decode() if old_b64.strip('"') else ""
+    if not old_pw:
+        # Secret may carry credentials only inside `uri` — parse userinfo.
+        ok_u, uri_b64 = _kubectl("get", "secret",
+                                os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
+                                "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
+                                "-o", "jsonpath={.data.uri}")
+        if ok_u and uri_b64.strip('"'):
+            u = base64.b64decode(uri_b64.strip('"')).decode()
+            if "://" in u and ":" in u.split("://", 1)[1].split("@")[0]:
+                old_pw = u.split("://", 1)[1].split("@")[0].split(":", 1)[1]
+    if not old_pw:
+        return ActResult(Outcome.FATAL, "predecessor-snapshot-empty")
     # DSN assembled from discrete env parts — no credential-shaped
     # postgresql://user:pw@ literal ever exists in YAML/manifests.
     _h = os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local")
@@ -214,6 +258,11 @@ async def generate_successor_cred(spec: dict) -> ActResult:
 @activity.defn
 async def create_role(principal: str, successor: str, sealed: str, role_spec: dict) -> ActResult:
     """CREATE ROLE successor (idempotent) + inherit principal's grants."""
+    # Idle guardrail: while ROTATION_FORCE_DRY_RUN is set the worker refuses
+    # the first mutating step outright — spec.dry_run=false alone cannot
+    # trigger a live rotation (defense-in-depth between scheduled runs).
+    if os.environ.get("ROTATION_FORCE_DRY_RUN", "false").lower() == "true":
+        return ActResult(Outcome.FATAL, "live-gated:ROTATION_FORCE_DRY_RUN")
     pw = _plaintext_from_sealed(sealed)
     if pw is None:
         return ActResult(Outcome.FATAL, "sealed-decrypt-failed")
@@ -332,17 +381,15 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
 
 
 @activity.defn
-async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: int = 900) -> ActResult:
+async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 900) -> ActResult:
     """All consumers' new pods Ready AND successor auth probe passes."""
+    cons = [_consumer(c) for c in consumers]
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         all_ready = True
-        for c in consumers:
-            # pgbouncer lives in infra-data, not the rotation namespace —
-            # probing it in ROTATION_NAMESPACE never resolves (post-mortem)
-            ns = "infra-data" if c == "pgbouncer" else os.environ.get("ROTATION_NAMESPACE", "cts")
-            ok, _ = _kubectl("rollout", "status", f"deploy/{c}", "-n",
-                             ns, f"--timeout=10s")
+        for c in cons:
+            ok, _ = _kubectl("rollout", "status", f"{c['kind']}/{c['name']}", "-n",
+                             c["namespace"], f"--timeout=10s")
             if not ok:
                 all_ready = False
         if all_ready:
@@ -368,38 +415,69 @@ async def wait_consumer_healthy(consumers: list[str], sealed: str, timeout_s: in
 
 
 @activity.defn
-async def patch_and_roll(consumers: list[str], sealed: str) -> ActResult:
-    """Update pgbouncer userlist (if consumer) + rollout restarts.
+async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
+    """Update pgbouncer userlist (if consumer) + out-of-band secrets +
+    rollout restarts across namespaces.
 
-    Idempotent-ish: rollout restart is safe to re-issue. The userlist
-    patch appends only if the successor line is absent.
+    Consumers are normalized via _consumer(): per-consumer
+    (name, namespace, kind) and optional out-of-band `secret` patch.
+    Idempotent: userlist upsert is replace-or-append with strict
+    line validation; restarts are safe to re-issue.
     """
     successor = json.loads(sealed).get("successor", "") if sealed.startswith("{") else ""
     pw = _plaintext_from_sealed(sealed) or ""
-    if "pgbouncer" in consumers:
-        # append successor to userlist (plaintext form — pgbouncer SCRAMs it)
-        ok, cur = _kubectl("get", "secret", "pgbouncer-userlist", "-n", "infra-data",
+    cons = [_consumer(c) for c in consumers]
+
+    # pgbouncer userlist: plaintext entries under auth_type=trust —
+    # pgbouncer passes them through for backend auth, so SCRAM verifiers
+    # cannot be used. Parse/validate each line, drop malformed ones
+    # (a pre-existing truncated tail once spliced a successor into the
+    # cts_backend entry and broke trust auth for ~10min).
+    pgb = next((c for c in cons if c["name"] == "pgbouncer"), None)
+    if pgb:
+        ok, cur = _kubectl("get", "secret", "pgbouncer-userlist", "-n", pgb["namespace"],
                            "-o", "jsonpath={.data.userlist\\.txt}")
         if not ok:
             return ActResult(Outcome.RETRYABLE, f"userlist-get:{cur}")
-        ul = base64.b64decode(cur.strip('"')).decode()
-        if f'"{successor}"' not in ul:
-            ul += f'"{successor}" "{pw}"\n'
-            patch = json.dumps({"data": {"userlist.txt": base64.b64encode(ul.encode()).decode()}})
-            ok, d = _kubectl("patch", "secret", "pgbouncer-userlist", "-n", "infra-data",
-                             "--type", "merge", "-p", patch)
-            if not ok:
-                return ActResult(Outcome.RETRYABLE, f"userlist-patch:{d}")
-        ok, d = _kubectl("rollout", "restart", "deploy/pgbouncer", "-n", "infra-data")
+        entries, dropped = [], 0
+        for line in base64.b64decode(cur.strip('"')).decode().splitlines():
+            m = _USERLIST_LINE.match(line.strip())
+            if m:
+                entries.append(m.groups())
+            elif line.strip():
+                dropped += 1
+        entries = [(u, p) for u, p in entries if u != successor]
+        entries.append((successor, pw))
+        ul = "".join(f'"{u}" "{p}"\n' for u, p in entries)
+        patch = json.dumps({"data": {"userlist.txt": base64.b64encode(ul.encode()).decode()}})
+        ok, d = _kubectl("patch", "secret", "pgbouncer-userlist", "-n", pgb["namespace"],
+                         "--type", "merge", "-p", patch)
         if not ok:
-            return ActResult(Outcome.RETRYABLE, f"pgbouncer-restart:{d}")
-    for c in consumers:
-        if c == "pgbouncer":
+            return ActResult(Outcome.RETRYABLE, f"userlist-patch:{d}")
+        if dropped:
+            print(f"userlist: dropped {dropped} malformed lines")
+
+    # Out-of-band (non-GitOps) secrets: write the successor credential
+    # directly — the GitOps sealed path can't reach them.
+    for c in cons:
+        s = c["secret"]
+        if not s:
             continue
-        ok, d = _kubectl("rollout", "restart", f"deploy/{c}", "-n",
-                         os.environ.get("ROTATION_NAMESPACE", "cts"))
+        val = s.get("value_template", "{pw}").format(
+            user=successor, pw=pw,
+            host=os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local"),
+            port=os.environ.get("ROTATION_PG_PORT", "5432"),
+            db=os.environ.get("ROTATION_PG_DB", "mydatabase"))
+        patch = json.dumps({"data": {s["key"]: base64.b64encode(val.encode()).decode()}})
+        ok, d = _kubectl("patch", "secret", s["name"], "-n", c["namespace"],
+                         "--type", "merge", "-p", patch)
         if not ok:
-            return ActResult(Outcome.RETRYABLE, f"restart-{c}:{d}")
+            return ActResult(Outcome.RETRYABLE, f"secret-patch-{s['name']}:{d}")
+
+    for c in cons:
+        ok, d = _kubectl("rollout", "restart", f"{c['kind']}/{c['name']}", "-n", c["namespace"])
+        if not ok:
+            return ActResult(Outcome.RETRYABLE, f"restart-{c['name']}:{d}")
     return ActResult(Outcome.OK, "consumers-rolled")
 
 

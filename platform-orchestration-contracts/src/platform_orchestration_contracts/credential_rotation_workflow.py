@@ -91,7 +91,7 @@ class RotationSpec:
     principal: str                      # e.g. "cortex_db_admin"
     namespace: str                      # e.g. "infra-data"
     secret_name: str                    # e.g. "cts-backend-db"
-    consumers: list[str]                # e.g. ["cts-backend", "cts-watchdog", "pgbouncer"]
+    consumers: list                     # names or {"name","namespace","kind","secret"?} — see _consumer()
     db_host: str
     db_name: str = "mydatabase"
     successor_name: Optional[str] = None  # default: principal + "_r{N}"
