@@ -119,7 +119,8 @@ def _sops_spec(spec: "RotationSpec") -> dict:
     """Subset of spec fields sops_encrypt_and_open_pr needs:
     artifact path override + consumer gitops secret files."""
     return {"artifact_path": spec.artifact_path, "consumers": spec.consumers,
-            "secret_name": spec.secret_name, "namespace": spec.namespace}
+            "secret_name": spec.secret_name, "namespace": spec.namespace,
+            "principal": spec.principal}
 
 
 @workflow.defn
@@ -232,12 +233,10 @@ class CredentialRotationWorkflow:
                     [sealed, branch, True, _sops_spec(spec)],
                     "sops_encrypt_and_open_pr")
                 self._state.stage = "await_approval"
-                await workflow.execute_activity(
+                await _req(
                     acts_unsafe.notify_human,
-                    args=[self._state.pr_url, spec.principal, "rotation PR ready (dry-run)"],
-                    schedule_to_close_timeout=timedelta(minutes=10),
-                    retry_policy=RetryPolicy(maximum_attempts=4),
-                )
+                    [self._state.pr_url, spec.principal, "rotation PR ready (dry-run)"],
+                    "notify_human", attempts=4)
                 self._state.stage = "dry_run_complete"
                 self._state.evidence["dry_run"] = True
                 return self._state
@@ -253,12 +252,10 @@ class CredentialRotationWorkflow:
                 [sealed, branch, spec.dry_run, _sops_spec(spec)],
                 "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
-            await workflow.execute_activity(
+            await _req(
                 acts_unsafe.notify_human,
-                args=[self._state.pr_url, spec.principal, "rotation PR ready"],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            )
+                [self._state.pr_url, spec.principal, "rotation PR ready"],
+                "notify_human", attempts=4)
 
             # APPROVE — wait for merge signal (the human gate)
             try:
@@ -269,21 +266,17 @@ class CredentialRotationWorkflow:
             except workflow.TimeoutError:
                 self._state.stage = "expired"
                 # Gate window elapsed — clean up the unused successor
-                await workflow.execute_activity(
+                await _req(
                     acts_unsafe.revoke_predecessor,
-                    spec.successor_name,
-                    schedule_to_close_timeout=timedelta(minutes=10),
-                    retry_policy=RetryPolicy(maximum_attempts=4),
-                )
+                    [spec.successor_name],
+                    "revoke_successor", attempts=4)
                 return self._state
             if self._merge_rejected or self._aborted:
                 self._state.stage = "aborted"
-                await workflow.execute_activity(
+                await _req(
                     acts_unsafe.revoke_predecessor,
-                    args=[spec.successor_name],
-                    schedule_to_close_timeout=timedelta(minutes=10),
-                    retry_policy=RetryPolicy(maximum_attempts=4),
-                )
+                    [spec.successor_name],
+                    "revoke_successor", attempts=4)
                 return self._state
 
             # CUTOVER — flip consumers to successor, verify, then revoke
@@ -302,12 +295,10 @@ class CredentialRotationWorkflow:
             if spec.soak_seconds:
                 await workflow.sleep(spec.soak_seconds)
 
-            await workflow.execute_activity(
+            await _req(
                 acts_unsafe.revoke_predecessor,
-                args=[spec.principal],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            )
+                [spec.principal],
+                "revoke_predecessor", attempts=12)
             self._state.stage = "verify"
 
             # VERIFY — old credential must now fail auth; ZeroTrace re-scan clean
@@ -323,12 +314,10 @@ class CredentialRotationWorkflow:
             # CLOSE — post evidence; optional human ack is time-boxed and
             # non-blocking when automatic evidence is strong.
             self._state.stage = "closing"
-            await workflow.execute_activity(
+            await _req(
                 acts_unsafe.post_closure_evidence,
-                args=[self._state.evidence],
-                schedule_to_close_timeout=timedelta(minutes=10),
-                retry_policy=RetryPolicy(maximum_attempts=4),
-            )
+                [self._state.evidence],
+                "post_closure_evidence", attempts=4)
             if spec.closure_ack_required:
                 try:
                     await workflow.wait_condition(
@@ -347,12 +336,10 @@ class CredentialRotationWorkflow:
             self._state.stage = "cutover_failed"
             self._state.error = str(e)
             try:
-                await workflow.execute_activity(
+                await _req(
                     acts_unsafe.revoke_predecessor,
-                    args=[spec.successor_name],
-                    schedule_to_close_timeout=timedelta(minutes=10),
-                    retry_policy=RetryPolicy(maximum_attempts=4),
-                )
+                    [spec.successor_name],
+                    "compensate_successor", attempts=4)
                 self._state.evidence["compensated"] = True
             except Exception as ce:
                 self._state.evidence["compensation_error"] = str(ce)

@@ -432,15 +432,61 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
                         "security: rotate credential (sops-encrypted) [rotation-workflow]"],
                        check=True, capture_output=True, env=git_env)
         subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch], check=True, capture_output=True, env=git_env)
-        pr_cmd = ["gh", "pr", "create", "--fill", "-R", os.environ["ROTATION_REPO_SLUG"]]
+        # Trust-auth consumer discovery: clients connecting through pgbouncer
+        # with auth_type=trust need no secret env binding — they can name the
+        # principal in hardcoded connection strings (ConfigMap scripts, app
+        # code). Env/secret audits miss them entirely. Surface every repo
+        # file still referencing the principal so the approver can verify
+        # each is handled (updated in this PR, patched direct, or dead).
+        principal = spec.get("principal", "")
+        refs = _repo_principal_refs(repo, principal, secret_path, spec) if principal else []
+        body = "Automated credential rotation (sops-encrypted).\n"
+        if refs:
+            body += ("\n### Files still referencing `" + principal + "`\n"
+                     "Verify each is a consumer patched by this PR/direct-mode, "
+                     "or update the hardcoded username before revoking:\n"
+                     + "\n".join(f"- `{p}`" for p in refs))
+        pr_cmd = ["gh", "pr", "create", "-R", os.environ["ROTATION_REPO_SLUG"],
+                  "--body", body]
         if dry_run:
             pr_cmd += ["--draft", "--title", "[DRY-RUN] credential rotation artifact — DO NOT MERGE"]
+        else:
+            pr_cmd += ["--title", f"security: rotate {principal or 'credential'}"]
         r = subprocess.run(pr_cmd, cwd=repo, capture_output=True, text=True, env=git_env)
         if r.returncode != 0:
             return ActResult(Outcome.RETRYABLE, f"gh:{r.stderr[:200]}")
         return ActResult(Outcome.OK, ref=r.stdout.strip())
     except subprocess.CalledProcessError as e:
         return ActResult(Outcome.RETRYABLE, f"git:{(e.stderr or b'')[:200].decode(errors='replace')}")
+
+
+def _repo_principal_refs(repo: str, principal: str, secret_path: str,
+                         spec: dict) -> list:
+    """Files under apps/ still naming the principal after this PR's writes.
+    Run post-commit so files this PR already updated drop out naturally.
+    Skips the rotation worker's own manifests/docs (operator references)
+    and evidence artifacts."""
+    skip = ("apps/credential-rotation-worker/",
+            "apps/secrets/_rotation-artifacts/", secret_path)
+    consumer_paths = {
+        ((_consumer(c)["secret"] or {}).get("path"))
+        for c in spec.get("consumers", []) if _consumer(c)["secret"]
+    }
+    hits = []
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for fn in files:
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, repo)
+            if rel.startswith(skip) or rel in consumer_paths:
+                continue
+            try:
+                with open(fp, "r", errors="replace") as f:
+                    if principal in f.read():
+                        hits.append(rel)
+            except OSError:
+                continue
+    return sorted(hits)
 
 
 @activity.defn
@@ -613,10 +659,26 @@ async def revoke_predecessor(principal: str) -> ActResult:
         if row is None:
             conn.close()
             return ActResult(Outcome.OK, f"role-absent:{principal}")
+        # NOLOGIN only blocks NEW auth — existing pooled sessions (pgbouncer,
+        # app pools) keep working. Terminate them so revocation is absolute.
+        # Best-effort: needs role membership/superuser; failure is noted,
+        # not fatal, since NOLOGIN still prevents reconnects.
+        def _kill_sessions():
+            try:
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE usename = %s AND pid <> pg_backend_pid()",
+                    (principal,))
+                return cur.rowcount
+            except Exception:
+                return -1
         if not os.environ.get("ROTATION_ALLOW_DROP") and row[0] is False:
+            killed = _kill_sessions()
             conn.close()
-            return ActResult(Outcome.OK, f"role-already-nologin:{principal}")
+            return ActResult(Outcome.OK,
+                             f"role-already-nologin:{principal},sessions-killed:{killed}")
         if os.environ.get("ROTATION_ALLOW_DROP"):
+            _kill_sessions()
             cur.execute(psql.SQL("REASSIGN OWNED BY {} TO postgres").format(psql.Identifier(principal)))
             cur.execute(psql.SQL("DROP OWNED BY {}").format(psql.Identifier(principal)))
             cur.execute(psql.SQL("DROP ROLE IF EXISTS {}").format(psql.Identifier(principal)))
@@ -625,8 +687,9 @@ async def revoke_predecessor(principal: str) -> ActResult:
         # ownership intact — DROP would fail while the role owns
         # tables/migrations (always true for cortex_db_admin).
         cur.execute(psql.SQL("ALTER ROLE {} NOLOGIN").format(psql.Identifier(principal)))
+        killed = _kill_sessions()
         conn.close()
-        return ActResult(Outcome.OK, f"role-nologin:{principal}")
+        return ActResult(Outcome.OK, f"role-nologin:{principal},sessions-killed:{killed}")
     except Exception as e:
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
