@@ -131,7 +131,11 @@ class CredentialRotationWorkflow:
 
     # ---- signals ----------------------------------------------------
     @workflow.signal
-    def approve_merge(self, approver: str, pr_url: str) -> None:
+    def approve_merge(self, approver, pr_url: str = "") -> None:
+        # `temporal workflow signal --input '["a","b"]'` delivers the array as
+        # a single payload — unpack it rather than TypeError-ing the task.
+        if isinstance(approver, (list, tuple)):
+            approver, pr_url = (list(approver) + [""])[:2]
         self._merge_approved = True
         self._state.pr_url = pr_url
         self._state.evidence["approver"] = approver
