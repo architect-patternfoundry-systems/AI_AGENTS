@@ -145,8 +145,8 @@ def _sops_encrypt(manifest: bytes) -> tuple[bool, bytes | str]:
             age_key = f.read().strip()
         # Derive public key from secret key for encryption
         r = subprocess.run(
-            ["age-keygen", "-y", "-i", key_file],
-            capture_output=True, timeout=10, text=True,
+            ["age-keygen", "-y"],
+            input=age_key, capture_output=True, timeout=10, text=True,
         )
         if r.returncode != 0:
             return False, f"age-keygen failed: {r.stderr[:200]}"
