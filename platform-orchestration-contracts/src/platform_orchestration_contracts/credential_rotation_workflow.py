@@ -94,6 +94,8 @@ class RotationSpec:
     consumers: list                     # names or {"name","namespace","kind","secret"?} — see _consumer()
     db_host: str
     db_name: str = "mydatabase"
+    password_key: str = "password"      # secret key holding predecessor pw
+    artifact_path: Optional[str] = None  # sealed PR file path (default apps/secrets/{ns}/{name}.yaml; set outside Flux paths for OOB principals)
     successor_name: Optional[str] = None  # default: principal + "_r{N}"
     soak_seconds: int = 0                # optional delay before revoke
     merge_wait_hours: int = 168          # finite gate window; expiry cleans up
@@ -111,6 +113,13 @@ class RotationState:
     successor: Optional[str] = None
     evidence: dict = field(default_factory=dict)
     error: Optional[str] = None
+
+
+def _sops_spec(spec: "RotationSpec") -> dict:
+    """Subset of spec fields sops_encrypt_and_open_pr needs:
+    artifact path override + consumer gitops secret files."""
+    return {"artifact_path": spec.artifact_path, "consumers": spec.consumers,
+            "secret_name": spec.secret_name, "namespace": spec.namespace}
 
 
 @workflow.defn
@@ -211,7 +220,8 @@ class CredentialRotationWorkflow:
             sealed = await _req(
                 acts_unsafe.generate_successor_cred,
                 [{"principal": spec.principal, "successor": spec.successor_name,
-                  "consumers": spec.consumers}],
+                  "consumers": spec.consumers, "namespace": spec.namespace,
+                  "secret_name": spec.secret_name, "password_key": spec.password_key}],
                 "generate_successor_cred")
 
             if spec.dry_run:
@@ -219,7 +229,7 @@ class CredentialRotationWorkflow:
                 branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
                 self._state.pr_url = await _req(
                     acts_unsafe.sops_encrypt_and_open_pr,
-                    [sealed, branch, True],
+                    [sealed, branch, True, _sops_spec(spec)],
                     "sops_encrypt_and_open_pr")
                 self._state.stage = "await_approval"
                 await workflow.execute_activity(
@@ -240,7 +250,7 @@ class CredentialRotationWorkflow:
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
             self._state.pr_url = await _req(
                 acts_unsafe.sops_encrypt_and_open_pr,
-                [sealed, branch, spec.dry_run],
+                [sealed, branch, spec.dry_run, _sops_spec(spec)],
                 "sops_encrypt_and_open_pr")
             self._state.stage = "await_approval"
             await workflow.execute_activity(

@@ -247,16 +247,17 @@ async def generate_successor_cred(spec: dict) -> ActResult:
                 return ActResult(Outcome.FATAL,
                                  f"secret-keys-missing:{c['namespace']}/{s['name']}:{','.join(missing)}")
 
-    # Live cts-backend-db carries `password` + `uri` (full DSN) — both
-    # must carry the successor cred. URI template comes from env so the
-    # password stays alnum-safe (no URI escaping ever needed).
     # Snapshot the PREDECESSOR credential before merge — post-merge Flux
     # overwrites the live secret with the successor, so liveness checks
-    # later must use this sealed snapshot, not the live secret.
-    ok_s, old_b64 = _kubectl("get", "secret",
-                            os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
-                            "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
-                            "-o", "jsonpath={.data.password}")
+    # later must use this sealed snapshot, not the live secret. Spec
+    # fields win over env so non-cts rotations (e.g. cortex_db_admin →
+    # infra-system/postgres-credentials) read the right secret; the
+    # password may live under a nonstandard key (password_key) or a uri.
+    s_ns = spec.get("namespace") or os.environ.get("ROTATION_NAMESPACE", "cts")
+    s_name = spec.get("secret_name") or os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db")
+    pw_key = spec.get("password_key") or "password"
+    ok_s, old_b64 = _kubectl("get", "secret", s_name, "-n", s_ns,
+                            "-o", f"jsonpath={{.data.{pw_key}}}")
     if not ok_s:
         # Transient API failure must NOT silently produce an empty snapshot —
         # an empty predecessor_password leaves liveness_dead_check blind.
@@ -264,9 +265,7 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     old_pw = base64.b64decode(old_b64.strip('"')).decode() if old_b64.strip('"') else ""
     if not old_pw:
         # Secret may carry credentials only inside `uri` — parse userinfo.
-        ok_u, uri_b64 = _kubectl("get", "secret",
-                                os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db"),
-                                "-n", os.environ.get("ROTATION_NAMESPACE", "cts"),
+        ok_u, uri_b64 = _kubectl("get", "secret", s_name, "-n", s_ns,
                                 "-o", "jsonpath={.data.uri}")
         if ok_u and uri_b64.strip('"'):
             u = base64.b64decode(uri_b64.strip('"')).decode()
@@ -282,8 +281,8 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     uri = f"postgresql://{successor}:{pw}@{_h}:{_p}/{_d}"
     manifest = (
         "apiVersion: v1\nkind: Secret\nmetadata:\n"
-        f"  name: {os.environ.get('ROTATION_SECRET_NAME','cts-backend-db')}\n"
-        f"  namespace: {os.environ.get('ROTATION_NAMESPACE','cts')}\n"
+        f"  name: {s_name}\n"
+        f"  namespace: {s_ns}\n"
         "type: Opaque\nstringData:\n"
         f"  password: \"{pw}\"\n  uri: \"{uri}\"\n"
         f"  predecessor_password: \"{old_pw}\"\n"
@@ -338,19 +337,35 @@ async def create_role(principal: str, successor: str, sealed: str, role_spec: di
 
 
 @activity.defn
-async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = False) -> ActResult:
-    """Write sealed manifest + open PR via gh. sealed is already encrypted.
+async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = False,
+                                   spec: dict = None) -> ActResult:
+    """Write sealed manifest (+ any gitops-mode consumer secret files)
+    and open PR via gh. sealed is already encrypted.
+
+    spec.artifact_path overrides the primary file location — point it
+    outside Flux-applied paths (e.g. apps/secrets/_rotation-artifacts/)
+    for principals whose real secrets are out-of-band, so the merged
+    artifact is evidence-only and Flux applies nothing from it.
+
+    Consumers with secret.mode="gitops" get a sealed Secret file at
+    secret.path using their own key schema (e.g. POSTGRES_USER /
+    POSTGRES_PASSWORD) — required when the live secret is already in a
+    Flux inventory (direct kubectl patches would be reverted).
 
     dry_run=True forces a Draft PR — GitHub blocks merging drafts, so a
     dry-run artifact can never reach a Flux-reconciled path via merge
     (cf. the PR #304 auto-merge incident).
     """
+    spec = spec or {}
     try:
         ref = json.loads(sealed)
         blob = base64.b64decode(ref["sealed"])
     except Exception:
         return ActResult(Outcome.FATAL, "sealed-ref-malformed")
-    secret_path = os.environ["ROTATION_SECRET_PATH"]  # e.g. apps/secrets/cts/cts-backend-db.yaml
+    s_ns = spec.get("namespace") or os.environ.get("ROTATION_NAMESPACE", "cts")
+    s_name = spec.get("secret_name") or os.environ.get("ROTATION_SECRET_NAME", "cts-backend-db")
+    secret_path = (spec.get("artifact_path") or os.environ.get("ROTATION_SECRET_PATH")
+                   or f"apps/secrets/{s_ns}/{s_name}.yaml")
     ok, d = _kubectl("config", "current-context")  # sanity
     repo = os.environ.get("ROTATION_REPO_DIR", "/workspace")
     repo_url = os.environ.get("ROTATION_REPO_URL")
@@ -383,6 +398,34 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
                         "rotation-worker@patternfoundry.dev"], check=True, capture_output=True, env=git_env)
         open(os.path.join(repo, secret_path), "wb").write(blob)
         subprocess.run(["git", "-C", repo, "add", secret_path], check=True, capture_output=True, env=git_env)
+        # gitops-mode consumer secrets: one sealed file each, written at
+        # the live Flux-managed path with the secret's own key schema.
+        # Flux applies them on merge — direct patching would revert.
+        gitops = [c for c in (_consumer(x) for x in spec.get("consumers", []))
+                  if (c["secret"] or {}).get("mode") == "gitops"]
+        if gitops:
+            pw = _plaintext_from_sealed(sealed) or ""
+            successor = ref.get("successor", "")
+            fmt = {"user": successor, "pw": pw,
+                   "host": os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local"),
+                   "port": os.environ.get("ROTATION_PG_PORT", "5432"),
+                   "db": os.environ.get("ROTATION_PG_DB", "mydatabase")}
+            for c in gitops:
+                s = c["secret"]
+                sd = "".join(f'  {k}: "{t.format(**fmt)}"\n'
+                             for k, t in _secret_keys(s).items())
+                man = ("apiVersion: v1\nkind: Secret\nmetadata:\n"
+                       f"  name: {s['name']}\n  namespace: {c['namespace']}\n"
+                       f"type: Opaque\nstringData:\n{sd}").encode()
+                ok_e, enc = _sops_encrypt(man)
+                if not ok_e:
+                    return ActResult(Outcome.FATAL, f"sops-consumer-encrypt:{s['name']}")
+                p = os.path.join(repo, s["path"])
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "wb").write(enc if isinstance(enc, bytes) else enc.encode())
+                subprocess.run(["git", "-C", repo, "add", s["path"]],
+                               check=True, capture_output=True, env=git_env)
+            del pw
         subprocess.run(["git", "-C", repo, "commit", "-m",
                         "security: rotate credential (sops-encrypted) [rotation-workflow]"],
                        check=True, capture_output=True, env=git_env)
@@ -499,10 +542,17 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
         if dropped:
             print(f"userlist: dropped {dropped} malformed lines")
 
-    # Out-of-band (non-GitOps) secrets: write the successor credential
-    # directly — the GitOps sealed path can't reach them. Multi-key
-    # secrets (e.g. POSTGRES_USER + POSTGRES_PASSWORD) patch atomically
-    # in one merge so consumers never see a mixed-credential read.
+    # Out-of-band secrets, two delivery modes:
+    #   "direct" (default): kubectl merge-patch — for secrets outside
+    #     Flux inventory (postgres-credentials, pgbouncer-userlist).
+    #   "gitops": the sealed file was already merged via the approval
+    #     PR; Flux must apply it before consumers roll or they'd restart
+    #     onto stale creds. Poll the live secret until every rendered
+    #     key matches — a pending reconcile returns RETRYABLE and the
+    #     activity driver re-executes with backoff.
+    # Multi-key secrets (POSTGRES_USER + POSTGRES_PASSWORD) patch
+    # atomically in one merge so consumers never see a mixed-credential
+    # read.
     fmt = {"user": successor, "pw": pw,
            "host": os.environ.get("ROTATION_PG_HOST", "pgbouncer.infra-data.svc.cluster.local"),
            "port": os.environ.get("ROTATION_PG_PORT", "5432"),
@@ -511,8 +561,22 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
         s = c["secret"]
         if not s:
             continue
-        data = {k: base64.b64encode(t.format(**fmt).encode()).decode()
-                for k, t in _secret_keys(s).items()}
+        expected = {k: t.format(**fmt) for k, t in _secret_keys(s).items()}
+        if s.get("mode") == "gitops":
+            ok, d = _kubectl("get", "secret", s["name"], "-n", c["namespace"],
+                             "-o", "jsonpath={.data}")
+            if not ok:
+                return ActResult(Outcome.RETRYABLE, f"secret-wait-{s['name']}:{d}")
+            try:
+                live = json.loads(d)
+            except ValueError:
+                return ActResult(Outcome.RETRYABLE, f"secret-wait-parse:{s['name']}")
+            applied = all(base64.b64decode(live.get(k, "")).decode(errors="replace") == v
+                          for k, v in expected.items())
+            if not applied:
+                return ActResult(Outcome.RETRYABLE, f"gitops-secret-pending:{s['name']}")
+            continue
+        data = {k: base64.b64encode(v.encode()).decode() for k, v in expected.items()}
         patch = json.dumps({"data": data})
         ok, d = _kubectl("patch", "secret", s["name"], "-n", c["namespace"],
                          "--type", "merge", "-p", patch)
