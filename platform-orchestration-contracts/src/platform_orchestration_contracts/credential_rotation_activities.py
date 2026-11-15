@@ -94,6 +94,46 @@ def _kubectl(*args: str, input_bytes: bytes | None = None, timeout: int = 30) ->
 _USERLIST_LINE = re.compile(r'^"([^"]+)" "([^"]*)"$')
 
 
+def _render_userlist(raw: str, successor: str, pw: str,
+                     drop: str = "") -> tuple:
+    """Parse userlist text → (rendered, dropped_count).
+    Only '"user" "secret"' lines survive; malformed non-empty lines are
+    dropped — CALLER MUST SURFACE dropped>0, silent loss is how the
+    cts_* entries were nearly eaten again. `drop` removes a named entry
+    (e.g. revoked predecessor); `successor` is upserted (empty = skip)."""
+    entries, dropped = [], 0
+    for line in raw.splitlines():
+        m = _USERLIST_LINE.match(line.strip())
+        if m:
+            entries.append(m.groups())
+        elif line.strip():
+            dropped += 1
+    entries = [(u, p) for u, p in entries if u != successor and u != drop]
+    if successor:
+        entries.append((successor, pw))
+    return "".join(f'"{u}" "{p}"\n' for u, p in entries), dropped
+
+
+def _prune_userlist(principal: str) -> int:
+    """Remove principal's entry from pgbouncer-userlist — shrinks the
+    trust-auth surface at revoke time. Returns entries removed, -1 on
+    failure (best-effort; NOLOGIN is the real boundary)."""
+    ns = os.environ.get("ROTATION_PGBOUNCER_NS", "infra-data")
+    ok, cur = _kubectl("get", "secret", "pgbouncer-userlist", "-n", ns,
+                       "-o", "jsonpath={.data.userlist\\.txt}")
+    if not ok:
+        return -1
+    raw = base64.b64decode(cur.strip('"')).decode()
+    rendered, _ = _render_userlist(raw, "", "", drop=principal)
+    if rendered == raw:
+        return 0
+    patch = json.dumps({"data": {"userlist.txt": base64.b64encode(
+        rendered.encode()).decode()}})
+    ok, _ = _kubectl("patch", "secret", "pgbouncer-userlist", "-n", ns,
+                     "--type", "merge", "-p", patch)
+    return 1 if ok else -1
+
+
 def _secret_keys(s: dict) -> dict:
     """secret spec → {key: value_template}. Supports multi-key `keys`
     mapping ({POSTGRES_USER: '{user}', POSTGRES_PASSWORD: '{pw}'}) and
@@ -405,6 +445,7 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
         # Flux applies them on merge — direct patching would revert.
         gitops = [c for c in (_consumer(x) for x in spec.get("consumers", []))
                   if (c["secret"] or {}).get("mode") == "gitops"]
+        ul_dropped = 0
         if gitops:
             pw = _plaintext_from_sealed(sealed) or ""
             successor = ref.get("successor", "")
@@ -414,11 +455,27 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
                    "db": os.environ.get("ROTATION_PG_DB", "mydatabase")}
             for c in gitops:
                 s = c["secret"]
-                sd = "".join(f'  {k}: "{t.format(**fmt)}"\n'
-                             for k, t in _secret_keys(s).items())
-                man = ("apiVersion: v1\nkind: Secret\nmetadata:\n"
-                       f"  name: {s['name']}\n  namespace: {c['namespace']}\n"
-                       f"type: Opaque\nstringData:\n{sd}").encode()
+                if s.get("userlist"):
+                    # Whole-file render: live entries + successor upsert.
+                    # Sealed in the PR → Flux owns the list; direct patch
+                    # would become permanent drift on every rotation.
+                    ok_u, cur = _kubectl(
+                        "get", "secret", s["name"], "-n", c["namespace"],
+                        "-o", "jsonpath={.data.userlist\\.txt}")
+                    if not ok_u:
+                        return ActResult(Outcome.RETRYABLE, f"userlist-get:{cur}")
+                    rendered, ul_dropped = _render_userlist(
+                        base64.b64decode(cur.strip('"')).decode(), successor, pw)
+                    body = "\n".join("    " + l for l in rendered.splitlines())
+                    man = ("apiVersion: v1\nkind: Secret\nmetadata:\n"
+                           f"  name: {s['name']}\n  namespace: {c['namespace']}\n"
+                           f"type: Opaque\nstringData:\n  userlist.txt: |\n{body}\n").encode()
+                else:
+                    sd = "".join(f'  {k}: "{t.format(**fmt)}"\n'
+                                 for k, t in _secret_keys(s).items())
+                    man = ("apiVersion: v1\nkind: Secret\nmetadata:\n"
+                           f"  name: {s['name']}\n  namespace: {c['namespace']}\n"
+                           f"type: Opaque\nstringData:\n{sd}").encode()
                 ok_e, enc = _sops_encrypt(man)
                 if not ok_e:
                     return ActResult(Outcome.FATAL, f"sops-consumer-encrypt:{s['name']}")
@@ -441,6 +498,9 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
         principal = spec.get("principal", "")
         refs = _repo_principal_refs(repo, principal, secret_path, spec) if principal else []
         body = "Automated credential rotation (sops-encrypted).\n"
+        if ul_dropped:
+            body += (f"\n**userlist render dropped {ul_dropped} malformed "
+                     "line(s)** — inspect the sealed file before merge.\n")
         if refs:
             body += ("\n### Files still referencing `" + principal + "`\n"
                      "Verify each is a consumer patched by this PR/direct-mode, "
@@ -567,28 +627,20 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
     # (a pre-existing truncated tail once spliced a successor into the
     # cts_backend entry and broke trust auth for ~10min).
     pgb = next((c for c in cons if c["name"] == "pgbouncer"), None)
-    if pgb:
+    pgb_s = (pgb["secret"] or {}) if pgb else {}
+    ul_dropped = 0
+    if pgb and pgb_s.get("mode") != "gitops":
         ok, cur = _kubectl("get", "secret", "pgbouncer-userlist", "-n", pgb["namespace"],
                            "-o", "jsonpath={.data.userlist\\.txt}")
         if not ok:
             return ActResult(Outcome.RETRYABLE, f"userlist-get:{cur}")
-        entries, dropped = [], 0
-        for line in base64.b64decode(cur.strip('"')).decode().splitlines():
-            m = _USERLIST_LINE.match(line.strip())
-            if m:
-                entries.append(m.groups())
-            elif line.strip():
-                dropped += 1
-        entries = [(u, p) for u, p in entries if u != successor]
-        entries.append((successor, pw))
-        ul = "".join(f'"{u}" "{p}"\n' for u, p in entries)
+        ul, ul_dropped = _render_userlist(
+            base64.b64decode(cur.strip('"')).decode(), successor, pw)
         patch = json.dumps({"data": {"userlist.txt": base64.b64encode(ul.encode()).decode()}})
         ok, d = _kubectl("patch", "secret", "pgbouncer-userlist", "-n", pgb["namespace"],
                          "--type", "merge", "-p", patch)
         if not ok:
             return ActResult(Outcome.RETRYABLE, f"userlist-patch:{d}")
-        if dropped:
-            print(f"userlist: dropped {dropped} malformed lines")
 
     # Out-of-band secrets, two delivery modes:
     #   "direct" (default): kubectl merge-patch — for secrets outside
@@ -609,6 +661,24 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
         s = c["secret"]
         if not s:
             continue
+        if s.get("mode") == "gitops" and s.get("userlist"):
+            # pgbouncer userlist delivered via the sealed PR file: wait
+            # until the live secret carries the successor entry —
+            # Flux reconcile pending → RETRYABLE (rollback window).
+            ok, d = _kubectl("get", "secret", s["name"], "-n", c["namespace"],
+                             "-o", "jsonpath={.data.userlist\\.txt}")
+            if not ok:
+                return ActResult(Outcome.RETRYABLE, f"userlist-wait:{d}")
+            live_raw = base64.b64decode(d.strip('"')).decode()
+            has = any(m and m.group(1) == successor
+                      for m in (_USERLIST_LINE.match(l.strip())
+                                for l in live_raw.splitlines()))
+            if not has:
+                return ActResult(Outcome.RETRYABLE,
+                                 f"userlist-gitops-pending:{s['name']}")
+            continue
+        if s.get("userlist"):
+            continue  # direct-mode userlist already patched above
         expected = {k: t.format(**fmt) for k, t in _secret_keys(s).items()}
         if s.get("mode") == "gitops":
             ok, d = _kubectl("get", "secret", s["name"], "-n", c["namespace"],
@@ -635,7 +705,10 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
         ok, d = _kubectl("rollout", "restart", f"{c['kind']}/{c['name']}", "-n", c["namespace"])
         if not ok:
             return ActResult(Outcome.RETRYABLE, f"restart-{c['name']}:{d}")
-    return ActResult(Outcome.OK, "consumers-rolled")
+    detail = "consumers-rolled"
+    if ul_dropped:
+        detail += f",userlist-dropped:{ul_dropped}"
+    return ActResult(Outcome.OK, detail)
 
 
 @activity.defn
@@ -674,22 +747,25 @@ async def revoke_predecessor(principal: str) -> ActResult:
                 return -1
         if not os.environ.get("ROTATION_ALLOW_DROP") and row[0] is False:
             killed = _kill_sessions()
+            pruned = _prune_userlist(principal)
             conn.close()
             return ActResult(Outcome.OK,
-                             f"role-already-nologin:{principal},sessions-killed:{killed}")
+                             f"role-already-nologin:{principal},sessions-killed:{killed},ul-pruned:{pruned}")
         if os.environ.get("ROTATION_ALLOW_DROP"):
             _kill_sessions()
             cur.execute(psql.SQL("REASSIGN OWNED BY {} TO postgres").format(psql.Identifier(principal)))
             cur.execute(psql.SQL("DROP OWNED BY {}").format(psql.Identifier(principal)))
             cur.execute(psql.SQL("DROP ROLE IF EXISTS {}").format(psql.Identifier(principal)))
+            _prune_userlist(principal)
             return ActResult(Outcome.OK, f"role-dropped:{principal}")
         # Default: NOLOGIN kills auth immediately but keeps object
         # ownership intact — DROP would fail while the role owns
         # tables/migrations (always true for cortex_db_admin).
         cur.execute(psql.SQL("ALTER ROLE {} NOLOGIN").format(psql.Identifier(principal)))
         killed = _kill_sessions()
+        pruned = _prune_userlist(principal)
         conn.close()
-        return ActResult(Outcome.OK, f"role-nologin:{principal},sessions-killed:{killed}")
+        return ActResult(Outcome.OK, f"role-nologin:{principal},sessions-killed:{killed},ul-pruned:{pruned}")
     except Exception as e:
         return ActResult(Outcome.RETRYABLE, f"pg:{type(e).__name__}")
 
