@@ -86,7 +86,14 @@ def _kubectl(*args: str, input_bytes: bytes | None = None, timeout: int = 30) ->
     try:
         r = subprocess.run(["kubectl", *args], input=input_bytes,
                            capture_output=True, timeout=timeout)
-        return r.returncode == 0, (r.stderr or r.stdout)[:400].decode(errors="replace")
+        # Success path: callers consume stdout as DATA (secret .data maps,
+        # rendered userlists, rollout status) — truncating corrupts payloads
+        # (e.g. json.loads on a 559-byte .data map fails mid-token and the
+        # caller spins forever on RETRYABLE secret-parse). Failure path:
+        # stderr-or-stdout is error detail only, so it stays bounded.
+        if r.returncode == 0:
+            return True, r.stdout.decode(errors="replace")
+        return False, (r.stderr or r.stdout)[:400].decode(errors="replace")
     except subprocess.TimeoutExpired:
         return False, "kubectl-timeout"
 
