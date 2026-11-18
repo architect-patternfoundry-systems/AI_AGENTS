@@ -288,6 +288,11 @@ async def generate_successor_cred(spec: dict) -> ActResult:
             try:
                 data = json.loads(d)
             except ValueError:
+                # Malformed data is deterministic, not transient — RETRYABLE
+                # here spun the r78234 dry-run forever on truncated payloads.
+                # Surface size + head (key names only; .data values stay out).
+                return ActResult(Outcome.FATAL,
+                                 f"secret-parse:{s['name']}:len={len(d)}:{d[:30]!r}")
                 return ActResult(Outcome.RETRYABLE, f"secret-parse:{s['name']}")
             if s.get("userlist"):
                 continue  # rendered userlist has no templated keys to check
@@ -431,7 +436,20 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
         "GIT_CONFIG_KEY_0": "safe.directory",
         "GIT_CONFIG_VALUE_0": repo,
     }
+    slug = os.environ.get("ROTATION_REPO_SLUG")
+    if not slug:
+        return ActResult(Outcome.FATAL, "ROTATION_REPO_SLUG not set")
     try:
+        # Idempotent resume: an earlier attempt may have already pushed the
+        # branch and opened the PR (a failure between push and result-return
+        # deadlocks retries on non-fast-forward). Return the existing PR.
+        rl = subprocess.run(["gh", "pr", "list", "-R", slug, "--head", branch,
+                             "--json", "url", "--limit", "1"],
+                            capture_output=True, text=True, env=git_env)
+        if rl.returncode == 0:
+            existing = json.loads(rl.stdout or "[]")
+            if existing:
+                return ActResult(Outcome.OK, ref=existing[0]["url"])
         # Clone or update the repository
         if os.path.exists(os.path.join(repo, ".git")):
             subprocess.run(["git", "-C", repo, "fetch", "origin"], check=True, capture_output=True, env=git_env)
@@ -494,10 +512,31 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
                 subprocess.run(["git", "-C", repo, "add", s["path"]],
                                check=True, capture_output=True, env=git_env)
             del pw
-        subprocess.run(["git", "-C", repo, "commit", "-m",
-                        "security: rotate credential (sops-encrypted) [rotation-workflow]"],
-                       check=True, capture_output=True, env=git_env)
-        subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch], check=True, capture_output=True, env=git_env)
+        dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
+                               check=True, capture_output=True, env=git_env).stdout.strip()
+        if dirty:
+            subprocess.run(["git", "-C", repo, "commit", "-m",
+                            "security: rotate credential (sops-encrypted) [rotation-workflow]"],
+                           check=True, capture_output=True, env=git_env)
+        push = subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch],
+                              capture_output=True, env=git_env)
+        if push.returncode != 0:
+            # A previous attempt pushed this branch already — rebase onto it
+            # and retry once. Persistent rejection is deterministic → FATAL.
+            subprocess.run(["git", "-C", repo, "fetch", "origin", branch],
+                           check=True, capture_output=True, env=git_env)
+            rb = subprocess.run(["git", "-C", repo, "rebase", f"origin/{branch}"],
+                                capture_output=True, env=git_env)
+            if rb.returncode != 0:
+                subprocess.run(["git", "-C", repo, "rebase", "--abort"],
+                               capture_output=True, env=git_env)
+                return ActResult(Outcome.FATAL,
+                                 f"git:branch-diverged:{(rb.stderr or b'')[:160].decode(errors='replace')}")
+            push = subprocess.run(["git", "-C", repo, "push", "-u", "origin", branch],
+                                  capture_output=True, env=git_env)
+            if push.returncode != 0:
+                return ActResult(Outcome.FATAL,
+                                 f"git:push-rejected:{(push.stderr or b'')[:160].decode(errors='replace')}")
         # Trust-auth consumer discovery: clients connecting through pgbouncer
         # with auth_type=trust need no secret env binding — they can name the
         # principal in hardcoded connection strings (ConfigMap scripts, app
@@ -515,14 +554,22 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
                      "Verify each is a consumer patched by this PR/direct-mode, "
                      "or update the hardcoded username before revoking:\n"
                      + "\n".join(f"- `{p}`" for p in refs))
-        pr_cmd = ["gh", "pr", "create", "-R", os.environ["ROTATION_REPO_SLUG"],
-                  "--body", body]
+        pr_cmd = ["gh", "pr", "create", "-R", slug, "--body", body]
         if dry_run:
             pr_cmd += ["--draft", "--title", "[DRY-RUN] credential rotation artifact — DO NOT MERGE"]
         else:
             pr_cmd += ["--title", f"security: rotate {principal or 'credential'}"]
         r = subprocess.run(pr_cmd, cwd=repo, capture_output=True, text=True, env=git_env)
         if r.returncode != 0:
+            # "PR already exists for this branch" or a race with a parallel
+            # attempt — treat the existing PR as success rather than retry.
+            rl = subprocess.run(["gh", "pr", "list", "-R", slug, "--head", branch,
+                                 "--json", "url", "--limit", "1"],
+                                capture_output=True, text=True, env=git_env)
+            if rl.returncode == 0:
+                existing = json.loads(rl.stdout or "[]")
+                if existing:
+                    return ActResult(Outcome.OK, ref=existing[0]["url"])
             return ActResult(Outcome.RETRYABLE, f"gh:{r.stderr[:200]}")
         return ActResult(Outcome.OK, ref=r.stdout.strip())
     except subprocess.CalledProcessError as e:
@@ -697,7 +744,8 @@ async def patch_and_roll(consumers: list, sealed: str) -> ActResult:
             try:
                 live = json.loads(d)
             except ValueError:
-                return ActResult(Outcome.RETRYABLE, f"secret-wait-parse:{s['name']}")
+                return ActResult(Outcome.FATAL,
+                                 f"secret-wait-parse:{s['name']}:len={len(d)}:{d[:30]!r}")
             applied = all(base64.b64decode(live.get(k, "")).decode(errors="replace") == v
                           for k, v in expected.items())
             if not applied:
