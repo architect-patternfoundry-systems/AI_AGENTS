@@ -293,6 +293,9 @@ async def generate_successor_cred(spec: dict) -> ActResult:
                 # Surface size + head (key names only; .data values stay out).
                 return ActResult(Outcome.FATAL,
                                  f"secret-parse:{s['name']}:len={len(d)}:{d[:30]!r}")
+                return ActResult(Outcome.RETRYABLE, f"secret-parse:{s['name']}")
+            if s.get("userlist"):
+                continue  # rendered userlist has no templated keys to check
             missing = [k for k in _secret_keys(s) if k not in data]
             if missing:
                 return ActResult(Outcome.FATAL,
