@@ -81,3 +81,26 @@ Use structured logging (JSON) with consistent fields:
 - Each environment must have identical configuration
 - Promotion requires approval and testing
 - Automated rollback on failure detection
+## GitOps Secrets — Prune Safety & Consumer Markers
+
+Kustomizations with `prune: true` delete live objects the moment their manifest
+leaves Git. A live-pod census is **not** a safe basis for removing a Secret:
+intermittent consumers (Tilt dev workloads, CronJobs, scaled-to-zero replicas)
+are invisible at census time, and consumers declared in other repos (e.g.
+Tilt-applied manifests in app repos) are invisible to an infra-repo grep.
+
+Before pruning a Flux-managed Secret:
+
+1. Grep the repo for the secret name across `env`, `envFrom`, `volumes`, and
+   kustomizations.
+2. Check the secret and its kustomization entry for the consumer marker
+   `secrets.foundry.io/tilt-consumer` — set on secrets consumed by out-of-repo
+   or intermittent workloads. If present, treat the secret as live-needed even
+   with zero current consumers.
+3. When creating a secret whose consumer is declared outside this repo or only
+   exists intermittently, add the marker at creation so future censuses can
+   see it.
+
+Reference: PR #377 census-pruned `toneroot/storyloom-db-secret` (Tilt-managed
+`synthesis-worker`) → `CreateContainerConfigError`; restored in #388 with the
+marker. Same class hit `storyloom-dev` in #384.
