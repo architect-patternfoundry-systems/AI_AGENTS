@@ -23,6 +23,7 @@ ops can observe where a rotation is stuck.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import urllib.request
 from dataclasses import dataclass, field
@@ -480,7 +481,7 @@ class CredentialRotationWorkflow:
                         lambda: (self._merge_approved or self._merge_rejected
                                  or self._aborted),
                         timeout=remaining)
-                except workflow.TimeoutError:
+                except asyncio.TimeoutError:
                     return await _expire()
 
                 if self._merge_rejected or self._aborted:
@@ -603,7 +604,7 @@ class CredentialRotationWorkflow:
                         lambda: self._closure_acked or self._aborted,
                         timeout=timedelta(hours=24),
                     )
-                except workflow.TimeoutError:
+                except asyncio.TimeoutError:
                     self._state.evidence["closure_ack_timeout"] = True
 
             self._state.stage = "closed"
