@@ -460,6 +460,7 @@ class CredentialRotationWorkflow:
             # The approval deadline is FIXED at gate entry — forged or
             # malformed signals loop the wait but must not extend it.
             deadline = workflow.now() + timedelta(hours=spec.merge_wait_hours)
+            self._state.evidence["gate_deadline"] = deadline.isoformat()
 
             async def _expire():
                 self._state.stage = "expired"

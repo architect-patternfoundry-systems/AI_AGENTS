@@ -76,6 +76,9 @@ async def m_control(receipt, ctx):
 async def m_verify(receipt, ctx):
     CALLS.append(("verify_merge_receipt", receipt.get("approver")))
     mode = VERIFY_BEHAVIOR["mode"]
+    if mode == "unauth-slow":
+        await asyncio.sleep(0.4)
+        return acts.ActResult(acts.Outcome.FATAL, "unauth:bad-signature")
     if mode == "unauth":
         return acts.ActResult(acts.Outcome.FATAL, "unauth:bad-signature")
     if mode == "statefail":
@@ -177,6 +180,11 @@ async def _wait_stage(handle, stage, tries=80):
 
 
 async def _run_env(body):
+    # Reset shared mock behavior — tests mutate these mid-run; without
+    # this they leak across tests (e.g. PATCH "compensate" poisons the
+    # next run's cutover).
+    for d in (VERIFY_BEHAVIOR, CONTROL_BEHAVIOR, PATCH_BEHAVIOR):
+        d["mode"] = "ok"
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(env.client, task_queue=TASK_QUEUE,
                           workflows=[wf.CredentialRotationWorkflow],
@@ -431,3 +439,65 @@ class TestBoundedDiagnostics:
             wf._record_bad(ev, "bad_receipts", {"n": i})
         assert len(ev["bad_receipts"]) == 20
         assert ev["bad_receipts_dropped"] == 5
+
+
+    def test_forged_signals_do_not_extend_deadline(self):
+        """The gate deadline is fixed at entry: forged receipts loop the
+        wait but evidence["gate_deadline"] never moves, and a valid
+        receipt still completes the run."""
+        async def body(env):
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, SPEC,
+                id=WF_ID, task_queue=TASK_QUEUE)
+            st = await _wait_stage(handle, "await_approval")
+            deadline0 = st.evidence["gate_deadline"]
+
+            VERIFY_BEHAVIOR["mode"] = "unauth"
+            for _ in range(3):
+                await handle.signal(
+                    wf.CredentialRotationWorkflow.approve_merge,
+                    _receipt_for())
+                await asyncio.sleep(0.15)
+            for _ in range(60):
+                st = await handle.query(
+                    wf.CredentialRotationWorkflow.status)
+                if len(st.evidence.get("bad_receipts", [])) >= 3:
+                    break
+                await asyncio.sleep(0.1)
+            st = await handle.query(wf.CredentialRotationWorkflow.status)
+            assert st.evidence["gate_deadline"] == deadline0
+            assert len(st.evidence["bad_receipts"]) == 3
+
+            VERIFY_BEHAVIOR["mode"] = "ok"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.approve_merge, _receipt_for())
+            assert (await handle.result()).stage == "closed"
+
+        VERIFY_BEHAVIOR["mode"] = "ok"
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+
+    def test_valid_receipt_survives_mid_verify_rejection(self):
+        """A valid receipt arriving while a forged one is being verified
+        must not be clobbered by the rejection's flag-clear."""
+        async def body(env):
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, SPEC,
+                id=WF_ID, task_queue=TASK_QUEUE)
+            await _wait_stage(handle, "await_approval")
+            VERIFY_BEHAVIOR["mode"] = "unauth-slow"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.approve_merge, _receipt_for())
+            # while the forged receipt is in verification, land the real one
+            await asyncio.sleep(0.15)
+            VERIFY_BEHAVIOR["mode"] = "ok"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.approve_merge,
+                _receipt_for(approver="ops-lead"))
+            result = await handle.result()
+            assert result.stage == "closed"
+
+        VERIFY_BEHAVIOR["mode"] = "ok"
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+        assert "patch_and_roll" in _names()
