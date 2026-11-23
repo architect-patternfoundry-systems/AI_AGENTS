@@ -90,9 +90,15 @@ async def m_healthy(consumers, sealed, timeout_s, require_direct=False):
     return _ok("ready")
 
 
+PATCH_BEHAVIOR = {"mode": "ok"}
+
+
 @activity.defn(name="patch_and_roll")
 async def m_patch(consumers, sealed):
     CALLS.append(("patch_and_roll", None))
+    if PATCH_BEHAVIOR["mode"] == "compensate":
+        return acts.ActResult(
+            acts.Outcome.COMPENSATE, "patched 3/8 secrets then failed")
     return _ok("rolled")
 
 
@@ -384,3 +390,44 @@ class TestWorkflowPaths:
         CALLS.clear()
         asyncio.run(_run_env(body))
         assert CALLS == []
+
+
+    def test_partial_cutover_preserves_successor(self):
+        """COMPENSATE mid-cutover → terminal failure, no blind successor
+        revoke: consumers may already run on it."""
+        async def body(env):
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, SPEC,
+                id=WF_ID, task_queue=TASK_QUEUE)
+            await _wait_stage(handle, "await_approval")
+            VERIFY_BEHAVIOR["mode"] = "ok"
+            PATCH_BEHAVIOR["mode"] = "compensate"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.approve_merge, _receipt_for())
+            try:
+                await handle.result()
+                raise AssertionError("expected cutover failure")
+            except Exception:
+                pass
+            st = await handle.query(wf.CredentialRotationWorkflow.status)
+            assert st.evidence.get("partial_cutover") is True
+            assert st.evidence.get("successor_pending_review") is True
+
+        VERIFY_BEHAVIOR["mode"] = "ok"
+        PATCH_BEHAVIOR["mode"] = "ok"
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+        names = _names()
+        assert "patch_and_roll" in names
+        # Neither the successor nor the predecessor was touched by
+        # automatic compensation — recovery is an authorized decision.
+        assert "revoke_predecessor" not in names, names
+
+
+class TestBoundedDiagnostics:
+    def test_record_bad_caps_and_counts(self):
+        ev = {}
+        for i in range(25):
+            wf._record_bad(ev, "bad_receipts", {"n": i})
+        assert len(ev["bad_receipts"]) == 20
+        assert ev["bad_receipts_dropped"] == 5

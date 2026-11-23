@@ -184,6 +184,17 @@ CONTROL_REQUIRED_FIELDS = (
 )
 
 
+def _record_bad(evidence: dict, key: str, entry: dict, cap: int = 20) -> None:
+    """Append a bounded diagnostic entry — malformed input must not grow
+    workflow history without limit. Keeps the first `cap` entries plus a
+    running drop count; entry values are caller-truncated, secret-free."""
+    lst = evidence.setdefault(key, [])
+    if len(lst) < cap:
+        lst.append(entry)
+    else:
+        evidence[f"{key}_dropped"] = evidence.get(f"{key}_dropped", 0) + 1
+
+
 def _control_receipt(state: "RotationState", receipt) -> Optional[dict]:
     """Shape-check a control (abort/reject) receipt. Malformed receipts
     are recorded and dropped — they never set a flag, so they cannot
@@ -192,9 +203,10 @@ def _control_receipt(state: "RotationState", receipt) -> Optional[dict]:
         receipt = (list(receipt) + [{}])[0]
     if not isinstance(receipt, dict) or any(
             f not in receipt for f in CONTROL_REQUIRED_FIELDS):
-        state.evidence.setdefault("bad_signals", []).append(
-            {"received": receipt if isinstance(receipt, dict) else str(receipt)[:200],
-             "at": workflow.now().isoformat()})
+        _record_bad(state.evidence, "bad_signals", {
+            "received": {k: str(v)[:80] for k, v in receipt.items()}
+            if isinstance(receipt, dict) else str(receipt)[:200],
+            "at": workflow.now().isoformat()})
         return None
     return receipt
 
@@ -250,9 +262,10 @@ class CredentialRotationWorkflow:
             receipt = (list(receipt) + [{}])[0]
         if not isinstance(receipt, dict) or any(
                 f not in receipt for f in RECEIPT_REQUIRED_FIELDS):
-            self._state.evidence.setdefault("bad_receipts", []).append(
-                {"received": receipt if isinstance(receipt, dict) else str(receipt)[:200],
-                 "at": workflow.now().isoformat()})
+            _record_bad(self._state.evidence, "bad_receipts", {
+                "received": {k: str(v)[:80] for k, v in receipt.items()}
+                if isinstance(receipt, dict) else str(receipt)[:200],
+                "at": workflow.now().isoformat()})
             return
         self._merge_approved = True
         self._receipt = receipt
@@ -444,20 +457,30 @@ class CredentialRotationWorkflow:
                 "consumers": spec.consumers,
                 "sealed": sealed,
             }
+            # The approval deadline is FIXED at gate entry — forged or
+            # malformed signals loop the wait but must not extend it.
+            deadline = workflow.now() + timedelta(hours=spec.merge_wait_hours)
+
+            async def _expire():
+                self._state.stage = "expired"
+                # Bounded approval expiry — the defined cleanup path.
+                await _req(
+                    acts_unsafe.revoke_predecessor,
+                    [spec.successor_name],
+                    "revoke_successor", attempts=4)
+                return self._state
+
             while True:
+                remaining = deadline - workflow.now()
+                if remaining.total_seconds() <= 0:
+                    return await _expire()
                 try:
                     await workflow.wait_condition(
                         lambda: (self._merge_approved or self._merge_rejected
                                  or self._aborted),
-                        timeout=timedelta(hours=spec.merge_wait_hours))
+                        timeout=remaining)
                 except workflow.TimeoutError:
-                    self._state.stage = "expired"
-                    # Bounded approval expiry — the defined cleanup path.
-                    await _req(
-                        acts_unsafe.revoke_predecessor,
-                        [spec.successor_name],
-                        "revoke_successor", attempts=4)
-                    return self._state
+                    return await _expire()
 
                 if self._merge_rejected or self._aborted:
                     receipt = (self._abort_receipt if self._aborted
@@ -467,15 +490,21 @@ class CredentialRotationWorkflow:
                         acts_unsafe.verify_control_receipt,
                         [receipt, gate_ctx], "verify_control_receipt")
                     if not res.ok:
-                        self._state.evidence.setdefault(
-                            "bad_control_signals", []).append(
-                            {"kind": which, "detail": res.detail,
+                        _record_bad(
+                            self._state.evidence, "bad_control_signals",
+                            {"kind": which, "detail": res.detail[:160],
                              "approver": (receipt or {}).get("approver"),
                              "at": workflow.now().isoformat()})
-                        self._merge_rejected = False
-                        self._aborted = False
-                        self._abort_receipt = None
-                        self._reject_receipt = None
+                        # Clear only the flag+receipt we just evaluated —
+                        # a newer control receipt may have arrived during
+                        # verification and must not be clobbered.
+                        if self._aborted and self._abort_receipt is receipt:
+                            self._aborted = False
+                            self._abort_receipt = None
+                        if (self._merge_rejected
+                                and self._reject_receipt is receipt):
+                            self._merge_rejected = False
+                            self._reject_receipt = None
                         self._state.stage = "await_approval"
                         continue
                     self._state.stage = ("aborted" if self._aborted
@@ -489,23 +518,26 @@ class CredentialRotationWorkflow:
                 # BINDING — verify the receipt against the actual merged
                 # state before ANY consumer mutation.
                 self._state.stage = "verify_receipt"
+                receipt = self._receipt  # snapshot — a new receipt may
+                # arrive while verification runs and must not be lost
                 res = await _call(
                     acts_unsafe.verify_merge_receipt,
-                    [self._receipt, gate_ctx], "verify_merge_receipt")
+                    [receipt, gate_ctx], "verify_merge_receipt")
                 if res.ok:
                     break
                 if res.detail.startswith("unauth:"):
                     # Forged/malformed/wrong-instance/wrong-action —
                     # not an authenticated approval. Record, stay at the
                     # gate; a corrected receipt can still land.
-                    self._state.evidence.setdefault(
-                        "bad_receipts", []).append(
+                    _record_bad(
+                        self._state.evidence, "bad_receipts",
                         {"rejected_by": "verify_merge_receipt",
-                         "detail": res.detail,
-                         "approver": self._receipt.get("approver"),
+                         "detail": res.detail[:160],
+                         "approver": (receipt or {}).get("approver"),
                          "at": workflow.now().isoformat()})
-                    self._merge_approved = False
-                    self._receipt = None
+                    if self._receipt is receipt:
+                        self._merge_approved = False
+                        self._receipt = None
                     self._state.stage = "await_approval"
                     continue
                 # Authenticated approval, but merged state failed
@@ -577,18 +609,20 @@ class CredentialRotationWorkflow:
             return self._state
 
         except CutoverFailed as e:
-            # Compensation: successor exists but cutover did not complete —
-            # delete it so no orphaned valid credential lingers.
+            # Stage-aware partial-cutover recovery: COMPENSATE means an
+            # activity partially mutated — consumers may ALREADY run on
+            # the successor. Blindly revoking it would take them down.
+            # Preserve both credentials, fail terminally, and leave the
+            # recovery decision (revert secrets to the still-valid
+            # predecessor vs. complete the cutover) to an authorized
+            # operator — never to an automatic undo.
             self._state.stage = "cutover_failed"
             self._state.error = str(e)
-            try:
-                await _req(
-                    acts_unsafe.revoke_predecessor,
-                    [spec.successor_name],
-                    "compensate_successor", attempts=4)
-                self._state.evidence["compensated"] = True
-            except Exception as ce:
-                self._state.evidence["compensation_error"] = str(ce)
+            self._state.evidence["partial_cutover"] = True
+            self._state.evidence["successor_pending_review"] = True
+            self._state.evidence["predecessor_status"] = (
+                "valid-until-revoke-stage" if "revoke" not in str(e)
+                else "revoke-stage-failed")
             raise
         except Exception as e:
             self._state.stage = "failed"

@@ -432,11 +432,15 @@ class TestDryRunIsolation:
         assert "return self._state" in block
         assert dry < create < verify < patch_roll < revoke
 
-    def test_compensation_revokes_successor_not_predecessor(self):
+    def test_partial_cutover_does_not_blindly_revoke(self):
         import inspect
         from platform_orchestration_contracts import credential_rotation_workflow as wf
         src = inspect.getsource(wf.CredentialRotationWorkflow.run)
         cf = src.index("except CutoverFailed")
-        tail = src[cf:]
-        # compensation targets the successor — never re-arms the path
-        assert "[spec.successor_name]" in tail.split("except Exception")[0]
+        tail = src[cf:cf + 1200]
+        # Stage-aware recovery: COMPENSATE implies partial mutation —
+        # consumers may already use the successor, so the handler must
+        # NOT auto-revoke anything; it records and re-raises.
+        assert "revoke_predecessor" not in tail
+        assert "partial_cutover" in tail
+        assert "successor_pending_review" in tail
