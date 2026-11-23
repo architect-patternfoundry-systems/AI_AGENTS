@@ -40,13 +40,16 @@ class Outcome(str, Enum):
 
 @dataclass
 class ActResult:
-    outcome: Outcome
+    # outcome is serialized as its str value ("ok"/"fatal"/...); Temporal
+    # decodes the field back as plain str, so never compare with `is` or
+    # `.name` — `==` against Outcome members works for both shapes.
+    outcome: str
     detail: str = ""             # safe-for-history summary, never secret
     ref: str = ""                # opaque reference (sealed blob, pr_url, ...)
 
     @property
     def ok(self) -> bool:
-        return self.outcome is Outcome.OK
+        return self.outcome == Outcome.OK
 
 
 @dataclass
@@ -259,6 +262,10 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     """
     principal = spec["principal"]
     successor = spec["successor"]
+    # Incident-critical rotations require the direct postgres-rw probe
+    # path — refuse early rather than discover it missing post-revoke.
+    if spec.get("require_direct_probe") and not os.environ.get("ROTATION_PG_DIRECT_DSN"):
+        return ActResult(Outcome.FATAL, "direct-dsn-required-unset")
     pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
 
     # Pre-flight consumer validation — runs in dry-run too, so a bad
@@ -446,10 +453,49 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
         rl = subprocess.run(["gh", "pr", "list", "-R", slug, "--head", branch,
                              "--json", "url", "--limit", "1"],
                             capture_output=True, text=True, env=git_env)
+
+        target = os.environ.get("ROTATION_TARGET_BRANCH", "main")
+        affected = [secret_path] + [
+            s["path"] for s in
+            ((c.get("secret") or {}) for c in
+             (_consumer(x) for x in spec.get("consumers", [])))
+            if s.get("mode") == "gitops" and s.get("path")]
+
+        def _mk_pr_ref(url: str) -> str:
+            """JSON ref binding this PR to exact SHAs: pushed head, the
+            merge-base against the target branch, and each affected
+            secret file's blob SHA at that base — the anchor for
+            intended-vs-concurrent-change detection at verify time."""
+            out = {"url": url}
+            try:
+                if not os.path.exists(os.path.join(repo, ".git")):
+                    os.makedirs(repo, exist_ok=True)
+                    subprocess.run(["git", "clone", repo_url, repo],
+                                   check=True, capture_output=True, env=git_env)
+                subprocess.run(["git", "-C", repo, "fetch", "origin", target, branch],
+                               check=True, capture_output=True, env=git_env)
+                head = subprocess.run(
+                    ["git", "-C", repo, "rev-parse", f"origin/{branch}"],
+                    check=True, capture_output=True, env=git_env).stdout.strip().decode()
+                base = subprocess.run(
+                    ["git", "-C", repo, "merge-base", f"origin/{target}", f"origin/{branch}"],
+                    check=True, capture_output=True, env=git_env).stdout.strip().decode()
+                out["head"], out["base"] = head, base
+                bl = {}
+                for p in affected:
+                    r = subprocess.run(
+                        ["git", "-C", repo, "rev-parse", f"{base}:{p}"],
+                        capture_output=True, env=git_env)
+                    bl[p] = r.stdout.strip().decode() if r.returncode == 0 else None
+                out["baseline_files"] = bl
+            except subprocess.CalledProcessError:
+                pass  # ref degrades to URL only; verify_merge_receipt fails closed
+            return json.dumps(out)
+
         if rl.returncode == 0:
             existing = json.loads(rl.stdout or "[]")
             if existing:
-                return ActResult(Outcome.OK, ref=existing[0]["url"])
+                return ActResult(Outcome.OK, ref=_mk_pr_ref(existing[0]["url"]))
         # Clone or update the repository
         if os.path.exists(os.path.join(repo, ".git")):
             subprocess.run(["git", "-C", repo, "fetch", "origin"], check=True, capture_output=True, env=git_env)
@@ -569,9 +615,9 @@ async def sops_encrypt_and_open_pr(sealed: str, branch: str, dry_run: bool = Fal
             if rl.returncode == 0:
                 existing = json.loads(rl.stdout or "[]")
                 if existing:
-                    return ActResult(Outcome.OK, ref=existing[0]["url"])
+                    return ActResult(Outcome.OK, ref=_mk_pr_ref(existing[0]["url"]))
             return ActResult(Outcome.RETRYABLE, f"gh:{r.stderr[:200]}")
-        return ActResult(Outcome.OK, ref=r.stdout.strip())
+        return ActResult(Outcome.OK, ref=_mk_pr_ref(r.stdout.strip()))
     except subprocess.CalledProcessError as e:
         return ActResult(Outcome.RETRYABLE, f"git:{(e.stderr or b'')[:200].decode(errors='replace')}")
 
@@ -630,9 +676,14 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
 
 
 @activity.defn
-async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 900) -> ActResult:
-    """All consumers' new pods Ready AND successor auth probe passes."""
+async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 900,
+                                require_direct: bool = False) -> ActResult:
+    """All consumers' new pods Ready AND successor auth probe passes on
+    every required path (pooled always; direct postgres-rw when
+    ROTATION_PG_DIRECT_DSN is set — required when require_direct)."""
     cons = [_consumer(c) for c in consumers]
+    if require_direct and not os.environ.get("ROTATION_PG_DIRECT_DSN"):
+        return ActResult(Outcome.FATAL, "direct-dsn-required-unset")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         all_ready = True
@@ -646,18 +697,27 @@ async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 9
             pw = _plaintext_from_sealed(sealed)
             if pw:
                 import psycopg2
-                try:
-                    # conninfo: later params override — append successor creds
-                    # rather than string-replacing user (which kept the
-                    # rotation_worker password and always failed auth)
-                    conn = psycopg2.connect(
-                        os.environ["ROTATION_PG_DSN"]
-                        + f" user={json.loads(sealed).get('successor','')} password={pw}",
-                        connect_timeout=6)
-                    conn.close()
-                    return ActResult(Outcome.OK, "consumers-ready+successor-auth")
-                except Exception:
-                    pass
+                succ = json.loads(sealed).get('successor', '')
+                paths = {"pooled": os.environ["ROTATION_PG_DSN"]}
+                if os.environ.get("ROTATION_PG_DIRECT_DSN"):
+                    paths["direct"] = os.environ["ROTATION_PG_DIRECT_DSN"]
+                ok_paths = []
+                for pname, dsn in paths.items():
+                    try:
+                        # conninfo: later params override — append successor
+                        # creds rather than string-replacing user (which kept
+                        # the rotation_worker password and always failed auth)
+                        conn = psycopg2.connect(
+                            dsn + f" user={succ} password={pw}",
+                            connect_timeout=6)
+                        conn.close()
+                        ok_paths.append(pname)
+                    except Exception:
+                        pass
+                if len(ok_paths) == len(paths):
+                    return ActResult(Outcome.OK,
+                                     "consumers-ready+successor-auth:"
+                                     + ",".join(ok_paths))
             return ActResult(Outcome.OK, "consumers-ready")
         time.sleep(10)
     return ActResult(Outcome.COMPENSATE, "health-gate-timeout")
@@ -828,33 +888,75 @@ async def revoke_predecessor(principal: str) -> ActResult:
 
 
 @activity.defn
-async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
-    """Old credential must FAIL auth — twice consecutively to be safe."""
+async def liveness_dead_check(principal: str, sealed: str,
+                              require_direct: bool = False) -> ActResult:
+    """Old credential must FAIL auth — twice consecutively on every path,
+    and zero predecessor sessions may remain.
+
+    ROTATION_PG_DSN points at PgBouncer, so the primary probe covers the
+    application path (trust-auth client + userlist backend auth). When
+    ROTATION_PG_DIRECT_DSN is set (postgres-rw), the old credential must
+    also fail direct authentication — a stale PgBouncer userlist entry
+    must not be the only barrier checked. require_direct makes the
+    direct path mandatory for this rotation. The session count verifies
+    pg_terminate_backend actually emptied pg_stat_activity for the
+    principal — pooled-path failure alone is not proof of revocation."""
     # Read the PREDECESSOR password from the sealed snapshot — the live
     # secret has been overwritten by Flux post-merge (successor creds).
     old_pw = _sealed_field(sealed, "predecessor_password")
     if not old_pw:
         return ActResult(Outcome.RETRYABLE, "predecessor-cred-unsealed")
-    dead = 0
-    for _ in range(2):
-        try:
-            import psycopg2
-            pw = old_pw
-            conn = psycopg2.connect(
-                os.environ["ROTATION_PG_DSN"].split(" user=")[0]
-                + f" user={principal} password={pw}", connect_timeout=5)
-            conn.close()
-            return ActResult(Outcome.COMPENSATE, "predecessor-still-valid")
-        except psycopg2.OperationalError as e:
-            msg = str(e)
-            if "password authentication failed" in msg or "not permitted to log in" in msg:
-                dead += 1
-            else:
+    if require_direct and not os.environ.get("ROTATION_PG_DIRECT_DSN"):
+        return ActResult(Outcome.FATAL, "direct-dsn-required-unset")
+
+    def _probe(dsn: str) -> int:
+        dead = 0
+        for _ in range(2):
+            try:
+                import psycopg2
+                conn = psycopg2.connect(
+                    dsn.split(" user=")[0]
+                    + f" user={principal} password={old_pw}", connect_timeout=5)
+                conn.close()
+                return -1  # still valid
+            except psycopg2.OperationalError as e:
+                msg = str(e)
+                if "password authentication failed" in msg or "not permitted to log in" in msg:
+                    dead += 1
+                else:
+                    time.sleep(3)
+            except Exception:
                 time.sleep(3)
-        except Exception:
-            time.sleep(3)
-    return ActResult(Outcome.OK if dead >= 2 else Outcome.RETRYABLE,
-                     f"dead-probes:{dead}/2")
+        return dead
+
+    paths = {"pooled": _probe(os.environ["ROTATION_PG_DSN"])}
+    direct = os.environ.get("ROTATION_PG_DIRECT_DSN")
+    if direct:
+        paths["direct"] = _probe(direct)
+    if any(v == -1 for v in paths.values()):
+        return ActResult(Outcome.COMPENSATE,
+                         "predecessor-still-valid:"
+                         + ",".join(k for k, v in paths.items() if v == -1))
+
+    # Session-count verification: NOLOGIN blocks new auth but surviving
+    # pooled sessions keep working until terminated — verify zero remain.
+    remaining = -1
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.environ["ROTATION_PG_DSN"], connect_timeout=8)
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pg_stat_activity WHERE usename = %s",
+                    (principal,))
+        remaining = cur.fetchone()[0]
+        conn.close()
+    except Exception:
+        pass
+
+    detail = "dead:" + ",".join(f"{k}={v}/2" for k, v in paths.items())
+    detail += f",sessions-remaining:{remaining}"
+    if all(v == 2 for v in paths.values()) and remaining == 0:
+        return ActResult(Outcome.OK, detail)
+    return ActResult(Outcome.RETRYABLE, detail)
 
 
 @activity.defn
@@ -879,3 +981,323 @@ async def post_closure_evidence(evidence: dict) -> ActResult:
         return ActResult(Outcome.OK, f"closure-post-failed:HTTP{e.code}")
     except Exception as e:
         return ActResult(Outcome.OK, f"closure-post-unreachable:{type(e).__name__}")
+
+
+# ----------------------------------------------------------------------
+# Merge-receipt verification (approval binding)
+# ----------------------------------------------------------------------
+
+def _gh_json(*args: str, env: dict = None) -> dict | list:
+    """gh api/cli returning parsed JSON — patchable seam for tests."""
+    r = subprocess.run(["gh", *args], capture_output=True, text=True,
+                       env=env or os.environ)
+    if r.returncode != 0:
+        raise RuntimeError(f"gh:{(r.stderr or r.stdout)[:200]}")
+    return json.loads(r.stdout)
+
+
+def _git_out(repo: str, *args: str, env: dict = None) -> str:
+    """git -C <repo> <args> → stdout — patchable seam for tests."""
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                       env=env or os.environ)
+    if r.returncode != 0:
+        raise RuntimeError(f"git:{(r.stderr or r.stdout)[:200].decode(errors='replace')}")
+    return r.stdout.decode().strip()
+
+
+def _receipt_field_failures(receipt: dict, ctx: dict) -> list:
+    """Pure binding checks — no I/O. Returns failure strings."""
+    fails = []
+    for field in RECEIPT_SIGNED_FIELDS + ("signature",):
+        if field not in receipt:
+            fails.append(f"missing-field:{field}")
+    if fails:
+        return fails
+    if receipt["pr_url"] != ctx["pr_url"]:
+        fails.append("pr-url-mismatch")
+    if receipt.get("schema") != RECEIPT_SCHEMA:
+        fails.append("schema-mismatch")
+    if receipt.get("action") != "approve":
+        fails.append("wrong-action")
+    if receipt.get("rotation_instance") != ctx.get("rotation_instance"):
+        fails.append("instance-mismatch")
+    if receipt.get("run_id") != ctx.get("run_id"):
+        fails.append("run-mismatch")
+    if receipt["workflow_id"] != ctx["workflow_id"]:
+        fails.append("workflow-id-mismatch")
+    if receipt["spec_digest"] != ctx["spec_digest"]:
+        fails.append("spec-digest-mismatch")
+    if receipt["consumer_set_digest"] != ctx["consumer_set_digest"]:
+        fails.append("consumer-set-mismatch")
+    if receipt["successor"] != ctx["successor"]:
+        fails.append("successor-mismatch")
+    has_direct = any(((_consumer(c).get("secret") or {}).get("mode") != "gitops"
+                      and _consumer(c).get("secret"))
+                     for c in ctx.get("consumers", []))
+    if has_direct and receipt["direct_mode_approved"] is not True:
+        fails.append("direct-mode-not-explicitly-approved")
+    return fails
+
+
+def _pr_url_slug(url: str) -> str | None:
+    """'https://github.com/org/repo/pull/123' → 'org/repo', else None."""
+    m = re.match(r"https://[^/]+/([^/]+/[^/]+)/pull/\d+", url or "")
+    return m.group(1) if m else None
+
+
+# Receipt signature schema. Canonical serialization: UTF-8 JSON object
+# containing exactly the action's signed-field set, keys sorted, compact
+# separators — signer and verifier MUST agree on these bytes.
+RECEIPT_SCHEMA = "rotation-receipt/v1"
+
+# Receipt fields covered by the approver's ed25519 signature for an
+# "approve" action. workflow_id + run_id + rotation_instance bind the
+# receipt to exactly one execution: Temporal permits workflow-ID reuse
+# after closure, so the ID alone is not a unique-execution key.
+RECEIPT_SIGNED_FIELDS = (
+    "schema", "action", "approver", "pr_url", "reviewed_head_sha",
+    "merge_commit_sha", "spec_digest", "consumer_set_digest", "successor",
+    "workflow_id", "run_id", "rotation_instance", "direct_mode_approved",
+)
+
+# Signed field set for control signals (abort/reject). No PR/merge state
+# is bound — the signature only authenticates the termination request
+# for this exact execution.
+CONTROL_SIGNED_FIELDS = (
+    "schema", "action", "approver", "workflow_id", "run_id",
+    "rotation_instance",
+)
+
+
+def _receipt_signed_payload(receipt: dict,
+                            fields: tuple = RECEIPT_SIGNED_FIELDS) -> bytes:
+    """Canonical bytes an approver signs — mirrors _canon in the
+    workflow; both sides digest the same structure."""
+    return json.dumps({f: receipt.get(f) for f in fields},
+                      sort_keys=True, separators=(",", ":")).encode()
+
+
+def _approver_authenticated(receipt: dict,
+                            fields: tuple = RECEIPT_SIGNED_FIELDS
+                            ) -> tuple[bool, str]:
+    """Verify the receipt's ed25519 signature against the approver's
+    registered public key (ROTATION_APPROVER_KEYS = JSON
+    {name: base64-pubkey}). The `approver` field is caller-supplied —
+    the signature is what authenticates it. Fails closed when the key
+    map is unset, the approver is unknown, or the signature is bad."""
+    raw_keys = os.environ.get("ROTATION_APPROVER_KEYS", "")
+    if not raw_keys:
+        return False, "approver-keys-unset"
+    try:
+        keys = json.loads(raw_keys)
+    except ValueError:
+        return False, "approver-keys-malformed"
+    approver = receipt.get("approver", "")
+    if approver not in keys:
+        return False, f"unauthorized-approver:{approver}"
+    sig_b64 = receipt.get("signature", "")
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey)
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(keys[approver]))
+        pub.verify(base64.b64decode(sig_b64),
+                   _receipt_signed_payload(receipt, fields))
+        return True, ""
+    except Exception:
+        return False, "bad-signature"
+
+
+def _pr_state_checks(pr: dict, receipt: dict, target: str) -> list:
+    """Pure checks against a `gh pr view` payload."""
+    fails = []
+    if pr.get("state") != "MERGED":
+        fails.append(f"pr-not-merged:{pr.get('state')}")
+    if pr.get("baseRefName") != target:
+        fails.append(f"wrong-target-branch:{pr.get('baseRefName')}")
+    if pr.get("headRefOid") != receipt.get("reviewed_head_sha"):
+        fails.append("reviewed-head-mismatch")
+    if (pr.get("mergeCommit") or {}).get("oid") != receipt.get("merge_commit_sha"):
+        fails.append("merge-commit-mismatch")
+    return fails
+
+
+def _affected_secret_paths(ctx: dict) -> list:
+    """Repo paths the rotation PR is expected to change — the freeze set."""
+    paths = set()
+    for c in (_consumer(x) for x in ctx.get("consumers", [])):
+        s = c.get("secret") or {}
+        if s.get("mode") == "gitops" and s.get("path"):
+            paths.add(s["path"])
+    bl = ctx.get("baseline_files") or {}
+    paths.update(bl.keys())
+    return sorted(paths)
+
+
+def _classify_path_changes(changed: list, affected: list) -> tuple:
+    """(intended, concurrent) — changed paths partitioned against the
+    affected set. Anything outside the set is concurrent by definition."""
+    aff = set(affected)
+    intended = [p for p in changed if p in aff]
+    concurrent = [p for p in changed if p not in aff]
+    return intended, concurrent
+
+
+@activity.defn
+async def verify_merge_receipt(receipt: dict, ctx: dict) -> ActResult:
+    """Bind the approval to the exact reviewed+merged state before any
+    consumer mutation. All failures are FATAL — nothing has mutated yet,
+    so a stop costs nothing but the gate.
+
+    Checks (see AMENDMENT-01 §D):
+      1. receipt fields bind workflow/spec/successor/consumer-set/direct-mode
+      2. pr_url identity + repository slug
+      3. PR state=MERGED on expected target branch
+      4. PR final head == receipt.reviewed_head_sha (reviewed head)
+      5. PR mergeCommit.oid == receipt.merge_commit_sha and is an ancestor
+         of the target branch (distinct commits — merge-commit convention)
+      6. merged file contents == reviewed head contents (per affected path)
+      7. no concurrent edits to affected paths on target since merge-base;
+         no post-merge edits before mutation
+      8. approver ed25519 signature (ROTATION_APPROVER_KEYS) — a
+         well-formed receipt alone is not authorization
+      9. direct-mode live secrets still hold predecessor-era values
+
+    Failure classes (the workflow branches on the detail prefix):
+      * "unauth:..." — malformed, forged, wrong-instance, or wrong-action
+        receipt. Not proof of an authenticated approval: the gate stays
+        open for a corrected receipt; no cleanup is triggered.
+      * anything else — an authenticated, execution-bound approval whose
+        merged state failed verification. Terminal: stop before cutover.
+    """
+    fails = _receipt_field_failures(receipt, ctx)
+    if fails:
+        return ActResult(Outcome.FATAL, "unauth:" + ",".join(fails))
+
+    slug = os.environ.get("ROTATION_REPO_SLUG", "")
+    url_slug = _pr_url_slug(receipt["pr_url"])
+    if not url_slug or url_slug.lower() != slug.lower():
+        return ActResult(Outcome.FATAL, "unauth:wrong-repo:" + url_slug)
+    target = os.environ.get("ROTATION_TARGET_BRANCH", "main")
+
+    authed, why = _approver_authenticated(receipt)
+    if not authed:
+        return ActResult(Outcome.FATAL, f"unauth:{why}")
+
+    repo = os.environ.get("ROTATION_REPO_DIR", "/workspace")
+    git_env = {**os.environ, "GIT_CONFIG_COUNT": "1",
+               "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": repo}
+    try:
+        pr = _gh_json("pr", "view", receipt["pr_url"], "-R", slug,
+                      "--json", "state,headRefOid,mergeCommit,baseRefName",
+                      env=git_env)
+        fails = _pr_state_checks(pr, receipt, target)
+        if fails:
+            return ActResult(Outcome.FATAL, "pr-state:" + ",".join(fails))
+
+        merge_sha = receipt["merge_commit_sha"]
+        head_sha = receipt["reviewed_head_sha"]
+
+        # Fetch both endpoints + current target tip
+        _git_out(repo, "fetch", "origin", target, merge_sha, head_sha, env=git_env)
+        anc = subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor",
+             merge_sha, f"origin/{target}"],
+            capture_output=True, env=git_env)
+        if anc.returncode != 0:
+            return ActResult(Outcome.FATAL, "merge-commit-not-on-target")
+
+        affected = _affected_secret_paths(ctx)
+
+        # Merged contents must equal the reviewed head's contents for every
+        # affected path (guards a divergent merge result / conflict munge).
+        for p in affected:
+            try:
+                merged = _git_out(repo, "rev-parse", f"{merge_sha}:{p}", env=git_env)
+            except RuntimeError:
+                return ActResult(Outcome.FATAL, f"merged-missing:{p}")
+            try:
+                reviewed = _git_out(repo, "rev-parse", f"{head_sha}:{p}", env=git_env)
+            except RuntimeError:
+                return ActResult(Outcome.FATAL, f"reviewed-missing:{p}")
+            if merged != reviewed:
+                return ActResult(Outcome.FATAL, f"merged-content-differs:{p}")
+
+        # Intended-vs-concurrent: any commit on target between merge-base
+        # and merge's first parent that touched an affected path is a
+        # concurrent edit — stop and re-review, never regenerate silently.
+        base = ctx.get("merge_base")
+        if base:
+            out = _git_out(repo, "log", "--format=%H",
+                           f"{base}..{merge_sha}^1", "--", *affected,
+                           env=git_env)
+            if out.strip():
+                return ActResult(Outcome.FATAL,
+                                 f"concurrent-target-edit:{out.splitlines()[0][:12]}")
+        # Post-merge edits to affected paths already on target → drift.
+        out = _git_out(repo, "log", "--format=%H",
+                       f"{merge_sha}..origin/{target}", "--", *affected,
+                       env=git_env)
+        if out.strip():
+            return ActResult(Outcome.FATAL, "post-merge-drift")
+
+        # Direct-mode live state: secrets patched outside the PR must still
+        # carry predecessor-era values — anything else is drift requiring
+        # human review before we write over it.
+        directs = [c for c in (_consumer(x) for x in ctx.get("consumers", []))
+                   if (c.get("secret") or {}).get("mode") != "gitops"
+                   and c.get("secret") and not (c["secret"] or {}).get("userlist")]
+        if directs:
+            old_pw = _sealed_field(ctx.get("sealed", ""), "predecessor_password")
+            if not old_pw:
+                return ActResult(Outcome.RETRYABLE, "predecessor-cred-unsealed")
+            fmt_old = {"user": ctx["principal"], "pw": old_pw,
+                       "host": os.environ.get("ROTATION_PG_HOST", ""),
+                       "port": os.environ.get("ROTATION_PG_PORT", "5432"),
+                       "db": os.environ.get("ROTATION_PG_DB", "")}
+            seen = set()
+            for c in directs:
+                s = c["secret"]
+                key = (c["namespace"], s["name"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                ok, d = _kubectl("get", "secret", s["name"], "-n", c["namespace"],
+                                 "-o", "jsonpath={.data}")
+                if not ok:
+                    return ActResult(Outcome.RETRYABLE, f"direct-secret-get:{d}")
+                live = json.loads(d)
+                for k, t in _secret_keys(s).items():
+                    expected = t.format(**fmt_old)
+                    actual = base64.b64decode(live.get(k, "")).decode(errors="replace")
+                    if actual != expected:
+                        return ActResult(Outcome.FATAL,
+                                         f"direct-secret-drift:{c['namespace']}/{s['name']}:{k}")
+    except RuntimeError as e:
+        return ActResult(Outcome.RETRYABLE, f"verify-io:{e}")
+
+    return ActResult(Outcome.OK, "receipt-verified")
+
+
+@activity.defn
+async def verify_control_receipt(receipt: dict, ctx: dict) -> ActResult:
+    """Authenticate an abort/reject request for THIS execution only.
+
+    Untrusted callers must not trigger privileged cleanup — an abort or
+    reject is only honored when the control receipt carries a valid
+    approver signature over CONTROL_SIGNED_FIELDS bound to this
+    workflow_id + run_id + rotation_instance. Any failure returns FATAL;
+    the workflow records the attempt and keeps waiting."""
+    for f in CONTROL_SIGNED_FIELDS + ("signature",):
+        if f not in receipt:
+            return ActResult(Outcome.FATAL, f"missing-field:{f}")
+    if receipt["schema"] != RECEIPT_SCHEMA:
+        return ActResult(Outcome.FATAL, "schema-mismatch")
+    if receipt["action"] not in ("abort", "reject"):
+        return ActResult(Outcome.FATAL, "wrong-action")
+    for f in ("workflow_id", "run_id", "rotation_instance"):
+        if receipt[f] != ctx.get(f):
+            return ActResult(Outcome.FATAL, f"{f}-mismatch")
+    authed, why = _approver_authenticated(receipt, CONTROL_SIGNED_FIELDS)
+    if not authed:
+        return ActResult(Outcome.FATAL, f"unauth:{why}")
+    return ActResult(Outcome.OK, "control-verified")

@@ -34,6 +34,8 @@ async def main() -> None:
             acts.create_role,
             acts.sops_encrypt_and_open_pr,
             acts.notify_human,
+            acts.verify_merge_receipt,
+            acts.verify_control_receipt,
             acts.wait_consumer_healthy,
             acts.patch_and_roll,
             acts.revoke_predecessor,
