@@ -501,3 +501,30 @@ class TestBoundedDiagnostics:
         CALLS.clear()
         asyncio.run(_run_env(body))
         assert "patch_and_roll" in _names()
+
+
+    def test_expiry_under_sustained_invalid_input(self):
+        """Forged receipts loop the wait but cannot starve expiry: once
+        signaling stops, virtual time reaches the FIXED deadline and the
+        bounded cleanup path runs (successor revoked, stage expired)."""
+        async def body(env):
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, SPEC,
+                id=WF_ID, task_queue=TASK_QUEUE)
+            await _wait_stage(handle, "await_approval")
+            VERIFY_BEHAVIOR["mode"] = "unauth"
+            for _ in range(3):
+                await handle.signal(
+                    wf.CredentialRotationWorkflow.approve_merge,
+                    _receipt_for())
+                await asyncio.sleep(0.15)
+            # stop signaling — virtual time skips to the deadline
+            result = await handle.result()
+            assert result.stage == "expired"
+
+        VERIFY_BEHAVIOR["mode"] = "ok"
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+        revokes = [c for c in CALLS if c[0] == "revoke_predecessor"]
+        assert revokes == [("revoke_predecessor",
+                            "cortex_db_admin_r77777")], revokes
