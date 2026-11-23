@@ -61,13 +61,26 @@ async def m_notify(pr_url, principal, reason):
 
 
 VERIFY_BEHAVIOR = {"mode": "ok"}
+CONTROL_BEHAVIOR = {"mode": "ok"}
+
+
+@activity.defn(name="verify_control_receipt")
+async def m_control(receipt, ctx):
+    CALLS.append(("verify_control_receipt", receipt.get("action")))
+    if CONTROL_BEHAVIOR["mode"] == "fatal":
+        return acts.ActResult(acts.Outcome.FATAL, "unauth:bad-signature")
+    return _ok("control-verified")
 
 
 @activity.defn(name="verify_merge_receipt")
 async def m_verify(receipt, ctx):
     CALLS.append(("verify_merge_receipt", receipt.get("approver")))
-    if VERIFY_BEHAVIOR["mode"] == "fatal":
-        return acts.ActResult(acts.Outcome.FATAL, "receipt:bad-signature")
+    mode = VERIFY_BEHAVIOR["mode"]
+    if mode == "unauth":
+        return acts.ActResult(acts.Outcome.FATAL, "unauth:bad-signature")
+    if mode == "statefail":
+        return acts.ActResult(acts.Outcome.FATAL,
+                              "pr-state:merge-commit-mismatch")
     return _ok("receipt-verified")
 
 
@@ -102,7 +115,7 @@ async def m_evidence(evidence):
 
 
 ALL_MOCKS = [m_gen, m_create_role, m_open_pr, m_notify, m_verify,
-             m_healthy, m_patch, m_revoke, m_dead, m_evidence]
+             m_control, m_healthy, m_patch, m_revoke, m_dead, m_evidence]
 
 SPEC = wf.RotationSpec(
     principal="cortex_db_admin_r16023",
@@ -115,22 +128,46 @@ SPEC = wf.RotationSpec(
     db_host="pgbouncer",
     successor_name="cortex_db_admin_r77777",
     require_direct_probe=True,
+    rotation_instance="att1",
 )
 
 
-def _receipt_for(wf_id="cred-rotation/cortex_db_admin_r16023", **over):
-    r = {"approver": "ops-lead",
+WF_ID = "cred-rotation/cortex_db_admin_r16023/att1"
+
+
+def _receipt_for(wf_id=WF_ID, **over):
+    r = {"schema": acts.RECEIPT_SCHEMA, "action": "approve",
+         "approver": "ops-lead",
          "pr_url": "https://github.com/arch/repo/pull/1",
          "reviewed_head_sha": "h", "merge_commit_sha": "m",
          "spec_digest": "x", "consumer_set_digest": "y",
          "successor": "cortex_db_admin_r77777", "workflow_id": wf_id,
+         "run_id": "run-1", "rotation_instance": "att1",
          "direct_mode_approved": True, "signature": "signed"}
+    r.update(over)
+    return r
+
+
+def _control_receipt(action="abort", wf_id=WF_ID, **over):
+    r = {"schema": acts.RECEIPT_SCHEMA, "action": action,
+         "approver": "ops-lead", "workflow_id": wf_id,
+         "run_id": "run-1", "rotation_instance": "att1",
+         "signature": "signed"}
     r.update(over)
     return r
 
 
 def _names():
     return [c[0] for c in CALLS]
+
+
+async def _wait_stage(handle, stage, tries=80):
+    for _ in range(tries):
+        st = await handle.query(wf.CredentialRotationWorkflow.status)
+        if st.stage == stage:
+            return st
+        await asyncio.sleep(0.1)
+    return st
 
 
 async def _run_env(body):
@@ -145,16 +182,17 @@ class TestWorkflowPaths:
 
     def test_dry_run_never_reaches_mutation(self):
         async def body(env):
-            spec = wf.RotationSpec(**{**SPEC.__dict__, "dry_run": True})
+            spec = wf.RotationSpec(**{**SPEC.__dict__, "dry_run": True,
+                                      "rotation_instance": "att-dry"})
             handle = await env.client.start_workflow(
                 wf.CredentialRotationWorkflow.run, spec,
-                id="cred-rotation/test-dry", task_queue=TASK_QUEUE)
+                id="cred-rotation/cortex_db_admin_r16023/att-dry", task_queue=TASK_QUEUE)
             # Even a validly-shaped receipt arrives before close — must
             # not unlock anything: dry_run returns before the gate.
             try:
                 await handle.signal(
                     wf.CredentialRotationWorkflow.approve_merge,
-                    _receipt_for(wf_id="cred-rotation/test-dry"))
+                    _receipt_for(wf_id="cred-rotation/cortex_db_admin_r16023/att-dry"))
             except Exception:
                 pass
             result = await handle.result()
@@ -174,7 +212,7 @@ class TestWorkflowPaths:
         async def body(env):
             handle = await env.client.start_workflow(
                 wf.CredentialRotationWorkflow.run, SPEC,
-                id="cred-rotation/test-live", task_queue=TASK_QUEUE)
+                id=WF_ID, task_queue=TASK_QUEUE)
             # Poll until the gate is reached, then send garbage first.
             for _ in range(60):
                 st = await handle.query(
@@ -214,35 +252,135 @@ class TestWorkflowPaths:
         assert ("wait_consumer_healthy", True) in CALLS
         assert ("liveness_dead_check", True) in CALLS
 
-    def test_rejected_receipt_stops_before_cutover_and_cleans_up(self):
+    def test_forged_receipt_keeps_gate_open(self):
+        """An unauthenticated receipt is recorded, gate stays open, no
+        cleanup runs — then a valid receipt still completes the run."""
         async def body(env):
             handle = await env.client.start_workflow(
                 wf.CredentialRotationWorkflow.run, SPEC,
-                id="cred-rotation/test-reject", task_queue=TASK_QUEUE)
-            for _ in range(60):
-                st = await handle.query(
-                    wf.CredentialRotationWorkflow.status)
-                if st.stage == "await_approval":
+                id=WF_ID, task_queue=TASK_QUEUE)
+            await _wait_stage(handle, "await_approval")
+            VERIFY_BEHAVIOR["mode"] = "unauth"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.approve_merge, _receipt_for())
+            for _ in range(40):
+                st = await handle.query(wf.CredentialRotationWorkflow.status)
+                if st.evidence.get("bad_receipts"):
                     break
                 await asyncio.sleep(0.1)
-            VERIFY_BEHAVIOR["mode"] = "fatal"
+            st = await handle.query(wf.CredentialRotationWorkflow.status)
+            assert st.stage == "await_approval"
+            assert any("bad-signature" in r.get("detail", "")
+                       for r in st.evidence["bad_receipts"])
+
+            VERIFY_BEHAVIOR["mode"] = "ok"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.approve_merge, _receipt_for())
+            result = await handle.result()
+            assert result.stage == "closed"
+
+        VERIFY_BEHAVIOR["mode"] = "ok"
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+        names = _names()
+        # forged receipt consumed no cleanup; the valid run completed
+        assert "revoke_predecessor" in names  # the real one, post-cutover
+        assert ("revoke_predecessor", "cortex_db_admin_r77777") not in CALLS
+
+    def test_state_mismatch_terminates_without_cleanup(self):
+        """Authenticated approval + merged-state verification failure →
+        non-retryable terminal failure pre-cutover; successor preserved,
+        NOT auto-revoked."""
+        async def body(env):
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, SPEC,
+                id=WF_ID, task_queue=TASK_QUEUE)
+            await _wait_stage(handle, "await_approval")
+            VERIFY_BEHAVIOR["mode"] = "statefail"
             await handle.signal(
                 wf.CredentialRotationWorkflow.approve_merge, _receipt_for())
             try:
                 await handle.result()
                 raise AssertionError("expected workflow failure")
-            except Exception:
-                pass
+            except Exception as e:
+                # non-retryable ApplicationError reaches the client as a
+                # failed execution, not a task-retry loop
+                cause = getattr(e, "cause", e)
+                assert "receipt-verification-failed" in str(cause)
+                assert getattr(cause, "non_retryable", False) is True
+                assert getattr(cause, "type", "") == \
+                    "rotation-verification-rejected"
 
+        VERIFY_BEHAVIOR["mode"] = "ok"
         CALLS.clear()
         asyncio.run(_run_env(body))
         names = _names()
-        # verify ran, cutover did not, successor role was cleaned up
         assert "verify_merge_receipt" in names
         assert "patch_and_roll" not in names
-        assert "wait_consumer_healthy" not in names
-        assert "liveness_dead_check" not in names
-        # revoke_predecessor called with the SUCCESSOR (compensation),
-        # never with the predecessor
-        revokes = [c[1] for c in CALLS if c[0] == "revoke_predecessor"]
-        assert revokes == ["cortex_db_admin_r77777"], revokes
+        # no cleanup triggered by a rejected receipt — the successor is
+        # preserved for review (revoke only on authorized abort/expiry)
+        assert "revoke_predecessor" not in names, names
+
+    def test_forged_abort_ignored_signed_abort_honored(self):
+        """An unsigned abort must not destroy preparation; a signed one
+        performs the defined cleanup."""
+        async def body(env):
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, SPEC,
+                id=WF_ID, task_queue=TASK_QUEUE)
+            await _wait_stage(handle, "await_approval")
+
+            # Forged abort → recorded, gate stays open, no cleanup
+            CONTROL_BEHAVIOR["mode"] = "fatal"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.abort_rotation,
+                _control_receipt(action="abort", signature="forged"))
+            for _ in range(40):
+                st = await handle.query(wf.CredentialRotationWorkflow.status)
+                if st.evidence.get("bad_control_signals"):
+                    break
+                await asyncio.sleep(0.1)
+            st = await handle.query(wf.CredentialRotationWorkflow.status)
+            assert st.stage == "await_approval"
+            assert st.evidence["bad_control_signals"]
+            assert "revoke_predecessor" not in _names()
+
+            # Signed abort → authenticated cleanup, run ends aborted
+            CONTROL_BEHAVIOR["mode"] = "ok"
+            await handle.signal(
+                wf.CredentialRotationWorkflow.abort_rotation,
+                _control_receipt(action="abort"))
+            result = await handle.result()
+            assert result.stage == "aborted"
+
+        VERIFY_BEHAVIOR["mode"] = "ok"
+        CONTROL_BEHAVIOR["mode"] = "ok"
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+        # exactly one cleanup, targeting the successor
+        revokes = [c for c in CALLS if c[0] == "revoke_predecessor"]
+        assert revokes == [("revoke_predecessor",
+                            "cortex_db_admin_r77777")], revokes
+        assert "patch_and_roll" not in _names()
+
+    def test_instance_mismatch_fails_nonretryable(self):
+        """Workflow id must be cred-rotation/{principal}/{instance} —
+        anything else is a terminal start failure, no activities run."""
+        async def body(env):
+            spec = wf.RotationSpec(**{**SPEC.__dict__,
+                                      "rotation_instance": "att1"})
+            handle = await env.client.start_workflow(
+                wf.CredentialRotationWorkflow.run, spec,
+                id="cred-rotation/cortex_db_admin_r16023",  # no instance
+                task_queue=TASK_QUEUE)
+            try:
+                await handle.result()
+                raise AssertionError("expected start failure")
+            except Exception as e:
+                cause = getattr(e, "cause", e)
+                assert "rotation-instance-mismatch" in str(cause) \
+                    or "instance" in str(cause)
+
+        CALLS.clear()
+        asyncio.run(_run_env(body))
+        assert CALLS == []

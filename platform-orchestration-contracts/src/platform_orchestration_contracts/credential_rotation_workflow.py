@@ -66,8 +66,14 @@ class RotationActivities(Protocol):
     async def verify_merge_receipt(self, receipt: dict, ctx: dict) -> None:
         """Bind approval to the exact reviewed head + merge commit on the
         target branch, the spec/consumer digests, merged file contents,
-        approver allowlist, and absence of concurrent/direct-mode drift.
+        approver signature, and absence of concurrent/direct-mode drift.
         Runs after the merge signal, BEFORE any consumer mutation."""
+
+    async def verify_control_receipt(self, receipt: dict, ctx: dict) -> None:
+        """Authenticate an abort/reject request for this execution —
+        signature over CONTROL_SIGNED_FIELDS bound to workflow_id +
+        run_id + rotation_instance. Untrusted control signals must never
+        trigger privileged cleanup."""
 
     async def wait_consumer_healthy(self, consumers: list[str], timeout_s: int) -> bool:
         """All consumers authenticated with the successor before revoke."""
@@ -115,6 +121,10 @@ class RotationSpec:
     require_direct_probe: bool = False   # incident-critical rotations set this —
                                          # refuses live execution when
                                          # ROTATION_PG_DIRECT_DSN is unset
+    rotation_instance: str = ""          # unique per attempt, e.g.
+                                         # "inc2026-11-pg-r16023-att1" —
+                                         # REQUIRED; the workflow id must be
+                                         # cred-rotation/{principal}/{instance}
     dry_run: bool = False                # stop after open_pr+notify — zero mutation
     zerotrace_baseline: str = ""         # e.g. discovery-20260911T091040Z-21876 (Auth-1)
     ntfy_topic: str = "ops-credential-rotation"
@@ -162,10 +172,31 @@ def _consumer_set_digest(spec: "RotationSpec") -> str:
 
 
 RECEIPT_REQUIRED_FIELDS = (
-    "approver", "pr_url", "reviewed_head_sha", "merge_commit_sha",
-    "spec_digest", "consumer_set_digest", "successor", "workflow_id",
-    "direct_mode_approved", "signature",
+    "schema", "action", "approver", "pr_url", "reviewed_head_sha",
+    "merge_commit_sha", "spec_digest", "consumer_set_digest", "successor",
+    "workflow_id", "run_id", "rotation_instance", "direct_mode_approved",
+    "signature",
 )
+
+CONTROL_REQUIRED_FIELDS = (
+    "schema", "action", "approver", "workflow_id", "run_id",
+    "rotation_instance", "signature",
+)
+
+
+def _control_receipt(state: "RotationState", receipt) -> Optional[dict]:
+    """Shape-check a control (abort/reject) receipt. Malformed receipts
+    are recorded and dropped — they never set a flag, so they cannot
+    reach cleanup. Returns the receipt dict when well-formed."""
+    if isinstance(receipt, (list, tuple)):
+        receipt = (list(receipt) + [{}])[0]
+    if not isinstance(receipt, dict) or any(
+            f not in receipt for f in CONTROL_REQUIRED_FIELDS):
+        state.evidence.setdefault("bad_signals", []).append(
+            {"received": receipt if isinstance(receipt, dict) else str(receipt)[:200],
+             "at": workflow.now().isoformat()})
+        return None
+    return receipt
 
 
 def _parse_pr_ref(ref: str) -> dict:
@@ -181,11 +212,13 @@ def _parse_pr_ref(ref: str) -> dict:
 
 @workflow.defn
 class CredentialRotationWorkflow:
-    """One rotation per principal.
+    """One rotation attempt per (principal, rotation_instance).
 
-    Start with workflow_id=f"cred-rotation/{principal}" — Temporal
-    rejects duplicate starts for the same principal (the concurrency
-    lock).
+    Start with workflow_id=rotation_workflow_id(principal, instance)
+    and WorkflowIdReusePolicy=RejectDuplicate. Workflow IDs are reusable
+    after closure — duplicate rejection only holds inside Temporal's
+    retained-history window; the signed run_id + rotation_instance in
+    the receipt is the durable replay defense.
     """
 
     def __init__(self) -> None:
@@ -195,6 +228,8 @@ class CredentialRotationWorkflow:
         self._aborted = False
         self._closure_acked = False
         self._receipt: Optional[dict] = None
+        self._abort_receipt: Optional[dict] = None
+        self._reject_receipt: Optional[dict] = None
 
     # ---- signals ----------------------------------------------------
     @workflow.signal
@@ -207,7 +242,10 @@ class CredentialRotationWorkflow:
         workflow_id, direct_mode_approved. `temporal workflow signal
         --input '[<obj>]'` wraps the payload in an array — unwrap it.
         A malformed receipt does NOT open the gate: it is recorded and
-        the workflow keeps waiting so a corrected signal can land."""
+        the workflow keeps waiting so a corrected signal can land.
+        Shape validation only — signature/binding verification happens
+        in verify_merge_receipt; a forged receipt can never trigger
+        cutover OR cleanup."""
         if isinstance(receipt, (list, tuple)):
             receipt = (list(receipt) + [{}])[0]
         if not isinstance(receipt, dict) or any(
@@ -223,14 +261,28 @@ class CredentialRotationWorkflow:
         self._state.evidence["approved_at"] = workflow.now().isoformat()
 
     @workflow.signal
-    def reject_merge(self, reason: str) -> None:
+    def reject_merge(self, receipt) -> None:
+        """Rejection requires a signed control receipt (action="reject")
+        — otherwise any reachable signal sender could destroy legitimate
+        preparation. Shape-checked here; authenticated in
+        verify_control_receipt before any cleanup runs."""
+        receipt = _control_receipt(self._state, receipt)
+        if receipt is None:
+            return  # recorded by _control_receipt via evidence
         self._merge_rejected = True
-        self._state.evidence["rejected_reason"] = reason
+        self._reject_receipt = receipt
+        self._state.evidence["reject_requested"] = receipt.get("approver")
 
     @workflow.signal
-    def abort_rotation(self, reason: str) -> None:
+    def abort_rotation(self, receipt) -> None:
+        """Abort requires a signed control receipt (action="abort").
+        Same authentication as reject_merge — cleanup is privileged."""
+        receipt = _control_receipt(self._state, receipt)
+        if receipt is None:
+            return
         self._aborted = True
-        self._state.evidence["aborted_reason"] = reason
+        self._abort_receipt = receipt
+        self._state.evidence["abort_requested"] = receipt.get("approver")
 
     @workflow.signal
     def closure_ack(self, acker: str) -> None:
@@ -260,6 +312,18 @@ class CredentialRotationWorkflow:
         self._state.successor = spec.successor_name
         self._state.stage = "prepare"
         info = workflow.info()
+        # Instance binding: the workflow ID must be exactly
+        # cred-rotation/{principal}/{rotation_instance} — the instance
+        # nonce is what makes each rotation attempt uniquely addressable
+        # (workflow IDs are reusable after closure; instance + run_id in
+        # the signed receipt is the durable replay defense).
+        expected_id = rotation_workflow_id(spec.principal,
+                                           spec.rotation_instance)
+        if not spec.rotation_instance or info.workflow_id != expected_id:
+            raise ApplicationError(
+                f"workflow-id {info.workflow_id!r} != expected "
+                f"{expected_id!r}; spec.rotation_instance is required",
+                type="rotation-instance-mismatch", non_retryable=True)
         self._state.evidence.update({
             "principal": spec.principal,
             "zerotrace_baseline": spec.zerotrace_baseline,
@@ -289,11 +353,31 @@ class CredentialRotationWorkflow:
                     if res.ok:
                         return res.ref
                     if res.outcome == acts_unsafe.Outcome.COMPENSATE:
-                        raise CutoverFailed(f"{step}: {res.detail}")
+                        raise CutoverFailed(f"{step}: {res.detail}",
+                                            non_retryable=True)
                     if (res.outcome == acts_unsafe.Outcome.FATAL
                             or i == attempts - 1):
-                        raise ApplicationError(f"{step}: {res.detail}")
+                        raise ApplicationError(
+                            f"{step}: {res.detail}",
+                            type="rotation-step-failed",
+                            non_retryable=True)
                     await workflow.sleep(min(120, 10 * 2 ** i))
+
+            async def _call(fn, args, step, timeout_minutes=10, attempts=4):
+                """Like _req but RETURNS the terminal ActResult instead of
+                raising — the gate needs the failure detail to classify
+                unauthenticated vs authenticated-verification failures."""
+                for i in range(attempts):
+                    res = await workflow.execute_activity(
+                        fn, args=args,
+                        schedule_to_close_timeout=timedelta(minutes=timeout_minutes),
+                        retry_policy=RetryPolicy(maximum_attempts=4),
+                    )
+                    if res.outcome != acts_unsafe.Outcome.RETRYABLE \
+                            or i == attempts - 1:
+                        return res
+                    await workflow.sleep(min(120, 10 * 2 ** i))
+                return res
 
             sealed = await _req(
                 acts_unsafe.generate_successor_cred,
@@ -340,62 +424,102 @@ class CredentialRotationWorkflow:
                 [self._state.pr_url, spec.principal, "rotation PR ready"],
                 "notify_human", attempts=4)
 
-            # APPROVE — wait for merge signal (the human gate)
-            try:
-                await workflow.wait_condition(
-                    lambda: self._merge_approved or self._merge_rejected or self._aborted,
-                    timeout=timedelta(hours=spec.merge_wait_hours),
-                )
-            except workflow.TimeoutError:
-                self._state.stage = "expired"
-                # Gate window elapsed — clean up the unused successor
-                await _req(
-                    acts_unsafe.revoke_predecessor,
-                    [spec.successor_name],
-                    "revoke_successor", attempts=4)
-                return self._state
-            if self._merge_rejected or self._aborted:
-                self._state.stage = "aborted"
-                await _req(
-                    acts_unsafe.revoke_predecessor,
-                    [spec.successor_name],
-                    "revoke_successor", attempts=4)
-                return self._state
-
-            # BINDING — verify the receipt against the actual merged
-            # state before ANY consumer mutation. On failure: no consumer
-            # mutation, but the successor role already exists — revoke it
-            # rather than leave a live unused credential.
-            self._state.stage = "verify_receipt"
-            try:
-                await _req(
-                    acts_unsafe.verify_merge_receipt,
-                    [self._receipt, {
-                        "workflow_id": info.workflow_id,
-                        "run_id": info.run_id,
-                        "spec_digest": self._state.evidence["spec_digest"],
-                        "consumer_set_digest": self._state.evidence["consumer_set_digest"],
-                        "successor": spec.successor_name,
-                        "principal": spec.principal,
-                        "pr_url": self._state.pr_url,
-                        "pushed_head": self._state.evidence.get("pushed_head"),
-                        "merge_base": self._state.evidence.get("merge_base"),
-                        "baseline_files": self._state.evidence.get("baseline_files"),
-                        "consumers": spec.consumers,
-                        "sealed": sealed,
-                    }],
-                    "verify_merge_receipt")
-            except Exception:
-                self._state.evidence["receipt_rejected"] = True
+            # APPROVE — the human gate. Signal senders are untrusted:
+            # malformed/forged/wrong-instance receipts and control
+            # signals are only RECORDED — they can open neither cutover
+            # nor cleanup. Cleanup runs only on an authenticated
+            # abort/reject or bounded expiry.
+            gate_ctx = {
+                "workflow_id": info.workflow_id,
+                "run_id": info.run_id,
+                "rotation_instance": spec.rotation_instance,
+                "spec_digest": self._state.evidence["spec_digest"],
+                "consumer_set_digest": self._state.evidence["consumer_set_digest"],
+                "successor": spec.successor_name,
+                "principal": spec.principal,
+                "pr_url": self._state.pr_url,
+                "pushed_head": self._state.evidence.get("pushed_head"),
+                "merge_base": self._state.evidence.get("merge_base"),
+                "baseline_files": self._state.evidence.get("baseline_files"),
+                "consumers": spec.consumers,
+                "sealed": sealed,
+            }
+            while True:
                 try:
+                    await workflow.wait_condition(
+                        lambda: (self._merge_approved or self._merge_rejected
+                                 or self._aborted),
+                        timeout=timedelta(hours=spec.merge_wait_hours))
+                except workflow.TimeoutError:
+                    self._state.stage = "expired"
+                    # Bounded approval expiry — the defined cleanup path.
                     await _req(
                         acts_unsafe.revoke_predecessor,
                         [spec.successor_name],
-                        "revoke_successor_unapproved", attempts=4)
-                    self._state.evidence["unapproved_successor_revoked"] = True
-                except Exception as ce:
-                    self._state.evidence["successor_cleanup_error"] = str(ce)
-                raise
+                        "revoke_successor", attempts=4)
+                    return self._state
+
+                if self._merge_rejected or self._aborted:
+                    receipt = (self._abort_receipt if self._aborted
+                               else self._reject_receipt)
+                    which = "abort" if self._aborted else "reject"
+                    res = await _call(
+                        acts_unsafe.verify_control_receipt,
+                        [receipt, gate_ctx], "verify_control_receipt")
+                    if not res.ok:
+                        self._state.evidence.setdefault(
+                            "bad_control_signals", []).append(
+                            {"kind": which, "detail": res.detail,
+                             "approver": (receipt or {}).get("approver"),
+                             "at": workflow.now().isoformat()})
+                        self._merge_rejected = False
+                        self._aborted = False
+                        self._abort_receipt = None
+                        self._reject_receipt = None
+                        self._state.stage = "await_approval"
+                        continue
+                    self._state.stage = ("aborted" if self._aborted
+                                         else "rejected")
+                    await _req(
+                        acts_unsafe.revoke_predecessor,
+                        [spec.successor_name],
+                        "revoke_successor", attempts=4)
+                    return self._state
+
+                # BINDING — verify the receipt against the actual merged
+                # state before ANY consumer mutation.
+                self._state.stage = "verify_receipt"
+                res = await _call(
+                    acts_unsafe.verify_merge_receipt,
+                    [self._receipt, gate_ctx], "verify_merge_receipt")
+                if res.ok:
+                    break
+                if res.detail.startswith("unauth:"):
+                    # Forged/malformed/wrong-instance/wrong-action —
+                    # not an authenticated approval. Record, stay at the
+                    # gate; a corrected receipt can still land.
+                    self._state.evidence.setdefault(
+                        "bad_receipts", []).append(
+                        {"rejected_by": "verify_merge_receipt",
+                         "detail": res.detail,
+                         "approver": self._receipt.get("approver"),
+                         "at": workflow.now().isoformat()})
+                    self._merge_approved = False
+                    self._receipt = None
+                    self._state.stage = "await_approval"
+                    continue
+                # Authenticated approval, but merged state failed
+                # verification — terminal, non-retryable, pre-cutover.
+                # The successor is preserved for review; cleanup happens
+                # only via an authorized abort or a new attempt.
+                self._state.evidence["receipt_rejected"] = True
+                self._state.evidence["receipt_rejected_detail"] = res.detail
+                self._state.evidence["successor_pending_review"] = True
+                raise ApplicationError(
+                    f"receipt-verification-failed:{res.detail}",
+                    type="rotation-verification-rejected",
+                    non_retryable=True)
+
             if self._receipt.get("reviewed_head_sha") != self._state.evidence.get("pushed_head"):
                 # Human-edited branch after the worker push — allowed, but
                 # the approval binds to the *reviewed* head; record it.
@@ -472,6 +596,10 @@ class CredentialRotationWorkflow:
             raise
 
 
-# Convenience: deterministic workflow id for dedup-by-principal.
-def rotation_workflow_id(principal: str) -> str:
-    return f"cred-rotation/{principal}"
+# Convenience: deterministic workflow id per rotation attempt.
+def rotation_workflow_id(principal: str, instance: str) -> str:
+    """Unique per attempt — instance is an incident/attempt identifier
+    (e.g. 'inc2026-11-pg-r16023-att1'). Workflow IDs are reusable after
+    closure; the signed run_id + rotation_instance in the receipt is the
+    durable replay defense beyond Temporal's retained-history window."""
+    return f"cred-rotation/{principal}/{instance}"

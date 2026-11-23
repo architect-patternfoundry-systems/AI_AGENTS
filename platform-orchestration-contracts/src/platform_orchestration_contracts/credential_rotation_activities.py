@@ -1015,6 +1015,14 @@ def _receipt_field_failures(receipt: dict, ctx: dict) -> list:
         return fails
     if receipt["pr_url"] != ctx["pr_url"]:
         fails.append("pr-url-mismatch")
+    if receipt.get("schema") != RECEIPT_SCHEMA:
+        fails.append("schema-mismatch")
+    if receipt.get("action") != "approve":
+        fails.append("wrong-action")
+    if receipt.get("rotation_instance") != ctx.get("rotation_instance"):
+        fails.append("instance-mismatch")
+    if receipt.get("run_id") != ctx.get("run_id"):
+        fails.append("run-mismatch")
     if receipt["workflow_id"] != ctx["workflow_id"]:
         fails.append("workflow-id-mismatch")
     if receipt["spec_digest"] != ctx["spec_digest"]:
@@ -1037,24 +1045,41 @@ def _pr_url_slug(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-# Receipt fields covered by the approver's ed25519 signature. The signed
-# payload includes workflow_id — a receipt replayed against a different
-# execution fails both the binding checks and signature verification.
+# Receipt signature schema. Canonical serialization: UTF-8 JSON object
+# containing exactly the action's signed-field set, keys sorted, compact
+# separators — signer and verifier MUST agree on these bytes.
+RECEIPT_SCHEMA = "rotation-receipt/v1"
+
+# Receipt fields covered by the approver's ed25519 signature for an
+# "approve" action. workflow_id + run_id + rotation_instance bind the
+# receipt to exactly one execution: Temporal permits workflow-ID reuse
+# after closure, so the ID alone is not a unique-execution key.
 RECEIPT_SIGNED_FIELDS = (
-    "approver", "pr_url", "reviewed_head_sha", "merge_commit_sha",
-    "spec_digest", "consumer_set_digest", "successor", "workflow_id",
-    "direct_mode_approved",
+    "schema", "action", "approver", "pr_url", "reviewed_head_sha",
+    "merge_commit_sha", "spec_digest", "consumer_set_digest", "successor",
+    "workflow_id", "run_id", "rotation_instance", "direct_mode_approved",
+)
+
+# Signed field set for control signals (abort/reject). No PR/merge state
+# is bound — the signature only authenticates the termination request
+# for this exact execution.
+CONTROL_SIGNED_FIELDS = (
+    "schema", "action", "approver", "workflow_id", "run_id",
+    "rotation_instance",
 )
 
 
-def _receipt_signed_payload(receipt: dict) -> bytes:
+def _receipt_signed_payload(receipt: dict,
+                            fields: tuple = RECEIPT_SIGNED_FIELDS) -> bytes:
     """Canonical bytes an approver signs — mirrors _canon in the
     workflow; both sides digest the same structure."""
-    return json.dumps({f: receipt.get(f) for f in RECEIPT_SIGNED_FIELDS},
+    return json.dumps({f: receipt.get(f) for f in fields},
                       sort_keys=True, separators=(",", ":")).encode()
 
 
-def _approver_authenticated(receipt: dict) -> tuple[bool, str]:
+def _approver_authenticated(receipt: dict,
+                            fields: tuple = RECEIPT_SIGNED_FIELDS
+                            ) -> tuple[bool, str]:
     """Verify the receipt's ed25519 signature against the approver's
     registered public key (ROTATION_APPROVER_KEYS = JSON
     {name: base64-pubkey}). The `approver` field is caller-supplied —
@@ -1075,7 +1100,8 @@ def _approver_authenticated(receipt: dict) -> tuple[bool, str]:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import (
             Ed25519PublicKey)
         pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(keys[approver]))
-        pub.verify(base64.b64decode(sig_b64), _receipt_signed_payload(receipt))
+        pub.verify(base64.b64decode(sig_b64),
+                   _receipt_signed_payload(receipt, fields))
         return True, ""
     except Exception:
         return False, "bad-signature"
@@ -1132,23 +1158,30 @@ async def verify_merge_receipt(receipt: dict, ctx: dict) -> ActResult:
       6. merged file contents == reviewed head contents (per affected path)
       7. no concurrent edits to affected paths on target since merge-base;
          no post-merge edits before mutation
-      8. approver allowlist (ROTATION_APPROVERS) — a well-formed receipt
-         alone is not authorization
+      8. approver ed25519 signature (ROTATION_APPROVER_KEYS) — a
+         well-formed receipt alone is not authorization
       9. direct-mode live secrets still hold predecessor-era values
+
+    Failure classes (the workflow branches on the detail prefix):
+      * "unauth:..." — malformed, forged, wrong-instance, or wrong-action
+        receipt. Not proof of an authenticated approval: the gate stays
+        open for a corrected receipt; no cleanup is triggered.
+      * anything else — an authenticated, execution-bound approval whose
+        merged state failed verification. Terminal: stop before cutover.
     """
     fails = _receipt_field_failures(receipt, ctx)
     if fails:
-        return ActResult(Outcome.FATAL, "receipt:" + ",".join(fails))
+        return ActResult(Outcome.FATAL, "unauth:" + ",".join(fails))
 
     slug = os.environ.get("ROTATION_REPO_SLUG", "")
     url_slug = _pr_url_slug(receipt["pr_url"])
     if not url_slug or url_slug.lower() != slug.lower():
-        return ActResult(Outcome.FATAL, f"wrong-repo:{url_slug}")
+        return ActResult(Outcome.FATAL, "unauth:wrong-repo:" + url_slug)
     target = os.environ.get("ROTATION_TARGET_BRANCH", "main")
 
     authed, why = _approver_authenticated(receipt)
     if not authed:
-        return ActResult(Outcome.FATAL, f"approver-auth:{why}")
+        return ActResult(Outcome.FATAL, f"unauth:{why}")
 
     repo = os.environ.get("ROTATION_REPO_DIR", "/workspace")
     git_env = {**os.environ, "GIT_CONFIG_COUNT": "1",
@@ -1243,3 +1276,28 @@ async def verify_merge_receipt(receipt: dict, ctx: dict) -> ActResult:
         return ActResult(Outcome.RETRYABLE, f"verify-io:{e}")
 
     return ActResult(Outcome.OK, "receipt-verified")
+
+
+@activity.defn
+async def verify_control_receipt(receipt: dict, ctx: dict) -> ActResult:
+    """Authenticate an abort/reject request for THIS execution only.
+
+    Untrusted callers must not trigger privileged cleanup — an abort or
+    reject is only honored when the control receipt carries a valid
+    approver signature over CONTROL_SIGNED_FIELDS bound to this
+    workflow_id + run_id + rotation_instance. Any failure returns FATAL;
+    the workflow records the attempt and keeps waiting."""
+    for f in CONTROL_SIGNED_FIELDS + ("signature",):
+        if f not in receipt:
+            return ActResult(Outcome.FATAL, f"missing-field:{f}")
+    if receipt["schema"] != RECEIPT_SCHEMA:
+        return ActResult(Outcome.FATAL, "schema-mismatch")
+    if receipt["action"] not in ("abort", "reject"):
+        return ActResult(Outcome.FATAL, "wrong-action")
+    for f in ("workflow_id", "run_id", "rotation_instance"):
+        if receipt[f] != ctx.get(f):
+            return ActResult(Outcome.FATAL, f"{f}-mismatch")
+    authed, why = _approver_authenticated(receipt, CONTROL_SIGNED_FIELDS)
+    if not authed:
+        return ActResult(Outcome.FATAL, f"unauth:{why}")
+    return ActResult(Outcome.OK, "control-verified")

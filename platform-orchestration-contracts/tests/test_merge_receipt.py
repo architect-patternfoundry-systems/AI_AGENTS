@@ -44,6 +44,7 @@ CONSUMERS = [
 CTX = {
     "workflow_id": "cred-rotation/cortex_db_admin_r16023",
     "run_id": "r1",
+    "rotation_instance": "inc-test-att1",
     "spec_digest": "specdigest",
     "consumer_set_digest": "consumerdigest",
     "successor": "cortex_db_admin_r77777",
@@ -83,6 +84,10 @@ def _receipt(**over):
         "consumer_set_digest": "consumerdigest",
         "successor": "cortex_db_admin_r77777",
         "workflow_id": "cred-rotation/cortex_db_admin_r16023",
+        "run_id": "r1",
+        "rotation_instance": "inc-test-att1",
+        "schema": acts.RECEIPT_SCHEMA,
+        "action": "approve",
         "direct_mode_approved": True,
         "signature": "signed",
     }
@@ -112,6 +117,10 @@ class TestReceiptFields:
     @pytest.mark.parametrize("field,bad", [
         ("pr_url", "https://github.com/arch/repo/pull/100"),
         ("workflow_id", "cred-rotation/other"),
+        ("run_id", "other-run"),
+        ("rotation_instance", "inc-test-att2"),
+        ("schema", "rotation-receipt/v0"),
+        ("action", "abort"),
         ("spec_digest", "x"),
         ("consumer_set_digest", "x"),
         ("successor", "cortex_db_admin_r99999"),
