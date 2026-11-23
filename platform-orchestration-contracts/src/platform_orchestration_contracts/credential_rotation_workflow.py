@@ -62,6 +62,12 @@ class RotationActivities(Protocol):
     async def notify_human(self, pr_url: str, principal: str, reason: str) -> None:
         """ntfy push + PR comment (redundant channels)."""
 
+    async def verify_merge_receipt(self, receipt: dict, ctx: dict) -> None:
+        """Bind approval to the exact reviewed head + merge commit on the
+        target branch, the spec/consumer digests, merged file contents,
+        approver allowlist, and absence of concurrent/direct-mode drift.
+        Runs after the merge signal, BEFORE any consumer mutation."""
+
     async def wait_consumer_healthy(self, consumers: list[str], timeout_s: int) -> bool:
         """All consumers authenticated with the successor before revoke."""
 
@@ -123,6 +129,48 @@ def _sops_spec(spec: "RotationSpec") -> dict:
             "principal": spec.principal}
 
 
+def _canon(obj) -> str:
+    """Deterministic JSON for digesting."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _digest(obj) -> str:
+    import hashlib
+    return hashlib.sha256(_canon(obj).encode()).hexdigest()
+
+
+def _spec_digest(spec: "RotationSpec") -> str:
+    """Digest of the full resolved spec (incl. successor_name) — the value
+    the reviewer sees and the receipt must echo back."""
+    import dataclasses
+    return _digest(dataclasses.asdict(spec))
+
+
+def _consumer_set_digest(spec: "RotationSpec") -> str:
+    """Digest of the declared consumer set (namespaces/kinds/secrets as
+    declared — canonical, order-insensitive)."""
+    norm = sorted(_canon(c) for c in spec.consumers)
+    return _digest(norm)
+
+
+RECEIPT_REQUIRED_FIELDS = (
+    "approver", "pr_url", "reviewed_head_sha", "merge_commit_sha",
+    "spec_digest", "consumer_set_digest", "successor", "workflow_id",
+    "direct_mode_approved",
+)
+
+
+def _parse_pr_ref(ref: str) -> dict:
+    """sops_encrypt_and_open_pr returns a JSON ref
+    {"url","head","base","baseline_files"}; tolerate a legacy bare URL."""
+    if ref and ref.startswith("{"):
+        try:
+            return json.loads(ref)
+        except ValueError:
+            pass
+    return {"url": ref}
+
+
 @workflow.defn
 class CredentialRotationWorkflow:
     """One rotation per principal.
@@ -138,17 +186,32 @@ class CredentialRotationWorkflow:
         self._merge_rejected = False
         self._aborted = False
         self._closure_acked = False
+        self._receipt: Optional[dict] = None
 
     # ---- signals ----------------------------------------------------
     @workflow.signal
-    def approve_merge(self, approver, pr_url: str = "") -> None:
-        # `temporal workflow signal --input '["a","b"]'` delivers the array as
-        # a single payload — unpack it rather than TypeError-ing the task.
-        if isinstance(approver, (list, tuple)):
-            approver, pr_url = (list(approver) + [""])[:2]
+    def approve_merge(self, receipt, pr_url: str = "") -> None:
+        """Approval gate — requires a structured receipt binding the exact
+        reviewed head and merge commit (see verify_merge_receipt).
+
+        Receipt fields: approver, pr_url, reviewed_head_sha,
+        merge_commit_sha, spec_digest, consumer_set_digest, successor,
+        workflow_id, direct_mode_approved. `temporal workflow signal
+        --input '[<obj>]'` wraps the payload in an array — unwrap it.
+        A malformed receipt does NOT open the gate: it is recorded and
+        the workflow keeps waiting so a corrected signal can land."""
+        if isinstance(receipt, (list, tuple)):
+            receipt = (list(receipt) + [{}])[0]
+        if not isinstance(receipt, dict) or any(
+                f not in receipt for f in RECEIPT_REQUIRED_FIELDS):
+            self._state.evidence.setdefault("bad_receipts", []).append(
+                {"received": receipt if isinstance(receipt, dict) else str(receipt)[:200],
+                 "at": workflow.now().isoformat()})
+            return
         self._merge_approved = True
-        self._state.pr_url = pr_url
-        self._state.evidence["approver"] = approver
+        self._receipt = receipt
+        self._state.evidence["receipt"] = receipt
+        self._state.evidence["approver"] = receipt.get("approver")
         self._state.evidence["approved_at"] = workflow.now().isoformat()
 
     @workflow.signal
@@ -194,6 +257,11 @@ class CredentialRotationWorkflow:
             "zerotrace_baseline": spec.zerotrace_baseline,
             "workflow_id": info.workflow_id,
             "run_id": info.run_id,
+            # Digests the approver copies into the receipt — bind approval
+            # to this exact spec and consumer set, printed for reviewers
+            # via the `evidence` query.
+            "spec_digest": _spec_digest(spec),
+            "consumer_set_digest": _consumer_set_digest(spec),
         })
 
         try:
@@ -228,10 +296,11 @@ class CredentialRotationWorkflow:
             if spec.dry_run:
                 # Dry-run: skip all PostgreSQL mutations and rollouts
                 branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-                self._state.pr_url = await _req(
+                pr_ref = _parse_pr_ref(await _req(
                     acts_unsafe.sops_encrypt_and_open_pr,
                     [sealed, branch, True, _sops_spec(spec)],
-                    "sops_encrypt_and_open_pr")
+                    "sops_encrypt_and_open_pr"))
+                self._state.pr_url = pr_ref["url"]
                 self._state.stage = "await_approval"
                 await _req(
                     acts_unsafe.notify_human,
@@ -247,10 +316,14 @@ class CredentialRotationWorkflow:
                 [spec.principal, spec.successor_name, sealed, {"db_host": spec.db_host, "db_name": spec.db_name}],
                 "create_role")
             branch = f"security/rotate-{spec.principal}-{spec.successor_name}"
-            self._state.pr_url = await _req(
+            pr_ref = _parse_pr_ref(await _req(
                 acts_unsafe.sops_encrypt_and_open_pr,
                 [sealed, branch, spec.dry_run, _sops_spec(spec)],
-                "sops_encrypt_and_open_pr")
+                "sops_encrypt_and_open_pr"))
+            self._state.pr_url = pr_ref["url"]
+            self._state.evidence["pushed_head"] = pr_ref.get("head")
+            self._state.evidence["merge_base"] = pr_ref.get("base")
+            self._state.evidence["baseline_files"] = pr_ref.get("baseline_files")
             self._state.stage = "await_approval"
             await _req(
                 acts_unsafe.notify_human,
@@ -278,6 +351,32 @@ class CredentialRotationWorkflow:
                     [spec.successor_name],
                     "revoke_successor", attempts=4)
                 return self._state
+
+            # BINDING — verify the receipt against the actual merged
+            # state before ANY consumer mutation. FATAL on mismatch:
+            # nothing below this line has run, nothing to compensate.
+            self._state.stage = "verify_receipt"
+            await _req(
+                acts_unsafe.verify_merge_receipt,
+                [self._receipt, {
+                    "workflow_id": info.workflow_id,
+                    "run_id": info.run_id,
+                    "spec_digest": self._state.evidence["spec_digest"],
+                    "consumer_set_digest": self._state.evidence["consumer_set_digest"],
+                    "successor": spec.successor_name,
+                    "principal": spec.principal,
+                    "pr_url": self._state.pr_url,
+                    "pushed_head": self._state.evidence.get("pushed_head"),
+                    "merge_base": self._state.evidence.get("merge_base"),
+                    "baseline_files": self._state.evidence.get("baseline_files"),
+                    "consumers": spec.consumers,
+                    "sealed": sealed,
+                }],
+                "verify_merge_receipt")
+            if self._receipt.get("reviewed_head_sha") != self._state.evidence.get("pushed_head"):
+                # Human-edited branch after the worker push — allowed, but
+                # the approval binds to the *reviewed* head; record it.
+                self._state.evidence["branch_amended"] = True
 
             # CUTOVER — flip consumers to successor, verify, then revoke
             self._state.stage = "cutover"
