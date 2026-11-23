@@ -31,6 +31,7 @@ from typing import Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 
 # Activity stubs are defined with `with workflow.unsafe.imports_passed_through()`
 # in real deployments; kept as a protocol here so the workflow file is
@@ -88,8 +89,12 @@ class RotationActivities(Protocol):
         """POST evidence → governance-closure endpoint."""
 
 
-class CutoverFailed(Exception):
-    """Cutover ran but did not complete — successor must be cleaned up."""
+class CutoverFailed(ApplicationError):
+    """Cutover ran but did not complete — successor must be cleaned up.
+
+    Must be an ApplicationError: any other exception type surfacing from
+    workflow code is a workflow-TASK failure retried indefinitely —
+    the run wedges instead of failing."""
 
 
 @dataclass
@@ -107,6 +112,9 @@ class RotationSpec:
     merge_wait_hours: int = 168          # finite gate window; expiry cleans up
     health_min_samples: int = 2          # min old-role auth failures before revoke
     closure_ack_required: bool = False   # human ack optional/time-boxed
+    require_direct_probe: bool = False   # incident-critical rotations set this —
+                                         # refuses live execution when
+                                         # ROTATION_PG_DIRECT_DSN is unset
     dry_run: bool = False                # stop after open_pr+notify — zero mutation
     zerotrace_baseline: str = ""         # e.g. discovery-20260911T091040Z-21876 (Auth-1)
     ntfy_topic: str = "ops-credential-rotation"
@@ -156,7 +164,7 @@ def _consumer_set_digest(spec: "RotationSpec") -> str:
 RECEIPT_REQUIRED_FIELDS = (
     "approver", "pr_url", "reviewed_head_sha", "merge_commit_sha",
     "spec_digest", "consumer_set_digest", "successor", "workflow_id",
-    "direct_mode_approved",
+    "direct_mode_approved", "signature",
 )
 
 
@@ -280,17 +288,19 @@ class CredentialRotationWorkflow:
                     )
                     if res.ok:
                         return res.ref
-                    if res.outcome.name == "COMPENSATE":
+                    if res.outcome == acts_unsafe.Outcome.COMPENSATE:
                         raise CutoverFailed(f"{step}: {res.detail}")
-                    if res.outcome.name == "FATAL" or i == attempts - 1:
-                        raise RuntimeError(f"{step}: {res.detail}")
+                    if (res.outcome == acts_unsafe.Outcome.FATAL
+                            or i == attempts - 1):
+                        raise ApplicationError(f"{step}: {res.detail}")
                     await workflow.sleep(min(120, 10 * 2 ** i))
 
             sealed = await _req(
                 acts_unsafe.generate_successor_cred,
                 [{"principal": spec.principal, "successor": spec.successor_name,
                   "consumers": spec.consumers, "namespace": spec.namespace,
-                  "secret_name": spec.secret_name, "password_key": spec.password_key}],
+                  "secret_name": spec.secret_name, "password_key": spec.password_key,
+                  "require_direct_probe": spec.require_direct_probe}],
                 "generate_successor_cred")
 
             if spec.dry_run:
@@ -353,26 +363,39 @@ class CredentialRotationWorkflow:
                 return self._state
 
             # BINDING — verify the receipt against the actual merged
-            # state before ANY consumer mutation. FATAL on mismatch:
-            # nothing below this line has run, nothing to compensate.
+            # state before ANY consumer mutation. On failure: no consumer
+            # mutation, but the successor role already exists — revoke it
+            # rather than leave a live unused credential.
             self._state.stage = "verify_receipt"
-            await _req(
-                acts_unsafe.verify_merge_receipt,
-                [self._receipt, {
-                    "workflow_id": info.workflow_id,
-                    "run_id": info.run_id,
-                    "spec_digest": self._state.evidence["spec_digest"],
-                    "consumer_set_digest": self._state.evidence["consumer_set_digest"],
-                    "successor": spec.successor_name,
-                    "principal": spec.principal,
-                    "pr_url": self._state.pr_url,
-                    "pushed_head": self._state.evidence.get("pushed_head"),
-                    "merge_base": self._state.evidence.get("merge_base"),
-                    "baseline_files": self._state.evidence.get("baseline_files"),
-                    "consumers": spec.consumers,
-                    "sealed": sealed,
-                }],
-                "verify_merge_receipt")
+            try:
+                await _req(
+                    acts_unsafe.verify_merge_receipt,
+                    [self._receipt, {
+                        "workflow_id": info.workflow_id,
+                        "run_id": info.run_id,
+                        "spec_digest": self._state.evidence["spec_digest"],
+                        "consumer_set_digest": self._state.evidence["consumer_set_digest"],
+                        "successor": spec.successor_name,
+                        "principal": spec.principal,
+                        "pr_url": self._state.pr_url,
+                        "pushed_head": self._state.evidence.get("pushed_head"),
+                        "merge_base": self._state.evidence.get("merge_base"),
+                        "baseline_files": self._state.evidence.get("baseline_files"),
+                        "consumers": spec.consumers,
+                        "sealed": sealed,
+                    }],
+                    "verify_merge_receipt")
+            except Exception:
+                self._state.evidence["receipt_rejected"] = True
+                try:
+                    await _req(
+                        acts_unsafe.revoke_predecessor,
+                        [spec.successor_name],
+                        "revoke_successor_unapproved", attempts=4)
+                    self._state.evidence["unapproved_successor_revoked"] = True
+                except Exception as ce:
+                    self._state.evidence["successor_cleanup_error"] = str(ce)
+                raise
             if self._receipt.get("reviewed_head_sha") != self._state.evidence.get("pushed_head"):
                 # Human-edited branch after the worker push — allowed, but
                 # the approval binds to the *reviewed* head; record it.
@@ -388,7 +411,7 @@ class CredentialRotationWorkflow:
             # (fresh TCP probes, no pool reuse). Old role still valid here.
             await _req(
                 acts_unsafe.wait_consumer_healthy,
-                [spec.consumers, sealed, 900],
+                [spec.consumers, sealed, 900, spec.require_direct_probe],
                 "wait_consumer_healthy", timeout_minutes=15)
 
             if spec.soak_seconds:
@@ -405,7 +428,7 @@ class CredentialRotationWorkflow:
             # a still-alive result forces compensation before close.
             await _req(
                 acts_unsafe.liveness_dead_check,
-                [spec.principal, sealed],
+                [spec.principal, sealed, spec.require_direct_probe],
                 "liveness_dead_check")
             self._state.evidence["liveness_dead"] = True
             self._state.evidence["verified_at"] = workflow.now().isoformat()

@@ -40,13 +40,16 @@ class Outcome(str, Enum):
 
 @dataclass
 class ActResult:
-    outcome: Outcome
+    # outcome is serialized as its str value ("ok"/"fatal"/...); Temporal
+    # decodes the field back as plain str, so never compare with `is` or
+    # `.name` — `==` against Outcome members works for both shapes.
+    outcome: str
     detail: str = ""             # safe-for-history summary, never secret
     ref: str = ""                # opaque reference (sealed blob, pr_url, ...)
 
     @property
     def ok(self) -> bool:
-        return self.outcome is Outcome.OK
+        return self.outcome == Outcome.OK
 
 
 @dataclass
@@ -259,6 +262,10 @@ async def generate_successor_cred(spec: dict) -> ActResult:
     """
     principal = spec["principal"]
     successor = spec["successor"]
+    # Incident-critical rotations require the direct postgres-rw probe
+    # path — refuse early rather than discover it missing post-revoke.
+    if spec.get("require_direct_probe") and not os.environ.get("ROTATION_PG_DIRECT_DSN"):
+        return ActResult(Outcome.FATAL, "direct-dsn-required-unset")
     pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
 
     # Pre-flight consumer validation — runs in dry-run too, so a bad
@@ -669,9 +676,14 @@ async def notify_human(pr_url: str, principal: str, reason: str) -> ActResult:
 
 
 @activity.defn
-async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 900) -> ActResult:
-    """All consumers' new pods Ready AND successor auth probe passes."""
+async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 900,
+                                require_direct: bool = False) -> ActResult:
+    """All consumers' new pods Ready AND successor auth probe passes on
+    every required path (pooled always; direct postgres-rw when
+    ROTATION_PG_DIRECT_DSN is set — required when require_direct)."""
     cons = [_consumer(c) for c in consumers]
+    if require_direct and not os.environ.get("ROTATION_PG_DIRECT_DSN"):
+        return ActResult(Outcome.FATAL, "direct-dsn-required-unset")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         all_ready = True
@@ -685,18 +697,27 @@ async def wait_consumer_healthy(consumers: list, sealed: str, timeout_s: int = 9
             pw = _plaintext_from_sealed(sealed)
             if pw:
                 import psycopg2
-                try:
-                    # conninfo: later params override — append successor creds
-                    # rather than string-replacing user (which kept the
-                    # rotation_worker password and always failed auth)
-                    conn = psycopg2.connect(
-                        os.environ["ROTATION_PG_DSN"]
-                        + f" user={json.loads(sealed).get('successor','')} password={pw}",
-                        connect_timeout=6)
-                    conn.close()
-                    return ActResult(Outcome.OK, "consumers-ready+successor-auth")
-                except Exception:
-                    pass
+                succ = json.loads(sealed).get('successor', '')
+                paths = {"pooled": os.environ["ROTATION_PG_DSN"]}
+                if os.environ.get("ROTATION_PG_DIRECT_DSN"):
+                    paths["direct"] = os.environ["ROTATION_PG_DIRECT_DSN"]
+                ok_paths = []
+                for pname, dsn in paths.items():
+                    try:
+                        # conninfo: later params override — append successor
+                        # creds rather than string-replacing user (which kept
+                        # the rotation_worker password and always failed auth)
+                        conn = psycopg2.connect(
+                            dsn + f" user={succ} password={pw}",
+                            connect_timeout=6)
+                        conn.close()
+                        ok_paths.append(pname)
+                    except Exception:
+                        pass
+                if len(ok_paths) == len(paths):
+                    return ActResult(Outcome.OK,
+                                     "consumers-ready+successor-auth:"
+                                     + ",".join(ok_paths))
             return ActResult(Outcome.OK, "consumers-ready")
         time.sleep(10)
     return ActResult(Outcome.COMPENSATE, "health-gate-timeout")
@@ -867,19 +888,26 @@ async def revoke_predecessor(principal: str) -> ActResult:
 
 
 @activity.defn
-async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
-    """Old credential must FAIL auth — twice consecutively on every path.
+async def liveness_dead_check(principal: str, sealed: str,
+                              require_direct: bool = False) -> ActResult:
+    """Old credential must FAIL auth — twice consecutively on every path,
+    and zero predecessor sessions may remain.
 
     ROTATION_PG_DSN points at PgBouncer, so the primary probe covers the
     application path (trust-auth client + userlist backend auth). When
     ROTATION_PG_DIRECT_DSN is set (postgres-rw), the old credential must
     also fail direct authentication — a stale PgBouncer userlist entry
-    must not be the only barrier checked."""
+    must not be the only barrier checked. require_direct makes the
+    direct path mandatory for this rotation. The session count verifies
+    pg_terminate_backend actually emptied pg_stat_activity for the
+    principal — pooled-path failure alone is not proof of revocation."""
     # Read the PREDECESSOR password from the sealed snapshot — the live
     # secret has been overwritten by Flux post-merge (successor creds).
     old_pw = _sealed_field(sealed, "predecessor_password")
     if not old_pw:
         return ActResult(Outcome.RETRYABLE, "predecessor-cred-unsealed")
+    if require_direct and not os.environ.get("ROTATION_PG_DIRECT_DSN"):
+        return ActResult(Outcome.FATAL, "direct-dsn-required-unset")
 
     def _probe(dsn: str) -> int:
         dead = 0
@@ -901,7 +929,6 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
                 time.sleep(3)
         return dead
 
-    import psycopg2  # noqa: F401 — imported by _probe scope
     paths = {"pooled": _probe(os.environ["ROTATION_PG_DSN"])}
     direct = os.environ.get("ROTATION_PG_DIRECT_DSN")
     if direct:
@@ -910,11 +937,26 @@ async def liveness_dead_check(principal: str, sealed: str) -> ActResult:
         return ActResult(Outcome.COMPENSATE,
                          "predecessor-still-valid:"
                          + ",".join(k for k, v in paths.items() if v == -1))
-    if all(v == 2 for v in paths.values()):
-        return ActResult(Outcome.OK,
-                         "dead:" + ",".join(f"{k}=2/2" for k in paths))
-    return ActResult(Outcome.RETRYABLE,
-                     "dead-probes:" + ",".join(f"{k}={v}/2" for k, v in paths.items()))
+
+    # Session-count verification: NOLOGIN blocks new auth but surviving
+    # pooled sessions keep working until terminated — verify zero remain.
+    remaining = -1
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.environ["ROTATION_PG_DSN"], connect_timeout=8)
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pg_stat_activity WHERE usename = %s",
+                    (principal,))
+        remaining = cur.fetchone()[0]
+        conn.close()
+    except Exception:
+        pass
+
+    detail = "dead:" + ",".join(f"{k}={v}/2" for k, v in paths.items())
+    detail += f",sessions-remaining:{remaining}"
+    if all(v == 2 for v in paths.values()) and remaining == 0:
+        return ActResult(Outcome.OK, detail)
+    return ActResult(Outcome.RETRYABLE, detail)
 
 
 @activity.defn
@@ -966,9 +1008,7 @@ def _git_out(repo: str, *args: str, env: dict = None) -> str:
 def _receipt_field_failures(receipt: dict, ctx: dict) -> list:
     """Pure binding checks — no I/O. Returns failure strings."""
     fails = []
-    for field in ("approver", "pr_url", "reviewed_head_sha",
-                  "merge_commit_sha", "spec_digest", "consumer_set_digest",
-                  "successor", "workflow_id", "direct_mode_approved"):
+    for field in RECEIPT_SIGNED_FIELDS + ("signature",):
         if field not in receipt:
             fails.append(f"missing-field:{field}")
     if fails:
@@ -995,6 +1035,50 @@ def _pr_url_slug(url: str) -> str | None:
     """'https://github.com/org/repo/pull/123' → 'org/repo', else None."""
     m = re.match(r"https://[^/]+/([^/]+/[^/]+)/pull/\d+", url or "")
     return m.group(1) if m else None
+
+
+# Receipt fields covered by the approver's ed25519 signature. The signed
+# payload includes workflow_id — a receipt replayed against a different
+# execution fails both the binding checks and signature verification.
+RECEIPT_SIGNED_FIELDS = (
+    "approver", "pr_url", "reviewed_head_sha", "merge_commit_sha",
+    "spec_digest", "consumer_set_digest", "successor", "workflow_id",
+    "direct_mode_approved",
+)
+
+
+def _receipt_signed_payload(receipt: dict) -> bytes:
+    """Canonical bytes an approver signs — mirrors _canon in the
+    workflow; both sides digest the same structure."""
+    return json.dumps({f: receipt.get(f) for f in RECEIPT_SIGNED_FIELDS},
+                      sort_keys=True, separators=(",", ":")).encode()
+
+
+def _approver_authenticated(receipt: dict) -> tuple[bool, str]:
+    """Verify the receipt's ed25519 signature against the approver's
+    registered public key (ROTATION_APPROVER_KEYS = JSON
+    {name: base64-pubkey}). The `approver` field is caller-supplied —
+    the signature is what authenticates it. Fails closed when the key
+    map is unset, the approver is unknown, or the signature is bad."""
+    raw_keys = os.environ.get("ROTATION_APPROVER_KEYS", "")
+    if not raw_keys:
+        return False, "approver-keys-unset"
+    try:
+        keys = json.loads(raw_keys)
+    except ValueError:
+        return False, "approver-keys-malformed"
+    approver = receipt.get("approver", "")
+    if approver not in keys:
+        return False, f"unauthorized-approver:{approver}"
+    sig_b64 = receipt.get("signature", "")
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey)
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(keys[approver]))
+        pub.verify(base64.b64decode(sig_b64), _receipt_signed_payload(receipt))
+        return True, ""
+    except Exception:
+        return False, "bad-signature"
 
 
 def _pr_state_checks(pr: dict, receipt: dict, target: str) -> list:
@@ -1062,12 +1146,9 @@ async def verify_merge_receipt(receipt: dict, ctx: dict) -> ActResult:
         return ActResult(Outcome.FATAL, f"wrong-repo:{url_slug}")
     target = os.environ.get("ROTATION_TARGET_BRANCH", "main")
 
-    approvers = [a.strip() for a in
-                 os.environ.get("ROTATION_APPROVERS", "").split(",") if a.strip()]
-    if not approvers:
-        return ActResult(Outcome.FATAL, "approver-allowlist-unset")
-    if receipt["approver"] not in approvers:
-        return ActResult(Outcome.FATAL, f"unauthorized-approver:{receipt['approver']}")
+    authed, why = _approver_authenticated(receipt)
+    if not authed:
+        return ActResult(Outcome.FATAL, f"approver-auth:{why}")
 
     repo = os.environ.get("ROTATION_REPO_DIR", "/workspace")
     git_env = {**os.environ, "GIT_CONFIG_COUNT": "1",

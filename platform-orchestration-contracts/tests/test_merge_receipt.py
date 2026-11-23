@@ -57,6 +57,22 @@ CTX = {
 }
 
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+
+def _keypair():
+    k = Ed25519PrivateKey.generate()
+    pub = base64.b64encode(k.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    return k, pub
+
+
+PRIV, PUB = _keypair()
+PRIV2, PUB2 = _keypair()
+APPROVER_KEYS = json.dumps({"ops-lead": PUB})
+
+
 def _receipt(**over):
     r = {
         "approver": "ops-lead",
@@ -68,8 +84,16 @@ def _receipt(**over):
         "successor": "cortex_db_admin_r77777",
         "workflow_id": "cred-rotation/cortex_db_admin_r16023",
         "direct_mode_approved": True,
+        "signature": "signed",
     }
     r.update(over)
+    return r
+
+
+def _signed_receipt(priv=PRIV, **over):
+    r = _receipt(**over)
+    sig = priv.sign(acts._receipt_signed_payload(r))
+    r["signature"] = base64.b64encode(sig).decode()
     return r
 
 
@@ -80,10 +104,7 @@ class TestReceiptFields:
         assert acts._receipt_field_failures(_receipt(), CTX) == []
 
     def test_missing_each_required_field(self):
-        for f in acts.__dict__ and ("approver", "pr_url", "reviewed_head_sha",
-                                    "merge_commit_sha", "spec_digest",
-                                    "consumer_set_digest", "successor",
-                                    "workflow_id", "direct_mode_approved"):
+        for f in acts.RECEIPT_SIGNED_FIELDS + ("signature",):
             r = _receipt()
             del r[f]
             assert acts._receipt_field_failures(r, CTX) == [f"missing-field:{f}"]
@@ -189,7 +210,7 @@ def _gh_payload(state="MERGED", head=HEAD, merge=MERGE, base="main"):
 
 
 def _run(receipt, ctx, *, gh=None, git_map=None, kubectl_map=None,
-         approvers="ops-lead", sealed_pw="oldpw"):
+         approver_keys=APPROVER_KEYS, sealed_pw="oldpw"):
     """Invoke verify_merge_receipt with all I/O seams mocked.
 
     git_map: {(args_key): stdout}; keys matched by prefix join.
@@ -197,7 +218,7 @@ def _run(receipt, ctx, *, gh=None, git_map=None, kubectl_map=None,
     """
     env = {"ROTATION_REPO_SLUG": SLUG, "ROTATION_REPO_DIR": "/r",
            "ROTATION_TARGET_BRANCH": "main",
-           "ROTATION_APPROVERS": approvers,
+           "ROTATION_APPROVER_KEYS": approver_keys,
            "ROTATION_PG_HOST": "pgbouncer", "ROTATION_PG_PORT": "5432",
            "ROTATION_PG_DB": "mydatabase"}
 
@@ -253,43 +274,71 @@ class TestVerifyMergeReceipt:
         live = {("ns2", "pg-creds"): {
             "POSTGRES_USER": "cortex_db_admin_r16023",
             "POSTGRES_PASSWORD": "oldpw"}}
-        res = _run(_receipt(), CTX, kubectl_map=live)
+        res = _run(_signed_receipt(), CTX, kubectl_map=live)
         assert res.ok, res.detail
 
-    def test_unauthorized_approver(self):
-        res = _run(_receipt(approver="intern"), CTX)
+    def test_untrusted_caller_supplies_allowlisted_name(self):
+        # Attacker crafts a receipt naming an allowlisted approver but
+        # cannot produce their signature — must still fail.
+        r = _receipt(approver="ops-lead", signature="forged")
+        res = _run(r, CTX)
+        assert res.outcome is acts.Outcome.FATAL
+        assert "bad-signature" in res.detail
+
+    def test_unknown_approver_fails(self):
+        r = _receipt(approver="intern", signature="x")
+        res = _run(r, CTX)
         assert res.outcome is acts.Outcome.FATAL
         assert "unauthorized-approver" in res.detail
 
-    def test_allowlist_unset_fails_closed(self):
-        res = _run(_receipt(), CTX, approvers="")
+    def test_key_map_unset_fails_closed(self):
+        res = _run(_signed_receipt(), CTX, approver_keys="")
         assert res.outcome is acts.Outcome.FATAL
-        assert "approver-allowlist-unset" in res.detail
+        assert "approver-keys-unset" in res.detail
+
+    def test_wrong_key_signature_fails(self):
+        res = _run(_signed_receipt(priv=PRIV2), CTX)
+        assert res.outcome is acts.Outcome.FATAL
+        assert "bad-signature" in res.detail
+
+    def test_tampered_field_after_signing_fails(self):
+        r = _signed_receipt()
+        r["workflow_id"] = "cred-rotation/other"  # tamper after signing
+        res = _run(r, dict(CTX, workflow_id="cred-rotation/other"))
+        assert res.outcome is acts.Outcome.FATAL
+        assert "bad-signature" in res.detail
+
+    def test_replay_to_different_workflow_fails(self):
+        # A valid signature over a different workflow_id: field binding
+        # catches it first, and the signature no longer matches anyway.
+        r = _signed_receipt(workflow_id="cred-rotation/victim")
+        res = _run(r, CTX)
+        assert res.outcome is acts.Outcome.FATAL
 
     def test_wrong_repo(self):
         ctx = dict(CTX, pr_url="https://github.com/evil/x/pull/9")
-        res = _run(_receipt(pr_url=ctx["pr_url"]), ctx)
+        res = _run(_signed_receipt(pr_url=ctx["pr_url"]), ctx)
         assert res.outcome is acts.Outcome.FATAL
         assert "wrong-repo" in res.detail
 
     def test_pr_not_merged(self):
-        res = _run(_receipt(), CTX, gh=_gh_payload(state="OPEN"))
+        res = _run(_signed_receipt(), CTX, gh=_gh_payload(state="OPEN"))
         assert res.outcome is acts.Outcome.FATAL
         assert "pr-not-merged" in res.detail
 
     def test_head_vs_merge_distinction_enforced(self):
         # PR head != reviewed head → fail even though merge commit matches
-        res = _run(_receipt(), CTX, gh=_gh_payload(head=OTHER))
+        res = _run(_signed_receipt(), CTX, gh=_gh_payload(head=OTHER))
         assert res.outcome is acts.Outcome.FATAL
         assert "reviewed-head-mismatch" in res.detail
 
     def test_merge_commit_mismatch(self):
-        res = _run(_receipt(), CTX, gh=_gh_payload(merge=OTHER))
+        res = _run(_signed_receipt(), CTX, gh=_gh_payload(merge=OTHER))
         assert res.outcome is acts.Outcome.FATAL
         assert "merge-commit-mismatch" in res.detail
 
     def test_merge_commit_not_on_target(self):
-        res = _run(_receipt(), CTX, git_map={"ancestor": False})
+        res = _run(_signed_receipt(), CTX, git_map={"ancestor": False})
         assert res.outcome is acts.Outcome.FATAL
         assert "merge-commit-not-on-target" in res.detail
 
@@ -310,13 +359,13 @@ class TestVerifyMergeReceipt:
                           {**acts.os.environ,
                            "ROTATION_REPO_SLUG": SLUG, "ROTATION_REPO_DIR": "/r",
                            "ROTATION_TARGET_BRANCH": "main",
-                           "ROTATION_APPROVERS": "ops-lead"}):
-            res = asyncio.run(acts.verify_merge_receipt(_receipt(), CTX))
+                           "ROTATION_APPROVER_KEYS": APPROVER_KEYS}):
+            res = asyncio.run(acts.verify_merge_receipt(_signed_receipt(), CTX))
         assert res.outcome is acts.Outcome.FATAL
         assert "merged-content-differs" in res.detail
 
     def test_concurrent_target_edit_fatal(self):
-        res = _run(_receipt(), CTX,
+        res = _run(_signed_receipt(), CTX,
                    git_map={"log --format=%H base0..": "deadbeef123"})
         assert res.outcome is acts.Outcome.FATAL
         assert "concurrent-target-edit" in res.detail
@@ -340,8 +389,8 @@ class TestVerifyMergeReceipt:
                           {**acts.os.environ,
                            "ROTATION_REPO_SLUG": SLUG, "ROTATION_REPO_DIR": "/r",
                            "ROTATION_TARGET_BRANCH": "main",
-                           "ROTATION_APPROVERS": "ops-lead"}):
-            res = asyncio.run(acts.verify_merge_receipt(_receipt(), CTX))
+                           "ROTATION_APPROVER_KEYS": APPROVER_KEYS}):
+            res = asyncio.run(acts.verify_merge_receipt(_signed_receipt(), CTX))
         assert res.outcome is acts.Outcome.FATAL
         assert "post-merge-drift" in res.detail
 
@@ -349,7 +398,7 @@ class TestVerifyMergeReceipt:
         live = {("ns2", "pg-creds"): {
             "POSTGRES_USER": "someone_else",
             "POSTGRES_PASSWORD": "oldpw"}}
-        res = _run(_receipt(), CTX, kubectl_map=live)
+        res = _run(_signed_receipt(), CTX, kubectl_map=live)
         assert res.outcome is acts.Outcome.FATAL
         assert "direct-secret-drift" in res.detail
 
